@@ -11,6 +11,7 @@ struct SidebarView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @Binding var selectedThread: CodexThread?
+    @Binding var showMyMacs: Bool
     @Binding var showSettings: Bool
     @Binding var isSearchActive: Bool
 
@@ -88,6 +89,7 @@ struct SidebarView: View {
             }
 
             HStack(spacing: 10) {
+                SidebarFloatingMacsButton(colorScheme: colorScheme, action: openMyMacs)
                 SidebarFloatingSettingsButton(colorScheme: colorScheme, action: openSettings)
                 Spacer(minLength: 0)
                 if let trustedPairPresentation = codex.trustedPairPresentation {
@@ -275,6 +277,12 @@ struct SidebarView: View {
     private func openSettings() {
         searchText = ""
         showSettings = true
+        onClose()
+    }
+
+    private func openMyMacs() {
+        searchText = ""
+        showMyMacs = true
         onClose()
     }
 

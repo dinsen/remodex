@@ -319,6 +319,18 @@ extension CodexService {
         }
     }
 
+    // Interrupts every active or protected run before switching to a different Mac context.
+    func interruptAllRunningTurnsBeforeMacSwitch() async throws {
+        let candidateThreadIDs = runningThreadIDs
+            .union(protectedRunningFallbackThreadIDs)
+            .union(activeTurnIdByThread.keys)
+            .sorted()
+
+        for threadID in candidateThreadIDs {
+            try await interruptTurn(turnId: nil, threadId: threadID)
+        }
+    }
+
     // Queries server-side fuzzy file search using stable RPC (non-experimental).
     func fuzzyFileSearch(
         query: String,

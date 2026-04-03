@@ -217,7 +217,7 @@ final class TurnViewModelQueueTests: XCTestCase {
         XCTAssertTrue(service.messagesByThread["thread-queue"]?.isEmpty ?? true)
     }
 
-    func testSendTurnStoresOnlyConfirmedFileMentionsOnUserMessage() async {
+    func testSendTurnStoresOnlyConfirmedFileMentionsOnUserMessage() async throws {
         let service = makeService()
         service.isConnected = true
         service.resumedThreadIDs.insert("thread-queue")
@@ -247,7 +247,7 @@ final class TurnViewModelQueueTests: XCTestCase {
         XCTAssertEqual(message.fileMentions, ["CodexMobile/Views/Turn/TurnView.swift"])
     }
 
-    func testSendTurnDoesNotStoreManualFileLikeTextAsConfirmedMention() async {
+    func testSendTurnDoesNotStoreManualFileLikeTextAsConfirmedMention() async throws {
         let service = makeService()
         service.isConnected = true
         service.resumedThreadIDs.insert("thread-queue")

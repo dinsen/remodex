@@ -544,8 +544,7 @@ extension CodexService {
                 messagesByThread[threadId]?[existingIndex].turnId = turnId
                 didMutate = true
             }
-            // Optional chaining turns `isEmpty` into `Bool?`, so compare explicitly here.
-            if messagesByThread[threadId]?[existingIndex].fileMentions.isEmpty == true, !fileMentions.isEmpty {
+            if (messagesByThread[threadId]?[existingIndex].fileMentions.isEmpty ?? true), !fileMentions.isEmpty {
                 messagesByThread[threadId]?[existingIndex].fileMentions = fileMentions
                 didMutate = true
             }
@@ -2430,7 +2429,7 @@ extension CodexService {
         threadIdByTurnID.removeAll()
 
         if didMutate {
-            messagePersistence.save(messagesByThread)
+            persistCurrentMacMessages()
             if let activeThreadId {
                 updateCurrentOutput(for: activeThreadId)
             }
@@ -2446,10 +2445,11 @@ extension CodexService {
             guard !Task.isCancelled, let self else { return }
 
             let snapshot = self.messagesByThread
+            let macDeviceId = self.currentMacScopedPersistenceDeviceId
             self.messagePersistenceDebounceTask = nil
 
             Task.detached { [messagePersistence] in
-                messagePersistence.save(snapshot)
+                messagePersistence.save(snapshot, macDeviceId: macDeviceId)
             }
         }
     }

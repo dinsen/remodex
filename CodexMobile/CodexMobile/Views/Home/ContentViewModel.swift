@@ -23,6 +23,19 @@ final class ContentViewModel {
     @ObservationIgnored var reconnectSleepOverride: ((UInt64) async -> Void)?
     @ObservationIgnored var reconnectSleepChunkNanosecondsOverride: UInt64?
 
+    private struct RelaySessionSnapshot {
+        let relaySessionId: String?
+        let relayUrl: String?
+        let relayMacDeviceId: String?
+        let relayMacIdentityPublicKey: String?
+        let relayProtocolVersion: Int
+        let lastAppliedBridgeOutboundSeq: Int
+        let shouldForceQRBootstrapOnNextHandshake: Bool
+        let trustedReconnectFailureCount: Int
+        let secureConnectionState: CodexSecureConnectionState
+        let secureMacFingerprint: String?
+    }
+
     var isAttemptingAutoReconnect: Bool {
         isRunningAutoReconnect
     }
@@ -393,11 +406,22 @@ extension ContentViewModel {
 
     // Chooses the best reconnect path: resolve the live trusted-Mac session first, then fall back to the saved QR session.
     func preferredReconnectURL(codex: CodexService) async -> String? {
+        await preferredReconnectURL(
+            codex: codex,
+            targetMacDeviceId: codex.normalizedCurrentTrustedMacDeviceId
+        )
+    }
+
+    // Resolves a reconnect URL for an explicit Mac target, instead of implicitly following the current one.
+    func preferredReconnectURL(
+        codex: CodexService,
+        targetMacDeviceId: String?
+    ) async -> String? {
         switch await trustedReconnectResolution(codex: codex) {
         case .use(let resolvedURL):
             return resolvedURL
         case .fallbackToSaved:
-            return savedReconnectURL(codex: codex)
+            return savedReconnectURL(codex: codex, targetMacDeviceId: targetMacDeviceId)
         case .stop:
             return nil
         }
@@ -405,21 +429,40 @@ extension ContentViewModel {
 
     // Resolves a trusted-Mac session when possible and tells the caller whether to use, fall back, or stop.
     private func trustedReconnectResolution(codex: CodexService) async -> ReconnectURLResolution {
-        guard codex.hasTrustedMacReconnectCandidate else {
+        await trustedReconnectResolution(
+            codex: codex,
+            targetMacDeviceId: codex.normalizedCurrentTrustedMacDeviceId
+        )
+    }
+
+    private func trustedReconnectResolution(
+        codex: CodexService,
+        targetMacDeviceId: String?
+    ) async -> ReconnectURLResolution {
+        guard let targetMacDeviceId = normalizedMacDeviceId(targetMacDeviceId),
+              let trustedMac = codex.trustedMacRecord(for: targetMacDeviceId),
+              trustedMac.relayURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             return .fallbackToSaved
         }
 
         do {
-            guard let trustedReconnectURL = try await resolvedTrustedReconnectURL(codex: codex) else {
+            guard let trustedReconnectURL = try await resolvedTrustedReconnectURL(
+                codex: codex,
+                targetMacDeviceId: targetMacDeviceId
+            ) else {
                 return .fallbackToSaved
             }
             return .use(trustedReconnectURL)
         } catch let error as CodexTrustedSessionResolveError {
-            return trustedReconnectResolution(for: error, codex: codex)
+            return trustedReconnectResolution(
+                for: error,
+                codex: codex,
+                targetMacDeviceId: targetMacDeviceId
+            )
         } catch is CancellationError {
             return .stop
         } catch {
-            if !codex.hasSavedRelaySession {
+            if savedReconnectURL(codex: codex, targetMacDeviceId: targetMacDeviceId) == nil {
                 codex.lastErrorMessage = error.localizedDescription
             }
             return .fallbackToSaved
@@ -427,9 +470,14 @@ extension ContentViewModel {
     }
 
     // Builds the live reconnect URL after the trusted-session lookup succeeds.
-    private func resolvedTrustedReconnectURL(codex: CodexService) async throws -> String? {
-        let resolved = try await codex.resolveTrustedMacSession()
-        guard let relayURL = codex.normalizedRelayURL else {
+    private func resolvedTrustedReconnectURL(
+        codex: CodexService,
+        targetMacDeviceId: String
+    ) async throws -> String? {
+        let resolved = try await codex.resolveTrustedMacSession(deviceId: targetMacDeviceId)
+        guard let trustedMac = codex.trustedMacRecord(for: targetMacDeviceId),
+              let relayURL = trustedMac.relayURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !relayURL.isEmpty else {
             return nil
         }
         return "\(relayURL)/\(resolved.sessionId)"
@@ -438,18 +486,20 @@ extension ContentViewModel {
     // Applies trusted-resolve error policy without mixing it into the happy path URL assembly.
     private func trustedReconnectResolution(
         for error: CodexTrustedSessionResolveError,
-        codex: CodexService
+        codex: CodexService,
+        targetMacDeviceId: String?
     ) -> ReconnectURLResolution {
+        let hasSavedReconnectURL = savedReconnectURL(codex: codex, targetMacDeviceId: targetMacDeviceId) != nil
         switch error {
         case .unsupportedRelay:
-            if !codex.hasSavedRelaySession {
+            if !hasSavedReconnectURL {
                 codex.connectionRecoveryState = .idle
                 codex.lastErrorMessage = "This relay needs a fresh QR scan before trusted reconnect is available."
                 return .stop
             }
             return .fallbackToSaved
         case .macOffline(let message):
-            if codex.hasSavedRelaySession {
+            if hasSavedReconnectURL {
                 codex.lastErrorMessage = nil
                 return .fallbackToSaved
             }
@@ -464,7 +514,7 @@ extension ContentViewModel {
         case .noTrustedMac:
             return .fallbackToSaved
         case .invalidResponse(let message), .network(let message):
-            if !codex.hasSavedRelaySession {
+            if !hasSavedReconnectURL {
                 codex.lastErrorMessage = message
             }
             return .fallbackToSaved
@@ -472,12 +522,101 @@ extension ContentViewModel {
     }
 
     // Reuses the last QR-resolved session when trusted lookup is unavailable or not yet supported end-to-end.
-    private func savedReconnectURL(codex: CodexService) -> String? {
+    private func savedReconnectURL(codex: CodexService, targetMacDeviceId: String?) -> String? {
         guard let sessionId = codex.normalizedRelaySessionId,
               let relayURL = codex.normalizedRelayURL else {
             return nil
         }
+
+        if let normalizedTargetMacDeviceId = normalizedMacDeviceId(targetMacDeviceId),
+           codex.normalizedRelayMacDeviceId != normalizedTargetMacDeviceId {
+            return nil
+        }
         return "\(relayURL)/\(sessionId)"
+    }
+
+    func switchToTrustedMac(deviceId: String, codex: CodexService) async throws {
+        let normalizedTargetMacDeviceId = try normalizedRequiredMacDeviceId(deviceId)
+        guard normalizedTargetMacDeviceId != codex.normalizedCurrentTrustedMacDeviceId else {
+            return
+        }
+
+        let previousCurrentTrustedMacDeviceId = codex.normalizedCurrentTrustedMacDeviceId
+        let previousErrorMessage = codex.lastErrorMessage
+        codex.lastErrorMessage = nil
+
+        await stopAutoReconnectForManualRetry(codex: codex)
+        if !codex.runningThreadIDs.isEmpty
+            || !codex.protectedRunningFallbackThreadIDs.isEmpty
+            || !codex.activeTurnIdByThread.isEmpty {
+            try await codex.interruptAllRunningTurnsBeforeMacSwitch()
+        }
+
+        codex.saveLocalState(for: previousCurrentTrustedMacDeviceId)
+        await codex.disconnect(preserveReconnectIntent: false)
+        codex.clearInMemoryMacScopedState()
+        codex.loadLocalState(for: normalizedTargetMacDeviceId)
+        codex.loadMacScopedDefaultsState(for: normalizedTargetMacDeviceId)
+
+        do {
+            guard let fullURL = await preferredReconnectURL(
+                codex: codex,
+                targetMacDeviceId: normalizedTargetMacDeviceId
+            ) else {
+                throw CodexServiceError.invalidInput("Could not reconnect to the selected Mac.")
+            }
+
+            try await connectWithAutoRecovery(
+                codex: codex,
+                serverURL: fullURL,
+                performAutoRetry: true
+            )
+            codex.setCurrentTrustedMacDeviceId(normalizedTargetMacDeviceId)
+        } catch {
+            codex.clearInMemoryMacScopedState()
+            codex.loadLocalState(for: previousCurrentTrustedMacDeviceId)
+            codex.loadMacScopedDefaultsState(for: previousCurrentTrustedMacDeviceId)
+            if codex.lastErrorMessage?.isEmpty ?? true {
+                codex.lastErrorMessage = codex.userFacingConnectFailureMessage(error)
+            } else if codex.lastErrorMessage == nil {
+                codex.lastErrorMessage = previousErrorMessage
+            }
+            throw error
+        }
+    }
+
+    func switchToScannedMac(pairingPayload: CodexPairingQRPayload, codex: CodexService) async throws {
+        let previousCurrentTrustedMacDeviceId = codex.normalizedCurrentTrustedMacDeviceId
+        let previousErrorMessage = codex.lastErrorMessage
+        let previousRelaySessionSnapshot = captureRelaySessionSnapshot(from: codex)
+        codex.lastErrorMessage = nil
+
+        await stopAutoReconnectForManualScan(codex: codex)
+        codex.saveLocalState(for: previousCurrentTrustedMacDeviceId)
+        codex.rememberRelayPairing(pairingPayload)
+        codex.clearInMemoryMacScopedState()
+        codex.loadLocalState(for: pairingPayload.macDeviceId)
+        codex.loadMacScopedDefaultsState(for: pairingPayload.macDeviceId)
+
+        do {
+            try await connectWithAutoRecovery(
+                codex: codex,
+                serverURL: "\(pairingPayload.relay)/\(pairingPayload.sessionId)",
+                performAutoRetry: true
+            )
+        } catch {
+            codex.setCurrentTrustedMacDeviceId(previousCurrentTrustedMacDeviceId)
+            restoreRelaySessionSnapshot(previousRelaySessionSnapshot, to: codex)
+            codex.clearInMemoryMacScopedState()
+            codex.loadLocalState(for: previousCurrentTrustedMacDeviceId)
+            codex.loadMacScopedDefaultsState(for: previousCurrentTrustedMacDeviceId)
+            if codex.lastErrorMessage?.isEmpty ?? true {
+                codex.lastErrorMessage = codex.userFacingConnectFailureMessage(error)
+            } else if codex.lastErrorMessage == nil {
+                codex.lastErrorMessage = previousErrorMessage
+            }
+            throw error
+        }
     }
 
     // Centralizes reconnect sleeps so manual retry can interrupt stale foreground backoff quickly.
@@ -520,5 +659,74 @@ extension ContentViewModel {
 
     private var shouldContinueManualReconnect: Bool {
         !shouldCancelManualReconnect
+    }
+
+    private func normalizedMacDeviceId(_ deviceId: String?) -> String? {
+        guard let trimmed = deviceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func normalizedRequiredMacDeviceId(_ deviceId: String?) throws -> String {
+        guard let normalizedMacDeviceId = normalizedMacDeviceId(deviceId) else {
+            throw CodexServiceError.invalidInput("A valid Mac device id is required.")
+        }
+        return normalizedMacDeviceId
+    }
+
+    private func captureRelaySessionSnapshot(from codex: CodexService) -> RelaySessionSnapshot {
+        RelaySessionSnapshot(
+            relaySessionId: codex.relaySessionId,
+            relayUrl: codex.relayUrl,
+            relayMacDeviceId: codex.relayMacDeviceId,
+            relayMacIdentityPublicKey: codex.relayMacIdentityPublicKey,
+            relayProtocolVersion: codex.relayProtocolVersion,
+            lastAppliedBridgeOutboundSeq: codex.lastAppliedBridgeOutboundSeq,
+            shouldForceQRBootstrapOnNextHandshake: codex.shouldForceQRBootstrapOnNextHandshake,
+            trustedReconnectFailureCount: codex.trustedReconnectFailureCount,
+            secureConnectionState: codex.secureConnectionState,
+            secureMacFingerprint: codex.secureMacFingerprint
+        )
+    }
+
+    private func restoreRelaySessionSnapshot(_ snapshot: RelaySessionSnapshot, to codex: CodexService) {
+        codex.relaySessionId = snapshot.relaySessionId
+        codex.relayUrl = snapshot.relayUrl
+        codex.relayMacDeviceId = snapshot.relayMacDeviceId
+        codex.relayMacIdentityPublicKey = snapshot.relayMacIdentityPublicKey
+        codex.relayProtocolVersion = snapshot.relayProtocolVersion
+        codex.lastAppliedBridgeOutboundSeq = snapshot.lastAppliedBridgeOutboundSeq
+        codex.shouldForceQRBootstrapOnNextHandshake = snapshot.shouldForceQRBootstrapOnNextHandshake
+        codex.trustedReconnectFailureCount = snapshot.trustedReconnectFailureCount
+        codex.secureConnectionState = snapshot.secureConnectionState
+        codex.secureMacFingerprint = snapshot.secureMacFingerprint
+
+        if let relaySessionId = snapshot.relaySessionId {
+            SecureStore.writeString(relaySessionId, for: CodexSecureKeys.relaySessionId)
+        } else {
+            SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
+        }
+        if let relayUrl = snapshot.relayUrl {
+            SecureStore.writeString(relayUrl, for: CodexSecureKeys.relayUrl)
+        } else {
+            SecureStore.deleteValue(for: CodexSecureKeys.relayUrl)
+        }
+        if let relayMacDeviceId = snapshot.relayMacDeviceId {
+            SecureStore.writeString(relayMacDeviceId, for: CodexSecureKeys.relayMacDeviceId)
+        } else {
+            SecureStore.deleteValue(for: CodexSecureKeys.relayMacDeviceId)
+        }
+        if let relayMacIdentityPublicKey = snapshot.relayMacIdentityPublicKey {
+            SecureStore.writeString(relayMacIdentityPublicKey, for: CodexSecureKeys.relayMacIdentityPublicKey)
+        } else {
+            SecureStore.deleteValue(for: CodexSecureKeys.relayMacIdentityPublicKey)
+        }
+        SecureStore.writeString(String(snapshot.relayProtocolVersion), for: CodexSecureKeys.relayProtocolVersion)
+        SecureStore.writeString(
+            String(snapshot.lastAppliedBridgeOutboundSeq),
+            for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
+        )
     }
 }

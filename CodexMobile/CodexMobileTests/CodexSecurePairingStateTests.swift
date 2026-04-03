@@ -138,6 +138,125 @@ final class CodexSecurePairingStateTests: XCTestCase {
         )
     }
 
+    func testTrustMacPromotesCurrentTrustedMacDeviceId() {
+        let service = CodexService()
+        let macDeviceID = "mac-\(UUID().uuidString)"
+
+        service.trustMac(
+            deviceId: macDeviceID,
+            publicKey: Data(repeating: 6, count: 32).base64EncodedString(),
+            relayURL: "wss://relay.local/relay",
+            displayName: "Desk Mac"
+        )
+
+        XCTAssertEqual(service.normalizedCurrentTrustedMacDeviceId, macDeviceID)
+        XCTAssertEqual(
+            SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId),
+            macDeviceID
+        )
+    }
+
+    func testInitializationMigratesCurrentTrustedMacDeviceIdFromRelayMacDeviceId() {
+        let macDeviceID = "mac-\(UUID().uuidString)"
+        let publicKey = Data(repeating: 12, count: 32).base64EncodedString()
+
+        SecureStore.writeCodable(
+            CodexTrustedMacRegistry(
+                records: [
+                    macDeviceID: CodexTrustedMacRecord(
+                        macDeviceId: macDeviceID,
+                        macIdentityPublicKey: publicKey,
+                        lastPairedAt: Date()
+                    )
+                ]
+            ),
+            for: CodexSecureKeys.trustedMacRegistry
+        )
+        SecureStore.writeString(macDeviceID, for: CodexSecureKeys.relayMacDeviceId)
+
+        let service = CodexService()
+
+        XCTAssertEqual(service.normalizedCurrentTrustedMacDeviceId, macDeviceID)
+        XCTAssertEqual(
+            SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId),
+            macDeviceID
+        )
+    }
+
+    func testInitializationDoesNotInventCurrentTrustedMacWhenLegacyPointersAreUnknown() {
+        let knownMacDeviceID = "mac-\(UUID().uuidString)"
+
+        SecureStore.writeCodable(
+            CodexTrustedMacRegistry(
+                records: [
+                    knownMacDeviceID: CodexTrustedMacRecord(
+                        macDeviceId: knownMacDeviceID,
+                        macIdentityPublicKey: Data(repeating: 13, count: 32).base64EncodedString(),
+                        lastPairedAt: Date()
+                    )
+                ]
+            ),
+            for: CodexSecureKeys.trustedMacRegistry
+        )
+        SecureStore.writeString("mac-missing", for: CodexSecureKeys.lastTrustedMacDeviceId)
+
+        let service = CodexService()
+
+        XCTAssertNil(service.normalizedCurrentTrustedMacDeviceId)
+        XCTAssertNil(SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId))
+    }
+
+    func testInitializationMigratesCurrentTrustedMacDeviceIdFromLastTrustedMacDeviceId() {
+        let macDeviceID = "mac-\(UUID().uuidString)"
+        let publicKey = Data(repeating: 14, count: 32).base64EncodedString()
+
+        SecureStore.writeCodable(
+            CodexTrustedMacRegistry(
+                records: [
+                    macDeviceID: CodexTrustedMacRecord(
+                        macDeviceId: macDeviceID,
+                        macIdentityPublicKey: publicKey,
+                        lastPairedAt: Date()
+                    )
+                ]
+            ),
+            for: CodexSecureKeys.trustedMacRegistry
+        )
+        SecureStore.writeString(macDeviceID, for: CodexSecureKeys.lastTrustedMacDeviceId)
+
+        let service = CodexService()
+
+        XCTAssertEqual(service.normalizedCurrentTrustedMacDeviceId, macDeviceID)
+        XCTAssertEqual(
+            SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId),
+            macDeviceID
+        )
+    }
+
+    func testClearSavedRelaySessionFallsBackToCurrentTrustedMacState() {
+        let service = CodexService()
+        let macDeviceID = "mac-\(UUID().uuidString)"
+        let publicKey = Data(repeating: 15, count: 32).base64EncodedString()
+
+        service.trustedMacRegistry.records[macDeviceID] = CodexTrustedMacRecord(
+            macDeviceId: macDeviceID,
+            macIdentityPublicKey: publicKey,
+            lastPairedAt: Date(),
+            relayURL: "wss://relay.local/relay"
+        )
+        service.setCurrentTrustedMacDeviceId(macDeviceID)
+        service.relaySessionId = "saved-session"
+        service.relayUrl = "wss://relay.local/relay"
+        service.relayMacDeviceId = macDeviceID
+        service.relayMacIdentityPublicKey = publicKey
+
+        service.clearSavedRelaySession()
+
+        XCTAssertEqual(service.secureConnectionState, .liveSessionUnresolved)
+        XCTAssertEqual(service.secureMacFingerprint, codexSecureFingerprint(for: publicKey))
+        XCTAssertNil(service.normalizedRelaySessionId)
+    }
+
     // Clears the persisted relay session keys touched by secure reconnect tests.
     private func clearStoredSecureRelayState() {
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
@@ -147,6 +266,7 @@ final class CodexSecurePairingStateTests: XCTestCase {
         SecureStore.deleteValue(for: CodexSecureKeys.relayProtocolVersion)
         SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
         SecureStore.deleteValue(for: CodexSecureKeys.trustedMacRegistry)
+        SecureStore.deleteValue(for: CodexSecureKeys.currentTrustedMacDeviceId)
         SecureStore.deleteValue(for: CodexSecureKeys.lastTrustedMacDeviceId)
     }
 }

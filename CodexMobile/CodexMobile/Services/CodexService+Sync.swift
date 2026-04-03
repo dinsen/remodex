@@ -475,7 +475,7 @@ extension CodexService {
         threads.removeAll { $0.id == threadId }
         messagesByThread.removeValue(forKey: threadId)
         if persistMessages {
-            messagePersistence.save(messagesByThread)
+            persistCurrentMacMessages()
         }
 
         hydratedThreadIDs.remove(threadId)
@@ -710,28 +710,28 @@ extension CodexService {
     private static let locallyDeletedThreadIDsKey = "codex.locallyDeletedThreadIDs"
 
     var locallyArchivedThreadIDs: Set<String> {
-        Set(defaults.stringArray(forKey: Self.locallyArchivedThreadIDsKey) ?? [])
+        Set(defaults.stringArray(forKey: macScopedDefaultsKey(Self.locallyArchivedThreadIDsKey)) ?? [])
     }
 
     var locallyDeletedThreadIDs: Set<String> {
-        Set(defaults.stringArray(forKey: Self.locallyDeletedThreadIDsKey) ?? [])
+        Set(defaults.stringArray(forKey: macScopedDefaultsKey(Self.locallyDeletedThreadIDsKey)) ?? [])
     }
 
     private func addLocallyArchivedThreadID(_ threadId: String) {
         var ids = locallyArchivedThreadIDs
         ids.insert(threadId)
-        defaults.set(Array(ids), forKey: Self.locallyArchivedThreadIDsKey)
+        defaults.set(Array(ids), forKey: macScopedDefaultsKey(Self.locallyArchivedThreadIDsKey))
     }
 
     private func removeLocallyArchivedThreadID(_ threadId: String) {
         var ids = locallyArchivedThreadIDs
         ids.remove(threadId)
-        defaults.set(Array(ids), forKey: Self.locallyArchivedThreadIDsKey)
+        defaults.set(Array(ids), forKey: macScopedDefaultsKey(Self.locallyArchivedThreadIDsKey))
     }
 
     private func addLocallyDeletedThreadID(_ threadId: String) {
         var ids = locallyDeletedThreadIDs
         ids.insert(threadId)
-        defaults.set(Array(ids), forKey: Self.locallyDeletedThreadIDsKey)
+        defaults.set(Array(ids), forKey: macScopedDefaultsKey(Self.locallyDeletedThreadIDsKey))
     }
 }

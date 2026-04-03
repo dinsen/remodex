@@ -78,17 +78,19 @@ extension CodexService {
 
 private extension CodexService {
     // Chooses the Mac identity the UI should surface first: the live relay target when available,
-    // otherwise the preferred trusted Mac remembered for reconnect.
+    // otherwise the explicitly selected current trusted Mac.
     var visibleTrustedMacRecord: CodexTrustedMacRecord? {
         if let normalizedRelayMacDeviceId,
+           (normalizedCurrentTrustedMacDeviceId == nil
+                || normalizedCurrentTrustedMacDeviceId == normalizedRelayMacDeviceId),
            let trustedMac = trustedMacRegistry.records[normalizedRelayMacDeviceId] {
             return trustedMac
         }
 
-        return preferredTrustedMacRecord
+        return currentTrustedMacRecord
     }
 
-    // Reuses the connected device id when available, otherwise falls back to the saved preferred Mac.
+    // Reuses the connected device id when available, otherwise falls back to the explicit current Mac.
     var trustedPairDeviceId: String? {
         normalizedRelayMacDeviceId ?? visibleTrustedMacRecord?.macDeviceId
     }

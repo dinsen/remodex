@@ -310,7 +310,7 @@ extension CodexService {
            let trustedMac = trustedMacRegistry.records[relayMacDeviceId] {
             secureConnectionState = .trustedMac
             secureMacFingerprint = codexSecureFingerprint(for: trustedMac.macIdentityPublicKey)
-        } else if let trustedMac = preferredTrustedMacRecord {
+        } else if let trustedMac = currentTrustedMacRecord {
             secureConnectionState = .liveSessionUnresolved
             secureMacFingerprint = codexSecureFingerprint(for: trustedMac.macIdentityPublicKey)
         } else if normalizedRelaySessionId != nil {
@@ -323,12 +323,12 @@ extension CodexService {
     }
 
     // Used by: ContentViewModel trusted reconnect path.
-    func resolveTrustedMacSession() async throws -> CodexTrustedSessionResolveResponse {
+    func resolveTrustedMacSession(deviceId: String? = nil) async throws -> CodexTrustedSessionResolveResponse {
         let resolver = trustedSessionResolverOverride ?? { [weak self] in
             guard let self else {
                 throw CancellationError()
             }
-            return try await self.resolveTrustedMacSessionImpl()
+            return try await self.resolveTrustedMacSessionImpl(deviceId: deviceId)
         }
         let resolveTaskID = UUID()
         let task = Task {
@@ -367,6 +367,27 @@ extension CodexService {
             lastAppliedBridgeOutboundSeq = 0
         }
         rememberResolvedTrustedSession(resolved, relayURL: relayURL)
+    }
+}
+
+extension CodexService {
+    func trustMac(deviceId: String, publicKey: String, relayURL: String?, displayName: String?) {
+        let existing = trustedMacRegistry.records[deviceId]
+        trustedMacRegistry.records[deviceId] = CodexTrustedMacRecord(
+            macDeviceId: deviceId,
+            macIdentityPublicKey: publicKey,
+            lastPairedAt: Date(),
+            relayURL: relayURL ?? existing?.relayURL,
+            displayName: displayName ?? existing?.displayName,
+            lastResolvedSessionId: existing?.lastResolvedSessionId,
+            lastResolvedAt: existing?.lastResolvedAt,
+            lastUsedAt: Date()
+        )
+        SecureStore.writeCodable(trustedMacRegistry, for: CodexSecureKeys.trustedMacRegistry)
+        setCurrentTrustedMacDeviceId(deviceId)
+        SecureStore.writeString(deviceId, for: CodexSecureKeys.lastTrustedMacDeviceId)
+        lastTrustedMacDeviceId = deviceId
+        secureMacFingerprint = codexSecureFingerprint(for: publicKey)
     }
 }
 
@@ -530,27 +551,9 @@ private extension CodexService {
         }
     }
 
-    func trustMac(deviceId: String, publicKey: String, relayURL: String?, displayName: String?) {
-        let existing = trustedMacRegistry.records[deviceId]
-        trustedMacRegistry.records[deviceId] = CodexTrustedMacRecord(
-            macDeviceId: deviceId,
-            macIdentityPublicKey: publicKey,
-            lastPairedAt: Date(),
-            relayURL: relayURL ?? existing?.relayURL,
-            displayName: displayName ?? existing?.displayName,
-            lastResolvedSessionId: existing?.lastResolvedSessionId,
-            lastResolvedAt: existing?.lastResolvedAt,
-            lastUsedAt: Date()
-        )
-        SecureStore.writeCodable(trustedMacRegistry, for: CodexSecureKeys.trustedMacRegistry)
-        SecureStore.writeString(deviceId, for: CodexSecureKeys.lastTrustedMacDeviceId)
-        lastTrustedMacDeviceId = deviceId
-        secureMacFingerprint = codexSecureFingerprint(for: publicKey)
-    }
-
     // Resolves the live relay session for the preferred trusted Mac before we reconnect the socket.
-    func resolveTrustedMacSessionImpl() async throws -> CodexTrustedSessionResolveResponse {
-        guard let trustedMac = preferredTrustedMacRecord else {
+    func resolveTrustedMacSessionImpl(deviceId: String? = nil) async throws -> CodexTrustedSessionResolveResponse {
+        guard let trustedMac = trustedMacRecord(for: deviceId) ?? currentTrustedMacRecord else {
             throw CodexTrustedSessionResolveError.noTrustedMac
         }
         guard let relayURL = trustedMac.relayURL?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -661,6 +664,10 @@ private extension CodexService {
         trustedReconnectFailureCount = 0
         secureConnectionState = .trustedMac
         secureMacFingerprint = codexSecureFingerprint(for: resolved.macIdentityPublicKey)
+        if normalizedCurrentTrustedMacDeviceId == nil
+            || normalizedCurrentTrustedMacDeviceId == resolved.macDeviceId {
+            setCurrentTrustedMacDeviceId(resolved.macDeviceId)
+        }
         SecureStore.writeString(resolved.macDeviceId, for: CodexSecureKeys.lastTrustedMacDeviceId)
         lastTrustedMacDeviceId = resolved.macDeviceId
 

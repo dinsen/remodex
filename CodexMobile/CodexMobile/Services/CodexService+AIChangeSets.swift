@@ -473,7 +473,8 @@ private extension CodexService {
                     return $0.createdAt < $1.createdAt
                 }
                 return $0.id < $1.id
-            }
+            },
+            macDeviceId: currentMacScopedPersistenceDeviceId
         )
     }
 

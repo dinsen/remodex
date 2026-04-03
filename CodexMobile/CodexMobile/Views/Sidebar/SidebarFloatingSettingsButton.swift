@@ -1,12 +1,14 @@
 // FILE: SidebarFloatingSettingsButton.swift
-// Purpose: Floating shortcut used to open sidebar settings.
+// Purpose: Floating shortcuts used to open top-level sidebar destinations.
 // Layer: View Component
-// Exports: SidebarFloatingSettingsButton, SidebarMacConnectionStatusView
+// Exports: SidebarFloatingSettingsButton, SidebarFloatingMacsButton, SidebarMacConnectionStatusView
 
 import SwiftUI
 
-struct SidebarFloatingSettingsButton: View {
+private struct SidebarFloatingCircleButton: View {
     let colorScheme: ColorScheme
+    let systemImage: String
+    let accessibilityLabel: String
     let action: () -> Void
 
     var body: some View {
@@ -14,7 +16,7 @@ struct SidebarFloatingSettingsButton: View {
             HapticFeedback.shared.triggerImpactFeedback()
             action()
         }) {
-            Image(systemName: "gearshape.fill")
+            Image(systemName: systemImage)
                 .font(AppFont.system(size: 17, weight: .semibold))
                 .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
                 .frame(width: 44, height: 44)
@@ -22,7 +24,35 @@ struct SidebarFloatingSettingsButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(Circle())
-        .accessibilityLabel("Settings")
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+struct SidebarFloatingSettingsButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        SidebarFloatingCircleButton(
+            colorScheme: colorScheme,
+            systemImage: "gearshape.fill",
+            accessibilityLabel: "Settings",
+            action: action
+        )
+    }
+}
+
+struct SidebarFloatingMacsButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        SidebarFloatingCircleButton(
+            colorScheme: colorScheme,
+            systemImage: "desktopcomputer",
+            accessibilityLabel: "My Macs",
+            action: action
+        )
     }
 }
 

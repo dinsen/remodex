@@ -466,44 +466,52 @@ extension CodexService {
     static let gptPendingLoginCallbackDefaultsKey = "codex.gpt.pendingLoginCallbackState"
 
     var gptPendingLoginState: CodexGPTLoginState? {
-        get {
-            guard let data = defaults.data(forKey: Self.gptPendingLoginStateDefaultsKey),
-                  let state = try? decoder.decode(CodexGPTLoginState.self, from: data) else {
-                return nil
-            }
+        get { gptPendingLoginState(macDeviceId: normalizedCurrentTrustedMacDeviceId) }
+        set { setGPTPendingLoginState(newValue, macDeviceId: normalizedCurrentTrustedMacDeviceId) }
+    }
 
-            return state.isExpired ? nil : state
+    func gptPendingLoginState(macDeviceId: String?) -> CodexGPTLoginState? {
+        guard let data = defaults.data(forKey: macScopedDefaultsKey(Self.gptPendingLoginStateDefaultsKey, macDeviceId: macDeviceId)),
+              let state = try? decoder.decode(CodexGPTLoginState.self, from: data) else {
+            return nil
         }
-        set {
-            if let newValue {
-                guard let data = try? encoder.encode(newValue) else {
-                    return
-                }
-                defaults.set(data, forKey: Self.gptPendingLoginStateDefaultsKey)
-            } else {
-                defaults.removeObject(forKey: Self.gptPendingLoginStateDefaultsKey)
+
+        return state.isExpired ? nil : state
+    }
+
+    func setGPTPendingLoginState(_ newValue: CodexGPTLoginState?, macDeviceId: String?) {
+        if let newValue {
+            guard let data = try? encoder.encode(newValue) else {
+                return
             }
+            defaults.set(data, forKey: macScopedDefaultsKey(Self.gptPendingLoginStateDefaultsKey, macDeviceId: macDeviceId))
+        } else {
+            defaults.removeObject(forKey: macScopedDefaultsKey(Self.gptPendingLoginStateDefaultsKey, macDeviceId: macDeviceId))
         }
     }
 
     var gptPendingLoginCallbackState: CodexGPTLoginCallbackState? {
-        get {
-            guard let data = defaults.data(forKey: Self.gptPendingLoginCallbackDefaultsKey),
-                  let state = try? decoder.decode(CodexGPTLoginCallbackState.self, from: data) else {
-                return nil
-            }
+        get { gptPendingLoginCallbackState(macDeviceId: normalizedCurrentTrustedMacDeviceId) }
+        set { setGPTPendingLoginCallbackState(newValue, macDeviceId: normalizedCurrentTrustedMacDeviceId) }
+    }
 
-            return state.isExpired ? nil : state
+    func gptPendingLoginCallbackState(macDeviceId: String?) -> CodexGPTLoginCallbackState? {
+        guard let data = defaults.data(forKey: macScopedDefaultsKey(Self.gptPendingLoginCallbackDefaultsKey, macDeviceId: macDeviceId)),
+              let state = try? decoder.decode(CodexGPTLoginCallbackState.self, from: data) else {
+            return nil
         }
-        set {
-            if let newValue {
-                guard let data = try? encoder.encode(newValue) else {
-                    return
-                }
-                defaults.set(data, forKey: Self.gptPendingLoginCallbackDefaultsKey)
-            } else {
-                defaults.removeObject(forKey: Self.gptPendingLoginCallbackDefaultsKey)
+
+        return state.isExpired ? nil : state
+    }
+
+    func setGPTPendingLoginCallbackState(_ newValue: CodexGPTLoginCallbackState?, macDeviceId: String?) {
+        if let newValue {
+            guard let data = try? encoder.encode(newValue) else {
+                return
             }
+            defaults.set(data, forKey: macScopedDefaultsKey(Self.gptPendingLoginCallbackDefaultsKey, macDeviceId: macDeviceId))
+        } else {
+            defaults.removeObject(forKey: macScopedDefaultsKey(Self.gptPendingLoginCallbackDefaultsKey, macDeviceId: macDeviceId))
         }
     }
 
@@ -533,19 +541,19 @@ extension CodexService {
         return callbackState
     }
 
-    func loadPersistedGPTAccountSnapshot() -> CodexGPTAccountSnapshot? {
-        guard let data = defaults.data(forKey: Self.gptAccountSnapshotDefaultsKey),
+    func loadPersistedGPTAccountSnapshot(macDeviceId: String? = nil) -> CodexGPTAccountSnapshot? {
+        guard let data = defaults.data(forKey: macScopedDefaultsKey(Self.gptAccountSnapshotDefaultsKey, macDeviceId: macDeviceId)),
               let snapshot = try? decoder.decode(CodexGPTAccountSnapshot.self, from: data) else {
             return nil
         }
         return snapshot
     }
 
-    func persistGPTAccountSnapshot(_ snapshot: CodexGPTAccountSnapshot) {
+    func persistGPTAccountSnapshot(_ snapshot: CodexGPTAccountSnapshot, macDeviceId: String? = nil) {
         guard let data = try? encoder.encode(snapshot) else {
             return
         }
-        defaults.set(data, forKey: Self.gptAccountSnapshotDefaultsKey)
+        defaults.set(data, forKey: macScopedDefaultsKey(Self.gptAccountSnapshotDefaultsKey, macDeviceId: macDeviceId))
     }
 
     func clearGPTLoginState() {

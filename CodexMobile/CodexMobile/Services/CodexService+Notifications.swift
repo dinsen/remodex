@@ -102,6 +102,9 @@ extension CodexService {
             return
         }
 
+        if remoteNotificationRegistrar == nil {
+            remoteNotificationRegistrar = CodexApplicationRemoteNotificationRegistrar()
+        }
         let delegateProxy = CodexNotificationCenterDelegateProxy(service: self)
         notificationCenterDelegateProxy = delegateProxy
         userNotificationCenter.delegate = delegateProxy
@@ -158,7 +161,7 @@ extension CodexService {
             return
         }
 
-        remoteNotificationRegistrar.registerForRemoteNotifications()
+        remoteNotificationRegistrar?.registerForRemoteNotifications()
     }
 
     // Persists the APNs token and syncs it to the paired bridge when possible.

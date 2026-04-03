@@ -140,7 +140,7 @@ extension CodexService {
             return
         }
 
-        defaults.set(encoded, forKey: Self.forkedThreadOriginsDefaultsKey)
+        defaults.set(encoded, forKey: macScopedDefaultsKey(Self.forkedThreadOriginsDefaultsKey))
     }
 
     // Keeps user-renamed thread titles durable even when thread/list returns only the server fallback title.
@@ -160,7 +160,7 @@ extension CodexService {
             return
         }
 
-        defaults.set(encoded, forKey: Self.renamedThreadNamesDefaultsKey)
+        defaults.set(encoded, forKey: macScopedDefaultsKey(Self.renamedThreadNamesDefaultsKey))
     }
 
     func persistedThreadRename(for threadId: String?) -> String? {
