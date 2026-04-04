@@ -550,6 +550,10 @@ extension CodexService {
     }
 
     func persistGPTAccountSnapshot(_ snapshot: CodexGPTAccountSnapshot, macDeviceId: String? = nil) {
+        guard !suspendAutomaticMacScopedPersistence, !isApplyingMacScopedState else {
+            return
+        }
+
         guard let data = try? encoder.encode(snapshot) else {
             return
         }

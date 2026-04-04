@@ -543,16 +543,14 @@ extension ContentViewModel {
 
         let previousCurrentTrustedMacDeviceId = codex.normalizedCurrentTrustedMacDeviceId
         let previousErrorMessage = codex.lastErrorMessage
+        let previousRelaySessionSnapshot = captureRelaySessionSnapshot(from: codex)
         codex.lastErrorMessage = nil
 
+        try await interruptRunningTurnsBeforeMacSwitchIfNeeded(codex: codex)
         await stopAutoReconnectForManualRetry(codex: codex)
-        if !codex.runningThreadIDs.isEmpty
-            || !codex.protectedRunningFallbackThreadIDs.isEmpty
-            || !codex.activeTurnIdByThread.isEmpty {
-            try await codex.interruptAllRunningTurnsBeforeMacSwitch()
-        }
 
         codex.saveLocalState(for: previousCurrentTrustedMacDeviceId)
+        beginMacSwitchContext(normalizedTargetMacDeviceId, codex: codex)
         await codex.disconnect(preserveReconnectIntent: false)
         codex.clearInMemoryMacScopedState()
         codex.loadLocalState(for: normalizedTargetMacDeviceId)
@@ -572,10 +570,15 @@ extension ContentViewModel {
                 performAutoRetry: true
             )
             codex.setCurrentTrustedMacDeviceId(normalizedTargetMacDeviceId)
+            endMacSwitchContext(codex: codex)
         } catch {
+            restoreRelaySessionSnapshot(previousRelaySessionSnapshot, to: codex)
+            codex.setCurrentTrustedMacDeviceId(previousCurrentTrustedMacDeviceId)
+            codex.macScopedContextOverrideDeviceId = previousCurrentTrustedMacDeviceId
             codex.clearInMemoryMacScopedState()
             codex.loadLocalState(for: previousCurrentTrustedMacDeviceId)
             codex.loadMacScopedDefaultsState(for: previousCurrentTrustedMacDeviceId)
+            endMacSwitchContext(codex: codex)
             if codex.lastErrorMessage?.isEmpty ?? true {
                 codex.lastErrorMessage = codex.userFacingConnectFailureMessage(error)
             } else if codex.lastErrorMessage == nil {
@@ -591,8 +594,10 @@ extension ContentViewModel {
         let previousRelaySessionSnapshot = captureRelaySessionSnapshot(from: codex)
         codex.lastErrorMessage = nil
 
+        try await interruptRunningTurnsBeforeMacSwitchIfNeeded(codex: codex)
         await stopAutoReconnectForManualScan(codex: codex)
         codex.saveLocalState(for: previousCurrentTrustedMacDeviceId)
+        beginMacSwitchContext(pairingPayload.macDeviceId, codex: codex)
         codex.rememberRelayPairing(pairingPayload)
         codex.clearInMemoryMacScopedState()
         codex.loadLocalState(for: pairingPayload.macDeviceId)
@@ -604,12 +609,15 @@ extension ContentViewModel {
                 serverURL: "\(pairingPayload.relay)/\(pairingPayload.sessionId)",
                 performAutoRetry: true
             )
+            endMacSwitchContext(codex: codex)
         } catch {
             codex.setCurrentTrustedMacDeviceId(previousCurrentTrustedMacDeviceId)
             restoreRelaySessionSnapshot(previousRelaySessionSnapshot, to: codex)
+            codex.macScopedContextOverrideDeviceId = previousCurrentTrustedMacDeviceId
             codex.clearInMemoryMacScopedState()
             codex.loadLocalState(for: previousCurrentTrustedMacDeviceId)
             codex.loadMacScopedDefaultsState(for: previousCurrentTrustedMacDeviceId)
+            endMacSwitchContext(codex: codex)
             if codex.lastErrorMessage?.isEmpty ?? true {
                 codex.lastErrorMessage = codex.userFacingConnectFailureMessage(error)
             } else if codex.lastErrorMessage == nil {
@@ -674,6 +682,30 @@ extension ContentViewModel {
             throw CodexServiceError.invalidInput("A valid Mac device id is required.")
         }
         return normalizedMacDeviceId
+    }
+
+    private func beginMacSwitchContext(_ macDeviceId: String?, codex: CodexService) {
+        codex.suspendAutomaticMacScopedPersistence = true
+        codex.macScopedContextOverrideDeviceId = normalizedMacDeviceId(macDeviceId)
+    }
+
+    private func endMacSwitchContext(codex: CodexService) {
+        codex.macScopedContextOverrideDeviceId = nil
+        codex.suspendAutomaticMacScopedPersistence = false
+    }
+
+    private func interruptRunningTurnsBeforeMacSwitchIfNeeded(codex: CodexService) async throws {
+        guard codex.isConnected || codex.isInitialized else {
+            return
+        }
+
+        guard !codex.runningThreadIDs.isEmpty
+            || !codex.protectedRunningFallbackThreadIDs.isEmpty
+            || !codex.activeTurnIdByThread.isEmpty else {
+            return
+        }
+
+        try await codex.interruptAllRunningTurnsBeforeMacSwitch()
     }
 
     private func captureRelaySessionSnapshot(from codex: CodexService) -> RelaySessionSnapshot {

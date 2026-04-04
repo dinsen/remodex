@@ -458,6 +458,9 @@ final class CodexService {
     var trustedMacRegistry: CodexTrustedMacRegistry
     var currentTrustedMacDeviceId: String?
     var lastTrustedMacDeviceId: String?
+    @ObservationIgnored var macScopedContextOverrideDeviceId: String?
+    @ObservationIgnored var suspendAutomaticMacScopedPersistence = false
+    @ObservationIgnored var isApplyingMacScopedState = false
     var pendingSecureControlContinuations: [String: [CodexSecureControlWaiter]] = [:]
     var bufferedSecureControlMessages: [String: [String]] = [:]
     // Assistant-scoped patch ledger used by the revert-changes flow.
@@ -541,29 +544,13 @@ final class CodexService {
 
         self.threadRuntimeOverridesByThreadID = [:]
 
-        if let savedPlanSessionSources = defaults.data(forKey: Self.planSessionSourcesDefaultsKey),
-           let decodedPlanSessionSources = try? decoder.decode(
-               [String: CodexPlanSessionSource].self,
-               from: savedPlanSessionSources
-           ) {
-            self.planSessionSourceByThread = decodedPlanSessionSources
-        } else {
-            self.planSessionSourceByThread = [:]
-        }
+        self.planSessionSourceByThread = [:]
 
         self.forkedFromThreadIDByThreadID = [:]
 
         self.renamedThreadNameByThreadID = [:]
 
-        if let savedAssociatedManagedWorktreePaths = defaults.data(forKey: Self.associatedManagedWorktreePathsDefaultsKey),
-           let decodedAssociatedManagedWorktreePaths = try? decoder.decode(
-               [String: String].self,
-               from: savedAssociatedManagedWorktreePaths
-           ) {
-            self.associatedManagedWorktreePathByThreadID = decodedAssociatedManagedWorktreePaths
-        } else {
-            self.associatedManagedWorktreePathByThreadID = [:]
-        }
+        self.associatedManagedWorktreePathByThreadID = [:]
 
         let savedServiceTier = defaults.string(forKey: Self.selectedServiceTierDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -601,6 +588,7 @@ final class CodexService {
             self.lastAppliedBridgeOutboundSeq = parsedLastAppliedSeq
         }
         migrateCurrentTrustedMacDeviceIdIfNeeded()
+        migrateLegacyMacScopedDefaultsIfNeeded()
         loadCurrentMacScopedDefaultsState()
         loadCurrentMacScopedLocalState()
         self.remoteNotificationDeviceToken = SecureStore.readString(for: CodexSecureKeys.pushDeviceToken)
@@ -617,17 +605,21 @@ final class CodexService {
 
     // Persists per-thread plan-mode provenance so reconnect/relaunch keeps native vs fallback behavior stable.
     private func persistPlanSessionSources() {
+        guard !suspendAutomaticMacScopedPersistence, !isApplyingMacScopedState else {
+            return
+        }
+
         guard !planSessionSourceByThread.isEmpty else {
-            defaults.removeObject(forKey: Self.planSessionSourcesDefaultsKey)
+            defaults.removeObject(forKey: macScopedDefaultsKey(Self.planSessionSourcesDefaultsKey))
             return
         }
 
         guard let data = try? encoder.encode(planSessionSourceByThread) else {
-            defaults.removeObject(forKey: Self.planSessionSourcesDefaultsKey)
+            defaults.removeObject(forKey: macScopedDefaultsKey(Self.planSessionSourcesDefaultsKey))
             return
         }
 
-        defaults.set(data, forKey: Self.planSessionSourcesDefaultsKey)
+        defaults.set(data, forKey: macScopedDefaultsKey(Self.planSessionSourcesDefaultsKey))
     }
 
     // Remembers whether we can offer reconnect without forcing a fresh QR scan.

@@ -99,6 +99,38 @@ final class CodexTrustedMacSelectionTests: XCTestCase {
         XCTAssertNil(SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId))
     }
 
+    func testTrustedPairPresentationUsesVisibleCurrentMacInsteadOfStaleRelayMac() {
+        let service = makeService()
+        let currentMacID = "mac-current-\(UUID().uuidString)"
+        let staleRelayMacID = "mac-stale-\(UUID().uuidString)"
+
+        service.trustedMacRegistry.records[currentMacID] = CodexTrustedMacRecord(
+            macDeviceId: currentMacID,
+            macIdentityPublicKey: Data(repeating: 7, count: 32).base64EncodedString(),
+            lastPairedAt: Date(),
+            displayName: "Current Mac"
+        )
+        service.trustedMacRegistry.records[staleRelayMacID] = CodexTrustedMacRecord(
+            macDeviceId: staleRelayMacID,
+            macIdentityPublicKey: Data(repeating: 8, count: 32).base64EncodedString(),
+            lastPairedAt: Date(),
+            displayName: "Stale Mac"
+        )
+        service.setCurrentTrustedMacDeviceId(currentMacID)
+        service.relayMacDeviceId = staleRelayMacID
+        SidebarMacNicknameStore.setNickname("Current Alias", for: currentMacID)
+        SidebarMacNicknameStore.setNickname("Stale Alias", for: staleRelayMacID)
+        defer {
+            SidebarMacNicknameStore.setNickname("", for: currentMacID)
+            SidebarMacNicknameStore.setNickname("", for: staleRelayMacID)
+        }
+
+        let presentation = service.trustedPairPresentation
+
+        XCTAssertEqual(presentation?.deviceId, currentMacID)
+        XCTAssertEqual(presentation?.name, "Current Alias")
+    }
+
     private func clearStoredSecureRelayState() {
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
         SecureStore.deleteValue(for: CodexSecureKeys.relayUrl)

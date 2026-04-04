@@ -143,7 +143,9 @@ extension CodexService {
         finalizeAllStreamingState()
         messagePersistenceDebounceTask?.cancel()
         messagePersistenceDebounceTask = nil
-        persistCurrentMacMessages()
+        if !suspendAutomaticMacScopedPersistence {
+            persistCurrentMacMessages()
+        }
         assistantCompletionFingerprintByThread.removeAll()
         recentActivityLineByThread.removeAll()
         removeAllThreadTimelineState()

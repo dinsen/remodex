@@ -92,7 +92,7 @@ private extension CodexService {
 
     // Reuses the connected device id when available, otherwise falls back to the explicit current Mac.
     var trustedPairDeviceId: String? {
-        normalizedRelayMacDeviceId ?? visibleTrustedMacRecord?.macDeviceId
+        visibleTrustedMacRecord?.macDeviceId ?? normalizedRelayMacDeviceId
     }
 
     var trustedPairDisplayName: String? {

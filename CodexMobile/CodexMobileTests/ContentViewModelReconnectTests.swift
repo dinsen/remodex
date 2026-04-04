@@ -405,6 +405,137 @@ final class ContentViewModelReconnectTests: XCTestCase {
         XCTAssertFalse(viewModel.isAttemptingManualReconnect)
     }
 
+    func testDisconnectPersistsMacScopedOverrideNamespace() async {
+        let service = makeService()
+        let currentMacDeviceID = "mac-current-\(UUID().uuidString)"
+        let targetMacDeviceID = "mac-target-\(UUID().uuidString)"
+
+        service.setCurrentTrustedMacDeviceId(currentMacDeviceID)
+        service.messagesByThread = [
+            "thread-current": [makeMessage(threadID: "thread-current", text: "current")]
+        ]
+        service.saveLocalState(for: currentMacDeviceID)
+
+        service.messagesByThread = [
+            "thread-target": [makeMessage(threadID: "thread-target", text: "target")]
+        ]
+        service.macScopedContextOverrideDeviceId = targetMacDeviceID
+
+        await service.disconnect()
+
+        XCTAssertEqual(
+            service.messagePersistence.load(macDeviceId: currentMacDeviceID)["thread-current"]?.first?.text,
+            "current"
+        )
+        XCTAssertEqual(
+            service.messagePersistence.load(macDeviceId: targetMacDeviceID)["thread-target"]?.first?.text,
+            "target"
+        )
+    }
+
+    func testSwitchToTrustedMacFailureRestoresPreviousMacNamespaceWithoutPersistingTargetDrafts() async {
+        let service = makeService()
+        let viewModel = ContentViewModel()
+        let currentMacDeviceID = "mac-current-\(UUID().uuidString)"
+        let targetMacDeviceID = "mac-target-\(UUID().uuidString)"
+        let relayURL = "wss://relay.local/relay"
+
+        service.trustedMacRegistry.records[currentMacDeviceID] = CodexTrustedMacRecord(
+            macDeviceId: currentMacDeviceID,
+            macIdentityPublicKey: Data(repeating: 31, count: 32).base64EncodedString(),
+            lastPairedAt: Date(),
+            relayURL: relayURL
+        )
+        service.trustedMacRegistry.records[targetMacDeviceID] = CodexTrustedMacRecord(
+            macDeviceId: targetMacDeviceID,
+            macIdentityPublicKey: Data(repeating: 32, count: 32).base64EncodedString(),
+            lastPairedAt: Date(),
+            relayURL: relayURL
+        )
+        service.setCurrentTrustedMacDeviceId(currentMacDeviceID)
+        service.messagesByThread = [
+            "thread-current": [makeMessage(threadID: "thread-current", text: "current")]
+        ]
+        service.saveLocalState(for: currentMacDeviceID)
+        service.messagesByThread = [
+            "thread-target-old": [makeMessage(threadID: "thread-target-old", text: "target-old")]
+        ]
+        service.saveLocalState(for: targetMacDeviceID)
+        service.loadLocalState(for: currentMacDeviceID)
+        service.trustedSessionResolverOverride = {
+            CodexTrustedSessionResolveResponse(
+                ok: true,
+                macDeviceId: targetMacDeviceID,
+                macIdentityPublicKey: Data(repeating: 33, count: 32).base64EncodedString(),
+                displayName: "Target Mac",
+                sessionId: "target-session"
+            )
+        }
+        viewModel.connectOverride = { codex, _ in
+            codex.messagesByThread = [
+                "thread-target-new": [makeMessage(threadID: "thread-target-new", text: "target-new")]
+            ]
+            await codex.disconnect()
+            throw CodexServiceError.disconnected
+        }
+
+        do {
+            try await viewModel.switchToTrustedMac(deviceId: targetMacDeviceID, codex: service)
+            XCTFail("Expected switch failure to roll back.")
+        } catch {
+            // Expected.
+        }
+
+        XCTAssertEqual(service.normalizedCurrentTrustedMacDeviceId, currentMacDeviceID)
+
+        let currentMessages = service.messagePersistence.load(macDeviceId: currentMacDeviceID)
+        let targetMessages = service.messagePersistence.load(macDeviceId: targetMacDeviceID)
+        XCTAssertEqual(currentMessages["thread-current"]?.first?.text, "current")
+        XCTAssertEqual(targetMessages["thread-target-old"]?.first?.text, "target-old")
+        XCTAssertNil(targetMessages["thread-target-new"])
+    }
+
+    func testSwitchToScannedMacInterruptsRunningTurnsBeforeConnecting() async {
+        let service = makeService()
+        let viewModel = ContentViewModel()
+        var events: [String] = []
+
+        service.isConnected = true
+        service.runningThreadIDs = ["thread-1"]
+        service.activeTurnIdByThread["thread-1"] = "turn-1"
+        service.requestTransportOverride = { method, _ in
+            events.append(method)
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([:]),
+                includeJSONRPC: false
+            )
+        }
+        viewModel.connectOverride = { _, _ in
+            events.append("connect")
+            throw CancellationError()
+        }
+
+        do {
+            try await viewModel.switchToScannedMac(
+                pairingPayload: CodexPairingQRPayload(
+                    v: codexPairingQRVersion,
+                    relay: "wss://relay.local/relay",
+                    sessionId: "session-\(UUID().uuidString)",
+                    macDeviceId: "mac-\(UUID().uuidString)",
+                    macIdentityPublicKey: Data(repeating: 34, count: 32).base64EncodedString(),
+                    expiresAt: Int64(Date().addingTimeInterval(60).timeIntervalSince1970 * 1000)
+                ),
+                codex: service
+            )
+            XCTFail("Expected connect override to abort the switch.")
+        } catch {
+            // Expected.
+        }
+
+        XCTAssertEqual(events.prefix(2), ["turn/interrupt", "connect"])
+    }
+
     private func makeService() -> CodexService {
         let suiteName = "ContentViewModelReconnectTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard
@@ -425,5 +556,13 @@ final class ContentViewModelReconnectTests: XCTestCase {
         SecureStore.deleteValue(for: CodexSecureKeys.trustedMacRegistry)
         SecureStore.deleteValue(for: CodexSecureKeys.currentTrustedMacDeviceId)
         SecureStore.deleteValue(for: CodexSecureKeys.lastTrustedMacDeviceId)
+    }
+
+    private func makeMessage(threadID: String, text: String) -> CodexMessage {
+        CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: text
+        )
     }
 }
