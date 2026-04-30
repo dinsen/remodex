@@ -371,7 +371,7 @@ struct MyMacsView: View {
     }
 
     private func displayIdentity(for trustedMac: CodexTrustedMacRecord) -> MyMacDisplayIdentity {
-        let nickname = SidebarMacNicknameStore.nickname(for: trustedMac.macDeviceId)
+        let nickname = SidebarComputerNicknameStore.nickname(for: trustedMac.macDeviceId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let systemName = trustedMac.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
 

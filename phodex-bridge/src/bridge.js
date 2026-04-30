@@ -2,11 +2,12 @@
 // Purpose: Runs Codex locally, bridges relay traffic, and coordinates desktop refreshes for Codex.app.
 // Layer: CLI service
 // Exports: startBridge
-// Depends on: ws, crypto, os, ./qr, ./codex-desktop-refresher, ./codex-transport, ./rollout-watch, ./voice-handler, ./ios-app-compatibility
+// Depends on: ws, crypto, os, ./codex-home, ./qr, ./codex-desktop-refresher, ./codex-transport, ./rollout-watch, ./voice-handler, ./ios-app-compatibility
 
 const WebSocket = require("ws");
 const { randomBytes } = require("crypto");
 const { execFile, spawn } = require("child_process");
+const path = require("path");
 const os = require("os");
 const { promisify } = require("util");
 const {
@@ -22,6 +23,7 @@ const { readDaemonConfig, writeDaemonConfig } = require("./daemon-state");
 const { handleGitRequest } = require("./git-handler");
 const { handleThreadContextRequest } = require("./thread-context-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
+const { handleProjectRequest } = require("./project-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
 const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
 const {
@@ -30,6 +32,7 @@ const {
 const { createBridgePackageVersionStatusReader } = require("./package-version-status");
 const { createPushNotificationServiceClient } = require("./push-notification-service-client");
 const { createPushNotificationTracker } = require("./push-notification-tracker");
+const { resolveCodexGeneratedImagesRoot } = require("./codex-home");
 const {
   loadOrCreateBridgeDeviceState,
   rememberLastSeenPhoneAppVersion,
@@ -52,6 +55,8 @@ const RELAY_WATCHDOG_STALE_AFTER_MS = 25_000;
 const BRIDGE_STATUS_HEARTBEAT_INTERVAL_MS = 5_000;
 const STALE_RELAY_STATUS_MESSAGE = "Relay heartbeat stalled; reconnect pending.";
 const RELAY_HISTORY_IMAGE_REFERENCE_URL = "remodex://history-image-elided";
+const RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES = 3 * 1024 * 1024;
+const RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS = 24_000;
 function startBridge({
   config: explicitConfig = null,
   printPairingQr = true,
@@ -59,7 +64,7 @@ function startBridge({
   onBridgeStatus = null,
 } = {}) {
   const config = explicitConfig || readBridgeConfig();
-  config.keepMacAwakeEnabled = config.keepMacAwakeEnabled !== false;
+  config.keepMacAwakeEnabled = config.keepMacAwakeEnabled === true;
   const bridgeWakeAssertion = createMacOSBridgeWakeAssertion({
     enabled: config.keepMacAwakeEnabled,
   });
@@ -497,6 +502,9 @@ function startBridge({
     if (handleWorkspaceRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
+    if (handleProjectRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (notificationsHandler.handleNotificationsRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
@@ -508,7 +516,10 @@ function startBridge({
     })) {
       return;
     }
-    if (handleGitRequest(rawMessage, sendApplicationResponse)) {
+    if (handleGitRequest(rawMessage, sendApplicationResponse, {
+      codexAppPath: config.codexAppPath,
+      onThreadNameSet: sendThreadNameUpdatedNotification,
+    })) {
       return;
     }
     desktopRefresher.handleInbound(rawMessage);
@@ -520,7 +531,29 @@ function startBridge({
 
   // Encrypts bridge-generated responses instead of letting the relay see plaintext.
   function sendApplicationResponse(rawMessage) {
-    secureTransport.queueOutboundApplicationMessage(rawMessage, sendRelayWireMessage);
+    secureTransport.queueOutboundApplicationMessage(
+      sanitizeRelayBoundCodexMessage(rawMessage),
+      sendRelayWireMessage
+    );
+  }
+
+  // Mirrors accepted local renames back to the phone using the existing push-event shape.
+  function sendThreadNameUpdatedNotification(result) {
+    const threadId = readString(result?.threadId || result?.thread_id);
+    const name = readString(result?.name || result?.title);
+    if (!threadId || !name) {
+      return;
+    }
+
+    sendApplicationResponse(JSON.stringify({
+      method: "thread/name/updated",
+      params: {
+        threadId,
+        thread_id: threadId,
+        name,
+        title: name,
+      },
+    }));
   }
 
   // ─── Bridge-owned auth snapshot ─────────────────────────────
@@ -602,6 +635,7 @@ function startBridge({
         ? bridgeVersionInfoResult.value
         : null,
       transportMode: codex.mode,
+      hostPlatform: process.platform,
     });
   }
 
@@ -683,7 +717,7 @@ function startBridge({
     const parsed = safeParseJSON(rawMessage);
     const responseId = parsed?.id;
     if (responseId == null) {
-      return rawMessage;
+      return sanitizeLiveGeneratedImageMessageForRelay(rawMessage);
     }
 
     const trackedRequest = relaySanitizedResponseMethodsById.get(String(responseId));
@@ -1341,13 +1375,20 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
     }
 
     let turnDidChange = false;
+    const threadId = normalizeNonEmptyString(thread.id)
+      || normalizeNonEmptyString(thread.threadId)
+      || normalizeNonEmptyString(thread.thread_id);
+
     const sanitizedItems = turn.items.map((item) => {
       if (!item || typeof item !== "object") {
         return item;
       }
 
       let itemDidChange = false;
-      let sanitizedItem = item;
+      let sanitizedItem = annotateImageGenerationHistoryItem(item, threadId);
+      if (sanitizedItem !== item) {
+        itemDidChange = true;
+      }
 
       if (Array.isArray(item.content)) {
         const sanitizedContent = item.content.map((contentItem) => {
@@ -1391,10 +1432,11 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
   });
 
   if (!didSanitize) {
-    return rawMessage;
+    const trimmedPayload = trimThreadPayloadForRelay(parsed, thread);
+    return trimmedPayload == null ? rawMessage : trimmedPayload;
   }
 
-  return JSON.stringify({
+  const sanitizedPayload = JSON.stringify({
     ...parsed,
     result: {
       ...parsed.result,
@@ -1404,6 +1446,86 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
       },
     },
   });
+
+  return trimThreadPayloadForRelay(parseBridgeJSON(sanitizedPayload), null) ?? sanitizedPayload;
+}
+
+// Annotates live image-generation notifications so the phone can render a local-file
+// preview and does not receive the bulky inline base64 result over the relay.
+function sanitizeLiveGeneratedImageMessageForRelay(rawMessage) {
+  const parsed = parseBridgeJSON(rawMessage);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return rawMessage;
+  }
+
+  const params = parsed.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return rawMessage;
+  }
+
+  const sanitizedParams = sanitizeLiveGeneratedImageParams(params);
+  if (sanitizedParams === params) {
+    return rawMessage;
+  }
+
+  return JSON.stringify({
+    ...parsed,
+    params: sanitizedParams,
+  });
+}
+
+function sanitizeLiveGeneratedImageParams(params) {
+  const threadId = liveGeneratedImageThreadId(params);
+  let nextParams = params;
+  let didChange = false;
+
+  const item = params.item;
+  if (item && typeof item === "object" && !Array.isArray(item)) {
+    const sanitizedItem = annotateImageGenerationPayload(item, threadId);
+    if (sanitizedItem !== item) {
+      nextParams = { ...nextParams, item: sanitizedItem };
+      didChange = true;
+    }
+  }
+
+  const event = params.event;
+  if (event && typeof event === "object" && !Array.isArray(event)) {
+    const sanitizedEvent = sanitizeNestedGeneratedImagePayloads(event, threadId);
+    if (sanitizedEvent !== event) {
+      nextParams = { ...nextParams, event: sanitizedEvent };
+      didChange = true;
+    }
+  }
+
+  const sanitizedDirectParams = annotateImageGenerationPayload(nextParams, threadId);
+  if (sanitizedDirectParams !== nextParams) {
+    nextParams = sanitizedDirectParams;
+    didChange = true;
+  }
+
+  return didChange ? nextParams : params;
+}
+
+function sanitizeNestedGeneratedImagePayloads(value, threadId) {
+  let nextValue = annotateImageGenerationPayload(value, threadId);
+  let didChange = nextValue !== value;
+
+  for (const key of ["item", "payload", "data"]) {
+    const nested = nextValue?.[key];
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) {
+      continue;
+    }
+    const sanitizedNested = sanitizeNestedGeneratedImagePayloads(nested, threadId);
+    if (sanitizedNested !== nested) {
+      if (!didChange) {
+        nextValue = { ...nextValue };
+        didChange = true;
+      }
+      nextValue[key] = sanitizedNested;
+    }
+  }
+
+  return didChange ? nextValue : value;
 }
 
 // Drops huge replacement-history blobs from compaction items because the phone only needs
@@ -1448,6 +1570,108 @@ function omitCompactionReplacementHistory(value) {
   return didChange ? nextValue : value;
 }
 
+function annotateImageGenerationHistoryItem(item, threadId) {
+  if (!item || typeof item !== "object") {
+    return item;
+  }
+
+  const normalizedType = normalizeRelayHistoryContentType(item.type);
+  if (!isGeneratedImageRelayType(normalizedType)) {
+    return item;
+  }
+
+  return annotateImageGenerationPayload(item, threadId);
+}
+
+function annotateImageGenerationPayload(item, threadId) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return item;
+  }
+
+  const normalizedType = normalizeRelayHistoryContentType(item.type);
+  if (!isGeneratedImageRelayType(normalizedType)) {
+    return item;
+  }
+
+  let nextItem = item;
+  let didChange = false;
+  const existingPath = normalizeNonEmptyString(item.saved_path)
+    || normalizeNonEmptyString(item.savedPath)
+    || normalizeNonEmptyString(item.path)
+    || normalizeNonEmptyString(item.file_path);
+  const generatedPath = existingPath || generatedImagePathForHistoryItem(item, threadId);
+  if (generatedPath && !existingPath) {
+    nextItem = {
+      ...nextItem,
+      saved_path: generatedPath,
+    };
+    didChange = true;
+  }
+
+  if (typeof nextItem.result === "string" && nextItem.result.length > 0) {
+    const {
+      result: _result,
+      ...withoutInlineResult
+    } = nextItem;
+    nextItem = {
+      ...withoutInlineResult,
+      result_elided_for_relay: true,
+    };
+    didChange = true;
+  }
+
+  return didChange ? nextItem : item;
+}
+
+function generatedImagePathForHistoryItem(item, threadId) {
+  const resolvedThreadId = normalizeNonEmptyString(threadId);
+  const normalizedType = normalizeRelayHistoryContentType(item.type);
+  const callId = normalizedType === "imagegenerationend"
+    ? normalizeNonEmptyString(item.call_id)
+      || normalizeNonEmptyString(item.callId)
+      || normalizeNonEmptyString(item.itemId)
+      || normalizeNonEmptyString(item.item_id)
+      || normalizeNonEmptyString(item.id)
+    : normalizeNonEmptyString(item.id)
+      || normalizeNonEmptyString(item.call_id)
+      || normalizeNonEmptyString(item.callId)
+      || normalizeNonEmptyString(item.itemId)
+      || normalizeNonEmptyString(item.item_id);
+  if (!resolvedThreadId || !callId) {
+    return "";
+  }
+
+  return path.join(resolveCodexGeneratedImagesRoot(), resolvedThreadId, `${callId}.png`);
+}
+
+function isGeneratedImageRelayType(normalizedType) {
+  return normalizedType === "imagegeneration"
+    || normalizedType === "imagegenerationcall"
+    || normalizedType === "imagegenerationend"
+    || normalizedType === "imageview";
+}
+
+function liveGeneratedImageThreadId(params) {
+  const event = params?.event && typeof params.event === "object" && !Array.isArray(params.event)
+    ? params.event
+    : null;
+  const item = params?.item && typeof params.item === "object" && !Array.isArray(params.item)
+    ? params.item
+    : null;
+
+  return normalizeNonEmptyString(params?.threadId)
+    || normalizeNonEmptyString(params?.thread_id)
+    || normalizeNonEmptyString(params?.conversationId)
+    || normalizeNonEmptyString(params?.conversation_id)
+    || normalizeNonEmptyString(event?.threadId)
+    || normalizeNonEmptyString(event?.thread_id)
+    || normalizeNonEmptyString(event?.conversationId)
+    || normalizeNonEmptyString(event?.conversation_id)
+    || normalizeNonEmptyString(item?.threadId)
+    || normalizeNonEmptyString(item?.thread_id)
+    || "";
+}
+
 // Converts `data:image/...` history content into a tiny placeholder the iPhone can render safely.
 function sanitizeInlineHistoryImageContentItem(contentItem) {
   if (!contentItem || typeof contentItem !== "object") {
@@ -1455,13 +1679,13 @@ function sanitizeInlineHistoryImageContentItem(contentItem) {
   }
 
   const normalizedType = normalizeRelayHistoryContentType(contentItem.type);
-  if (normalizedType !== "image" && normalizedType !== "localimage") {
+  if (!isRelayHistoryImageContentType(normalizedType)) {
     return contentItem;
   }
 
-  const hasInlineUrl = isInlineHistoryImageDataURL(contentItem.url)
-    || isInlineHistoryImageDataURL(contentItem.image_url)
-    || isInlineHistoryImageDataURL(contentItem.path);
+  const hasInlineUrl = hasInlineHistoryImageDataURL(contentItem.url)
+    || hasInlineHistoryImageDataURL(contentItem.image_url)
+    || hasInlineHistoryImageDataURL(contentItem.path);
   if (!hasInlineUrl) {
     return contentItem;
   }
@@ -1485,8 +1709,28 @@ function normalizeRelayHistoryContentType(value) {
     : "";
 }
 
-function isInlineHistoryImageDataURL(value) {
-  return typeof value === "string" && value.toLowerCase().startsWith("data:image");
+// Covers Codex history variants such as image, local_image, and input_image.
+function isRelayHistoryImageContentType(normalizedType) {
+  return normalizedType === "image"
+    || normalizedType === "localimage"
+    || normalizedType === "inputimage"
+    || normalizedType === "outputimage";
+}
+
+function hasInlineHistoryImageDataURL(value) {
+  if (typeof value === "string") {
+    return value.toLowerCase().startsWith("data:image");
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(hasInlineHistoryImageDataURL);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value).some(hasInlineHistoryImageDataURL);
+  }
+
+  return false;
 }
 
 function parseBridgeJSON(value) {
@@ -1495,6 +1739,206 @@ function parseBridgeJSON(value) {
   } catch {
     return null;
   }
+}
+
+function trimThreadPayloadForRelay(parsed, explicitThread = undefined) {
+  const thread = explicitThread ?? parsed?.result?.thread;
+  if (!parsed || !thread || typeof thread !== "object" || !Array.isArray(thread.turns)) {
+    return null;
+  }
+
+  let workingThread = thread;
+  let encoded = encodeRelayThreadPayload(parsed, workingThread);
+  if (encoded == null) {
+    return null;
+  }
+
+  if (Buffer.byteLength(encoded, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+    return explicitThread === undefined ? null : encoded;
+  }
+
+  const turns = thread.turns;
+  let trimmedTurns = turns.slice();
+  while (trimmedTurns.length > 1) {
+    trimmedTurns = trimmedTurns.slice(1);
+    const candidateThread = {
+      ...thread,
+      turns: trimmedTurns,
+      historyTailTruncatedForRelay: true,
+    };
+    encoded = encodeRelayThreadPayload(parsed, candidateThread);
+    if (encoded != null && Buffer.byteLength(encoded, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+      return encoded;
+    }
+    workingThread = candidateThread;
+  }
+
+  const newestTurn = trimmedTurns[0];
+  if (!newestTurn || typeof newestTurn !== "object" || !Array.isArray(newestTurn.items)) {
+    return encodeRelayThreadPayload(parsed, workingThread);
+  }
+
+  let trimmedItems = newestTurn.items.slice();
+  while (trimmedItems.length > 1) {
+    trimmedItems = trimmedItems.slice(1);
+    const candidateThread = {
+      ...thread,
+      turns: [{
+        ...newestTurn,
+        items: trimmedItems,
+      }],
+      historyTailTruncatedForRelay: true,
+    };
+    encoded = encodeRelayThreadPayload(parsed, candidateThread);
+    if (encoded != null && Buffer.byteLength(encoded, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+      return encoded;
+    }
+    workingThread = candidateThread;
+  }
+
+  const mostRecentItem = trimmedItems[0];
+  if (!mostRecentItem || typeof mostRecentItem !== "object") {
+    return encodeRelayThreadPayload(parsed, workingThread);
+  }
+
+  const truncatedItem = truncateHistoryItemTextForRelay(
+    mostRecentItem,
+    RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS
+  );
+  let candidateThread = {
+    ...thread,
+    turns: [{
+      ...newestTurn,
+      items: [truncatedItem],
+    }],
+    historyTailTruncatedForRelay: true,
+  };
+  encoded = encodeRelayThreadPayload(parsed, candidateThread);
+  if (encoded != null && Buffer.byteLength(encoded, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+    return encoded;
+  }
+
+  candidateThread = {
+    ...thread,
+    turns: [{
+      ...newestTurn,
+      items: [compactHistoryItemForRelay(mostRecentItem, RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS)],
+    }],
+    historyTailTruncatedForRelay: true,
+  };
+  return encodeRelayThreadPayload(parsed, candidateThread);
+}
+
+function encodeRelayThreadPayload(parsed, thread) {
+  try {
+    return JSON.stringify({
+      ...parsed,
+      result: {
+        ...parsed.result,
+        thread,
+      },
+    });
+  } catch {
+    return null;
+  }
+}
+
+function truncateHistoryItemTextForRelay(item, maxChars) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return item;
+  }
+
+  let didChange = false;
+  let nextItem = item;
+  const textKeys = ["text", "message", "summary", "output", "outputText", "output_text"];
+
+  for (const key of textKeys) {
+    if (typeof item[key] === "string" && item[key].length > maxChars) {
+      nextItem = {
+        ...nextItem,
+        [key]: truncateRelayTextTail(item[key], maxChars),
+      };
+      didChange = true;
+    }
+  }
+
+  if (Array.isArray(item.content)) {
+    const nextContent = item.content.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return entry;
+      }
+
+      const truncatedEntry = truncateHistoryItemTextForRelay(entry, maxChars);
+      if (truncatedEntry !== entry) {
+        didChange = true;
+      }
+      return truncatedEntry;
+    });
+
+    if (didChange) {
+      nextItem = {
+        ...nextItem,
+        content: nextContent,
+      };
+    }
+  }
+
+  return didChange
+    ? {
+      ...nextItem,
+      relayTextTailTruncated: true,
+    }
+    : item;
+}
+
+function compactHistoryItemForRelay(item, maxChars) {
+  const compactItem = {
+    id: typeof item?.id === "string" ? item.id : undefined,
+    type: typeof item?.type === "string" ? item.type : "relay_truncated_item",
+    role: typeof item?.role === "string" ? item.role : undefined,
+    itemId: typeof item?.itemId === "string" ? item.itemId : undefined,
+    relayPayloadTruncated: true,
+  };
+  const tailText = firstRelayTextTail(item, maxChars);
+  if (tailText) {
+    compactItem.text = tailText;
+  }
+
+  return Object.fromEntries(
+    Object.entries(compactItem).filter(([, value]) => value !== undefined)
+  );
+}
+
+function firstRelayTextTail(value, maxChars) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "";
+  }
+
+  for (const key of ["text", "message", "summary", "output", "outputText", "output_text"]) {
+    if (typeof value[key] === "string" && value[key].trim()) {
+      return truncateRelayTextTail(value[key], maxChars);
+    }
+  }
+
+  if (Array.isArray(value.content)) {
+    for (const entry of value.content) {
+      const tail = firstRelayTextTail(entry, maxChars);
+      if (tail) {
+        return tail;
+      }
+    }
+  }
+
+  return "";
+}
+
+function truncateRelayTextTail(value, maxChars) {
+  if (typeof value !== "string" || value.length <= maxChars) {
+    return value;
+  }
+
+  const tail = value.slice(-maxChars).trimStart();
+  return `…\n${tail}`;
 }
 
 // Treats silent relay sockets as stale so the daemon can self-heal after sleep/wake.
@@ -1559,6 +2003,7 @@ module.exports = {
   createMacOSBridgeWakeAssertion,
   hasRelayConnectionGoneStale,
   persistBridgePreferences,
+  sanitizeLiveGeneratedImageMessageForRelay,
   sanitizeThreadHistoryImagesForRelay,
   startBridge,
 };

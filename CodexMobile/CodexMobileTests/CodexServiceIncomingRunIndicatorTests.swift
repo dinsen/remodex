@@ -22,6 +22,102 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(service.threadRunBadgeState(for: threadID), .running)
     }
 
+    func testAssistantDeltaCoalescingAppliesOrderedDeltasOnFlush() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "item-\(UUID().uuidString)"
+
+        service.enqueueAssistantDelta(threadId: threadID, turnId: turnID, itemId: itemID, delta: "Hello")
+        service.enqueueAssistantDelta(threadId: threadID, turnId: turnID, itemId: itemID, delta: " world")
+
+        XCTAssertTrue(service.messages(for: threadID).isEmpty)
+
+        service.flushAllPendingStreamingDeltas()
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .assistant)
+        XCTAssertEqual(messages.first?.text, "Hello world")
+        XCTAssertTrue(messages.first?.isStreaming == true)
+    }
+
+    func testAssistantDeltaCoalescingMergesCumulativeSnapshotsBeforeFlush() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "item-\(UUID().uuidString)"
+
+        service.enqueueAssistantDelta(threadId: threadID, turnId: turnID, itemId: itemID, delta: "Yes")
+        service.enqueueAssistantDelta(threadId: threadID, turnId: turnID, itemId: itemID, delta: "Yes, the")
+        service.enqueueAssistantDelta(threadId: threadID, turnId: turnID, itemId: itemID, delta: "Yes, the imagegen skill")
+
+        service.flushAllPendingStreamingDeltas()
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.text, "Yes, the imagegen skill")
+        XCTAssertTrue(messages.first?.isStreaming == true)
+    }
+
+    func testSystemDeltaCoalescingAppliesThinkingDeltasOnFlush() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "thinking-\(UUID().uuidString)"
+
+        service.appendStreamingSystemItemDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: itemID,
+            kind: .thinking,
+            delta: "Looking"
+        )
+        service.appendStreamingSystemItemDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: itemID,
+            kind: .thinking,
+            delta: " around"
+        )
+
+        XCTAssertTrue(service.messages(for: threadID).isEmpty)
+
+        service.flushAllPendingStreamingDeltas()
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .system)
+        XCTAssertEqual(messages.first?.kind, .thinking)
+        XCTAssertEqual(messages.first?.text, "Looking around")
+        XCTAssertTrue(messages.first?.isStreaming == true)
+    }
+
+    func testNilTurnSystemDeltasFlushBeforeTurnCompletionClosesRows() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let itemID = "thinking-\(UUID().uuidString)"
+
+        service.appendStreamingSystemItemDelta(
+            threadId: threadID,
+            turnId: nil,
+            itemId: itemID,
+            kind: .thinking,
+            delta: "Recovering"
+        )
+
+        XCTAssertTrue(service.messages(for: threadID).isEmpty)
+
+        service.markTurnCompleted(threadId: threadID, turnId: nil)
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.kind, .thinking)
+        XCTAssertEqual(messages.first?.text, "Recovering")
+        XCTAssertFalse(messages.first?.isStreaming ?? true)
+        XCTAssertTrue(service.pendingSystemDeltasByKey.isEmpty)
+    }
+
     func testIncomingMethodIsTrimmedBeforeRouting() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -723,6 +819,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
 
         let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
         XCTAssertEqual(assistantMessages.count, 2)
@@ -742,9 +839,11 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
 
         _ = service.timelineState(for: threadID)
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
         let firstSnapshot = service.timelineState(for: threadID).renderSnapshot
 
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
         let secondSnapshot = service.timelineState(for: threadID).renderSnapshot
 
         XCTAssertEqual(firstSnapshot.messages.count, 1)
@@ -764,6 +863,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
 
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
 
         XCTAssertEqual(service.currentOutput, "First chunk")
     }
@@ -777,6 +877,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
 
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
 
         XCTAssertEqual(service.currentOutput, "First chunk")
         XCTAssertEqual(service.timelineState(for: threadID).renderSnapshot.messages.first?.text, "First chunk")
@@ -793,8 +894,370 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " tail")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
 
         XCTAssertEqual(service.currentOutput, "Second")
+    }
+
+    func testLateOlderAssistantItemDeltaDoesNotStealTurnFallbackStream() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " tail")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: nil, delta: " current")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map { $0.itemId ?? "" }, ["item-1", "item-2"])
+        XCTAssertEqual(assistantMessages.map(\.text), ["First tail", "Second current"])
+    }
+
+    func testLateOlderAssistantCompletionDoesNotStealTurnFallbackStream() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        service.completeAssistantMessage(threadId: threadID, turnId: turnID, itemId: "item-1", text: "First final")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: nil, delta: " current")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map { $0.itemId ?? "" }, ["item-1", "item-2"])
+        XCTAssertEqual(assistantMessages.map(\.text), ["First final", "Second current"])
+    }
+
+    func testUnseenItemCompletionDoesNotStealTurnFallbackStream() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        service.completeAssistantMessage(threadId: threadID, turnId: turnID, itemId: "item-1", text: "First final")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: nil, delta: " current")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map { $0.itemId ?? "" }, ["item-2", "item-1"])
+        XCTAssertEqual(assistantMessages.map(\.text), ["Second current", "First final"])
+        XCTAssertFalse(assistantMessages.last?.isStreaming ?? true)
+    }
+
+    func testItemCompletionBeforeFallbackDoesNotCaptureTurnScopedDelta() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.completeAssistantMessage(threadId: threadID, turnId: turnID, itemId: "item-1", text: "First final")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: nil, delta: " current")
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map { $0.itemId ?? "" }, ["item-1", ""])
+        XCTAssertEqual(assistantMessages.map(\.text), ["First final", " current"])
+        XCTAssertFalse(assistantMessages.first?.isStreaming ?? true)
+        XCTAssertTrue(assistantMessages.last?.isStreaming ?? false)
+    }
+
+    func testIdentifierlessLateCompletionDoesNotAttachPreviousResponseToNewTurn() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let firstTurnID = "turn-\(UUID().uuidString)"
+        let secondTurnID = "turn-\(UUID().uuidString)"
+
+        service.appendUserMessage(threadId: threadID, text: "First prompt", turnId: firstTurnID)
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: firstTurnID,
+            itemId: "item-1",
+            delta: "Previous final"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: firstTurnID)
+        service.markTurnCompleted(threadId: threadID, turnId: firstTurnID)
+
+        service.setActiveTurnID(secondTurnID, for: threadID)
+        service.appendUserMessage(threadId: threadID, text: "Second prompt", turnId: secondTurnID)
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: nil,
+            text: "Previous final"
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 1)
+        XCTAssertEqual(assistantMessages.first?.turnId, firstTurnID)
+        XCTAssertEqual(assistantMessages.first?.text, "Previous final")
+    }
+
+    func testIdentifierlessLateCompletionDoesNotOverwriteActiveTurnResponse() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let firstTurnID = "turn-\(UUID().uuidString)"
+        let secondTurnID = "turn-\(UUID().uuidString)"
+
+        service.appendUserMessage(threadId: threadID, text: "First prompt", turnId: firstTurnID)
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: firstTurnID,
+            itemId: "item-1",
+            delta: "Previous final"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: firstTurnID)
+        service.markTurnCompleted(threadId: threadID, turnId: firstTurnID)
+
+        service.setActiveTurnID(secondTurnID, for: threadID)
+        service.appendUserMessage(threadId: threadID, text: "Second prompt", turnId: secondTurnID)
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: secondTurnID,
+            itemId: nil,
+            delta: "Current answer"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: secondTurnID)
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: nil,
+            text: "Previous final\n\nOlder replay block"
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 2)
+        XCTAssertEqual(assistantMessages.map(\.turnId), [firstTurnID, secondTurnID])
+        XCTAssertEqual(assistantMessages.map(\.text), ["Previous final", "Current answer"])
+        XCTAssertTrue(assistantMessages.last?.isStreaming ?? false)
+    }
+
+    func testNoItemCompletionReusesClosedAssistantRowWhileThreadStillLooksRunning() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let finalText = "Final answer that was already persisted before mirror replay."
+
+        service.appendMessage(
+            CodexMessage(
+                id: "assistant-existing",
+                threadId: threadID,
+                role: .assistant,
+                text: finalText,
+                turnId: turnID,
+                isStreaming: false
+            )
+        )
+        service.markThreadAsRunning(threadID)
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: nil,
+            text: finalText
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 1)
+        XCTAssertEqual(assistantMessages.first?.id, "assistant-existing")
+        XCTAssertEqual(assistantMessages.first?.text, finalText)
+        XCTAssertFalse(assistantMessages.first?.isStreaming ?? true)
+    }
+
+    func testFullBlockCompletionReplayDoesNotAppendDuplicateAssistantRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let introText = "I'll check Gmail for the latest TestFlight message."
+        let finalText = "Latest TestFlight version: 1.4 (123)."
+
+        service.appendMessage(
+            CodexMessage(
+                id: "assistant-intro",
+                threadId: threadID,
+                role: .assistant,
+                text: introText,
+                turnId: turnID,
+                itemId: "item-intro",
+                isStreaming: false
+            )
+        )
+        service.appendMessage(
+            CodexMessage(
+                id: "assistant-final",
+                threadId: threadID,
+                role: .assistant,
+                text: finalText,
+                turnId: turnID,
+                itemId: "item-final",
+                isStreaming: false
+            )
+        )
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "item-replay",
+            text: "\(introText)\n\n\(finalText)"
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map(\.id), ["assistant-intro", "assistant-final"])
+        XCTAssertEqual(assistantMessages.map(\.text), [introText, finalText])
+    }
+
+    func testFullBlockCompletionReplayWithoutTurnIdUsesActiveTurnAndDoesNotAppendDuplicateRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let introText = "I'll check Gmail for the latest TestFlight message."
+        let finalText = "Latest TestFlight version: 1.4 (123)."
+
+        service.setActiveTurnID(turnID, for: threadID)
+        service.appendMessage(
+            CodexMessage(
+                id: "assistant-intro",
+                threadId: threadID,
+                role: .assistant,
+                text: introText,
+                turnId: turnID,
+                itemId: "item-intro",
+                isStreaming: false
+            )
+        )
+        service.appendMessage(
+            CodexMessage(
+                id: "assistant-final",
+                threadId: threadID,
+                role: .assistant,
+                text: finalText,
+                turnId: nil,
+                itemId: "item-final",
+                isStreaming: false
+            )
+        )
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: "item-replay",
+            text: "\(introText)\n\n\(finalText)"
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map(\.id), ["assistant-intro", "assistant-final"])
+        XCTAssertEqual(assistantMessages.map(\.text), [introText, finalText])
+    }
+
+    func testLateDeltaForCompletedTurnDoesNotReopenAssistantBubble() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "item-1",
+            delta: "Final answer"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        service.recordTurnTerminalState(threadId: threadID, turnId: turnID, state: .completed)
+        service.markTurnCompleted(threadId: threadID, turnId: turnID)
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: nil,
+            delta: " replay"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 1)
+        XCTAssertEqual(assistantMessages.first?.text, "Final answer replay")
+        XCTAssertFalse(assistantMessages.first?.isStreaming ?? true)
+    }
+
+    func testTurnlessFinalThenTerminalReplayDoesNotDuplicateAssistantAnswer() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let finalText = """
+        Latest TestFlight inbox email says:
+
+        Remodex version 1.4, build 124
+
+        Subject: "Remodex - Remote AI Coding 1.4 (124) for iOS is now available to test."
+        """
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: "item-final",
+            text: finalText
+        )
+        service.recordTurnTerminalState(threadId: threadID, turnId: turnID, state: .completed)
+        service.markTurnCompleted(threadId: threadID, turnId: turnID)
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "item-status",
+            delta: "I'll use the Gmail connector to search your recent inbox."
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID, itemId: "item-status")
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "item-terminal",
+            text: finalText
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 1)
+        XCTAssertEqual(assistantMessages.first?.text, finalText)
+        XCTAssertEqual(assistantMessages.first?.turnId, turnID)
+        XCTAssertFalse(assistantMessages.first?.isStreaming ?? true)
+    }
+
+    func testTurnlessTerminalReplayDoesNotDuplicateAssistantAnswer() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let finalText = """
+        Latest TestFlight inbox email says:
+
+        Remodex version 1.4, build 124
+
+        Subject: "Remodex - Remote AI Coding 1.4 (124) for iOS is now available to test."
+        """
+
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: "item-final",
+            text: finalText
+        )
+        service.completeAssistantMessage(
+            threadId: threadID,
+            turnId: nil,
+            itemId: "item-terminal",
+            text: finalText
+        )
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 1)
+        XCTAssertEqual(assistantMessages.first?.text, finalText)
     }
 
     func testMergeAssistantDeltaKeepsLongReplayOverlapWithoutDuplication() {
@@ -823,8 +1286,9 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertTrue(assistantMessages.allSatisfy { !$0.isStreaming })
 
         let turnStreamingKey = "\(threadID)|\(turnID)"
-        XCTAssertFalse(service.streamingAssistantMessageByTurnID.keys.contains { key in
-            key == turnStreamingKey || key.hasPrefix("\(turnStreamingKey)|item:")
+        XCTAssertNil(service.streamingAssistantFallbackMessageByTurnID[turnStreamingKey])
+        XCTAssertFalse(service.streamingAssistantMessageByItemKey.keys.contains { key in
+            key.hasPrefix("\(turnStreamingKey)|item:")
         })
     }
 
@@ -967,6 +1431,45 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertFalse(assistantMessages[0].isStreaming)
     }
 
+    func testIncomingItemCompletionBeforeFallbackDoesNotCaptureTurnScopedDelta() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "codex/event/agent_message",
+            params: .object([
+                "conversationId": .string(threadID),
+                "id": .string(turnID),
+                "msg": .object([
+                    "type": .string("agent_message"),
+                    "message_id": .string("message-1"),
+                    "message": .string("Risposta precedente"),
+                ]),
+            ])
+        )
+
+        service.handleNotification(
+            method: "codex/event/agent_message_content_delta",
+            params: .object([
+                "conversationId": .string(threadID),
+                "id": .string(turnID),
+                "msg": .object([
+                    "type": .string("agent_message_content_delta"),
+                    "delta": .string("Risposta corrente"),
+                ]),
+            ])
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let assistantMessages = service.messages(for: threadID).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.count, 2)
+        XCTAssertEqual(assistantMessages.map { $0.itemId ?? "" }, ["message-1", ""])
+        XCTAssertEqual(assistantMessages.map(\.text), ["Risposta precedente", "Risposta corrente"])
+        XCTAssertFalse(assistantMessages[0].isStreaming)
+        XCTAssertTrue(assistantMessages[1].isStreaming)
+    }
+
     func testLateLegacyAgentCompletionWithoutMessageIdUpdatesClosedSingleAssistantBubble() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -1093,6 +1596,204 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(assistantMessages.count, 1)
         XCTAssertEqual(assistantMessages[0].text, "Testo finale completo")
         XCTAssertEqual(assistantMessages[0].itemId, "message-1")
+    }
+
+    func testLongerClosedAssistantSnapshotDoesNotAppendOtherAssistantBlocks() {
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let finalText = """
+        Summary
+
+        TLDR: risposta finale.
+        """
+        let flattenedText = """
+        Summary
+
+        TLDR: risposta finale.
+
+        Uso la skill check-code perché sto controllando la repo.
+
+        Riprendo da dove avevo lasciato.
+        """
+        let localMessage = CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: finalText,
+            turnId: turnID,
+            itemId: "message-1",
+            isStreaming: false
+        )
+        let serverMessage = CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: flattenedText,
+            turnId: turnID,
+            itemId: "message-1",
+            isStreaming: false
+        )
+
+        XCTAssertFalse(
+            CodexService.shouldReplaceClosedAssistantMessage(localMessage, with: serverMessage)
+        )
+    }
+
+    func testClosedAssistantSnapshotWithOlderPrefixDoesNotReplaceFinalBlock() {
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let finalText = "TLDR: risposta finale."
+        let flattenedText = """
+        Uso la skill check-code perché sto controllando la repo.
+
+        TLDR: risposta finale.
+        """
+        let localMessage = CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: finalText,
+            turnId: turnID,
+            itemId: "message-1",
+            isStreaming: false
+        )
+        let serverMessage = CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: flattenedText,
+            turnId: turnID,
+            itemId: "message-1",
+            isStreaming: false
+        )
+
+        XCTAssertFalse(
+            CodexService.shouldReplaceClosedAssistantMessage(localMessage, with: serverMessage)
+        )
+    }
+
+    func testRunningHistorySnapshotWithoutItemDoesNotPolluteItemScopedAssistant() throws {
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let currentText = "Si, sure-sure per i processi pesanti."
+        let flattenedText = """
+        Si, sure-sure per i processi pesanti.
+
+        Controllo solo i processi attivi, senza lanciare build o test.
+
+        Si, sure-sure per i processi pesanti.
+        """
+        let localMessage = CodexMessage(
+            id: CodexService.stableAssistantMessageID(threadId: threadID, turnId: turnID, itemId: "message-current")!,
+            threadId: threadID,
+            role: .assistant,
+            text: currentText,
+            turnId: turnID,
+            itemId: "message-current",
+            isStreaming: true
+        )
+        let serverSnapshot = CodexMessage(
+            threadId: threadID,
+            role: .assistant,
+            text: flattenedText,
+            turnId: turnID,
+            itemId: nil,
+            isStreaming: false
+        )
+
+        let merged = try CodexService.mergeHistoryMessages(
+            [localMessage],
+            [serverSnapshot],
+            activeThreadIDs: [threadID],
+            runningThreadIDs: []
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].text, currentText)
+        XCTAssertEqual(merged[0].itemId, "message-current")
+        XCTAssertTrue(merged[0].isStreaming)
+    }
+
+    func testRunningHistorySnapshotWithRepeatedPrefixDoesNotDuplicateAssistantText() throws {
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "message-current"
+        let currentText = "Si, sure-sure per i processi pesanti."
+        let flattenedText = """
+        Si, sure-sure per i processi pesanti.
+
+        Controllo solo i processi attivi, senza lanciare build o test.
+
+        Si, sure-sure per i processi pesanti.
+        """
+        let localMessage = CodexMessage(
+            id: CodexService.stableAssistantMessageID(threadId: threadID, turnId: turnID, itemId: itemID)!,
+            threadId: threadID,
+            role: .assistant,
+            text: currentText,
+            turnId: turnID,
+            itemId: itemID,
+            isStreaming: true
+        )
+        let serverSnapshot = CodexMessage(
+            id: CodexService.stableAssistantMessageID(threadId: threadID, turnId: turnID, itemId: itemID)!,
+            threadId: threadID,
+            role: .assistant,
+            text: flattenedText,
+            turnId: turnID,
+            itemId: itemID,
+            isStreaming: false
+        )
+
+        let merged = try CodexService.mergeHistoryMessages(
+            [localMessage],
+            [serverSnapshot],
+            activeThreadIDs: [threadID],
+            runningThreadIDs: []
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].text, currentText)
+        XCTAssertEqual(merged[0].itemId, itemID)
+        XCTAssertTrue(merged[0].isStreaming)
+    }
+
+    func testRunningHistorySnapshotWithExtraOlderSuffixDoesNotExtendAssistantText() throws {
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "message-current"
+        let currentText = "Si, sure-sure per i processi pesanti."
+        let flattenedText = """
+        Si, sure-sure per i processi pesanti.
+
+        Controllo solo i processi attivi, senza lanciare build o test.
+        """
+        let localMessage = CodexMessage(
+            id: CodexService.stableAssistantMessageID(threadId: threadID, turnId: turnID, itemId: itemID)!,
+            threadId: threadID,
+            role: .assistant,
+            text: currentText,
+            turnId: turnID,
+            itemId: itemID,
+            isStreaming: true
+        )
+        let serverSnapshot = CodexMessage(
+            id: CodexService.stableAssistantMessageID(threadId: threadID, turnId: turnID, itemId: itemID)!,
+            threadId: threadID,
+            role: .assistant,
+            text: flattenedText,
+            turnId: turnID,
+            itemId: itemID,
+            isStreaming: false
+        )
+
+        let merged = try CodexService.mergeHistoryMessages(
+            [localMessage],
+            [serverSnapshot],
+            activeThreadIDs: [threadID],
+            runningThreadIDs: []
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].text, currentText)
+        XCTAssertEqual(merged[0].itemId, itemID)
+        XCTAssertTrue(merged[0].isStreaming)
     }
 
     private func sendTurnStarted(service: CodexService, threadID: String, turnID: String) {

@@ -117,6 +117,27 @@ extension CodexService {
                 renamedThreadNameByThreadID = [:]
             }
 
+            if let savedPinnedThreadIDs = defaults.data(
+                forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedPinnedThreadIDs = try? decoder.decode([String].self, from: savedPinnedThreadIDs) {
+                pinnedThreadIDs = decodedPinnedThreadIDs
+            } else {
+                pinnedThreadIDs = []
+            }
+
+            if let savedPinnedThreadSnapshots = defaults.data(
+                forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedPinnedThreadSnapshots = try? decoder.decode(
+                   [String: [CodexThread]].self,
+                   from: savedPinnedThreadSnapshots
+               ) {
+                pinnedThreadSnapshotsByRootID = decodedPinnedThreadSnapshots
+            } else {
+                pinnedThreadSnapshotsByRootID = [:]
+            }
+
             if let savedAssociatedManagedWorktreePaths = defaults.data(
                 forKey: macScopedDefaultsKey(Self.associatedManagedWorktreePathsDefaultsKey, macDeviceId: macDeviceId)
             ),
@@ -130,6 +151,19 @@ extension CodexService {
             }
 
             authoritativeProjectPathByThreadID = [:]
+
+            if let savedTurnTerminalStates = defaults.data(
+                forKey: macScopedDefaultsKey(Self.turnTerminalStatesDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedTurnTerminalStates = try? decoder.decode(
+                   [String: CodexTurnTerminalState].self,
+                   from: savedTurnTerminalStates
+               ) {
+                terminalStateByTurnID = decodedTurnTerminalStates
+            } else {
+                terminalStateByTurnID = [:]
+            }
+            latestTurnTerminalStateByThread = [:]
 
             if let persistedGPTAccountSnapshot = loadPersistedGPTAccountSnapshot(macDeviceId: macDeviceId) {
                 gptAccountSnapshot = persistedGPTAccountSnapshot
@@ -146,6 +180,8 @@ extension CodexService {
                     email: nil,
                     displayName: nil,
                     planType: nil,
+                    hostPlatform: gptAccountSnapshot.hostPlatform,
+                    hostCapabilities: gptAccountSnapshot.hostCapabilities,
                     loginInFlight: true,
                     needsReauth: false,
                     expiresAt: pendingLogin.expiresAt,
@@ -185,10 +221,15 @@ extension CodexService {
             latestAssistantOutputByThread.removeAll()
             latestRepoAffectingMessageSignalByThread.removeAll()
             currentOutput = ""
+            latestTurnTerminalStateByThread.removeAll()
+            terminalStateByTurnID.removeAll()
             threadRuntimeOverridesByThreadID.removeAll()
             planSessionSourceByThread.removeAll()
             forkedFromThreadIDByThreadID.removeAll()
             renamedThreadNameByThreadID.removeAll()
+            pinnedThreadIDs.removeAll()
+            pinnedThreadSnapshotsByRootID.removeAll()
+            snapshotOnlyPinnedThreadIDs.removeAll()
             associatedManagedWorktreePathByThreadID.removeAll()
             authoritativeProjectPathByThreadID.removeAll()
             gptAccountSnapshot = codexGPTAccountInitialSnapshot()
@@ -197,8 +238,19 @@ extension CodexService {
     }
 
     func migrateLegacyMacScopedDefaultsIfNeeded() {
+        migrateLegacyMacScopedDefaultsValue(for: Self.threadRuntimeOverridesDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.planSessionSourcesDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.locallyArchivedThreadIDsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.locallyDeletedThreadIDsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.forkedThreadOriginsDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.renamedThreadNamesDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadIDsDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadSnapshotsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.associatedManagedWorktreePathsDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.turnTerminalStatesDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.gptAccountSnapshotDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginStateDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginCallbackDefaultsKey)
     }
 }
 

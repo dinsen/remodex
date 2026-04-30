@@ -1,5 +1,5 @@
 // FILE: SettingsView.swift
-// Purpose: Settings for Local Mode (Codex runs on user's Mac, relay WebSocket).
+// Purpose: Settings for Local Mode (Codex runs on the paired computer, relay WebSocket).
 // Layer: View
 // Exports: SettingsView
 
@@ -11,7 +11,7 @@ struct SettingsView: View {
     @Environment(SubscriptionService.self) private var subscriptions
 
     @AppStorage("codex.appFontStyle") private var appFontStyleRawValue = AppFont.defaultStoredStyleRawValue
-    @State private var isShowingMacNameSheet = false
+    @State private var isShowingComputerNameSheet = false
 
     private let runtimeAutoValue = "__AUTO__"
     private let runtimeNormalValue = "__NORMAL__"
@@ -35,10 +35,10 @@ struct SettingsView: View {
         }
         .font(AppFont.body())
         .navigationTitle("Settings")
-        .sheet(isPresented: $isShowingMacNameSheet) {
+        .sheet(isPresented: $isShowingComputerNameSheet) {
             if let trustedPairPresentation = codex.trustedPairPresentation {
-                SettingsMacNameSheet(
-                    nickname: sidebarMacNicknameBinding(for: trustedPairPresentation),
+                SettingsComputerNameSheet(
+                    nickname: sidebarComputerNicknameBinding(for: trustedPairPresentation),
                     currentName: trustedPairPresentation.name,
                     systemName: trustedPairPresentation.systemName ?? trustedPairPresentation.name
                 )
@@ -105,18 +105,20 @@ struct SettingsView: View {
                 .disabled(runtimeReasoningOptions.isEmpty)
             }
 
-            HStack {
-                Text("Speed")
-                Spacer()
-                Picker("Speed", selection: runtimeServiceTierSelection) {
-                    Text("Normal").tag(runtimeNormalValue)
-                    ForEach(CodexServiceTier.allCases, id: \.rawValue) { tier in
-                        Text(tier.displayName).tag(tier.rawValue)
+            if codex.selectedModelSupportsServiceTier(.fast) {
+                HStack {
+                    Text("Speed")
+                    Spacer()
+                    Picker("Speed", selection: runtimeServiceTierSelection) {
+                        Text("Normal").tag(runtimeNormalValue)
+                        ForEach(CodexServiceTier.allCases, id: \.rawValue) { tier in
+                            Text(tier.displayName).tag(tier.rawValue)
+                        }
                     }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .tint(settingsAccentColor)
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .tint(settingsAccentColor)
             }
 
             HStack {
@@ -131,6 +133,27 @@ struct SettingsView: View {
                 .labelsHidden()
                 .tint(settingsAccentColor)
             }
+
+            Divider()
+
+            HStack {
+                Text("Git writer model")
+                Spacer()
+                Picker("Git writer model", selection: gitWriterModelSelection) {
+                    ForEach(gitWriterModelOptions, id: \.id) { model in
+                        Text(TurnComposerMetaMapper.modelTitle(for: model))
+                            .tag(model.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .tint(settingsAccentColor)
+                .disabled(gitWriterModelOptions.isEmpty)
+            }
+
+            Text("Used for AI-generated commit messages and PR drafts. Defaults to GPT-5.4 Mini when available.")
+                .font(AppFont.caption())
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -139,15 +162,15 @@ struct SettingsView: View {
     @ViewBuilder private var connectionSection: some View {
         SettingsCard(title: "Connection") {
             if let trustedPairPresentation = codex.trustedPairPresentation {
-                SettingsTrustedMacCard(
+                SettingsTrustedComputerCard(
                     presentation: trustedPairPresentation,
                     connectionStatusLabel: connectionStatusLabel,
                     onEditName: {
-                        isShowingMacNameSheet = true
+                        isShowingComputerNameSheet = true
                     }
                 )
             } else {
-                Text("No paired Mac")
+                Text("No paired computer")
                     .font(AppFont.subheadline(weight: .semibold))
                     .foregroundStyle(.primary)
             }
@@ -176,19 +199,21 @@ struct SettingsView: View {
 
             Divider()
 
-            Toggle("Keep Mac reachable", isOn: keepMacAwakeWhileBridgeRunsBinding)
-                .tint(settingsAccentColor)
+            if codex.supportsKeepAwakeWhileBridgeRuns {
+                Toggle("Keep computer reachable", isOn: keepMacAwakeWhileBridgeRunsBinding)
+                    .tint(settingsAccentColor)
 
-            Text(codex.keepMacAwakeWhileBridgeRuns
-                 ? "Uses macOS caffeinate while the bridge is running so your Mac stays reachable even if the display turns off. Best while charging."
-                 : "Your Mac can go back to sleeping normally when the bridge is idle.")
-                .font(AppFont.caption())
-                .foregroundStyle(.secondary)
-
-            if !codex.isConnected {
-                Text("Saved on this iPhone. It will sync to your Mac the next time the bridge reconnects.")
+                Text(codex.keepMacAwakeWhileBridgeRuns
+                     ? "Uses the host computer's keep-awake support while the bridge is running so the computer stays reachable even if the display turns off. Best while charging."
+                     : "The computer can go back to sleeping normally when the bridge is idle.")
                     .font(AppFont.caption())
                     .foregroundStyle(.secondary)
+
+                if !codex.isConnected {
+                    Text("Saved on this iPhone. It will sync to the paired computer the next time the bridge reconnects.")
+                        .font(AppFont.caption())
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if codex.isConnected {
@@ -299,11 +324,22 @@ struct SettingsView: View {
         )
     }
 
-    // Writes nicknames against the active trusted Mac so switching pairs does not reuse the wrong alias.
-    private func sidebarMacNicknameBinding(for presentation: CodexTrustedPairPresentation) -> Binding<String> {
+    private var gitWriterModelOptions: [CodexModelOption] {
+        TurnComposerMetaMapper.orderedModels(from: codex.availableModels)
+    }
+
+    private var gitWriterModelSelection: Binding<String> {
         Binding(
-            get: { SidebarMacNicknameStore.nickname(for: presentation.deviceId) },
-            set: { SidebarMacNicknameStore.setNickname($0, for: presentation.deviceId) }
+            get: { codex.selectedGitWriterModelOption()?.id ?? gitWriterModelOptions.first?.id ?? "" },
+            set: { codex.setSelectedGitWriterModelId($0.isEmpty ? nil : $0) }
+        )
+    }
+
+    // Writes nicknames against the active trusted computer so switching pairs does not reuse the wrong alias.
+    private func sidebarComputerNicknameBinding(for presentation: CodexTrustedPairPresentation) -> Binding<String> {
+        Binding(
+            get: { SidebarComputerNicknameStore.nickname(for: presentation.deviceId) },
+            set: { SidebarComputerNicknameStore.setNickname($0, for: presentation.deviceId) }
         )
     }
 }
@@ -629,7 +665,7 @@ private struct SettingsBridgeVersionCard: View {
             }
 
             settingsVersionRow(
-                title: "Installed on Mac",
+                title: "Installed on Computer",
                 value: installedVersionLabel,
                 valueStyle: installedValueStyle
             )
@@ -667,7 +703,7 @@ private struct SettingsBridgeVersionCard: View {
 
     private var guidanceText: String? {
         guard let installedVersion else {
-            return "Connect to a Mac bridge to read the installed package version."
+            return "Connect to a computer bridge to read the installed package version."
         }
 
         guard let latestVersion else {
@@ -885,7 +921,7 @@ private struct SettingsAboutCard: View {
     }
 }
 
-private struct SettingsTrustedMacCard: View {
+private struct SettingsTrustedComputerCard: View {
     let presentation: CodexTrustedPairPresentation
     let connectionStatusLabel: String
     let onEditName: () -> Void
@@ -904,7 +940,7 @@ private struct SettingsTrustedMacCard: View {
                         )
 
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Mac")
+                        Text("Computer")
                             .font(AppFont.caption(weight: .semibold))
                             .foregroundStyle(.secondary)
 
@@ -929,7 +965,7 @@ private struct SettingsTrustedMacCard: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Edit Mac name")
+                .accessibilityLabel("Edit computer name")
             }
 
             HStack(spacing: 8) {
@@ -999,7 +1035,7 @@ private struct SettingsStatusPill: View {
     }
 }
 
-private struct SettingsMacNameSheet: View {
+private struct SettingsComputerNameSheet: View {
     @Binding var nickname: String
     let currentName: String
     let systemName: String
@@ -1011,7 +1047,7 @@ private struct SettingsMacNameSheet: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Mac name")
+                        Text("Computer name")
                         .font(AppFont.subheadline(weight: .semibold))
                         .foregroundStyle(.primary)
 
@@ -1031,7 +1067,7 @@ private struct SettingsMacNameSheet: View {
                             .fill(Color(.secondarySystemFill))
                     )
 
-                Text("This nickname stays on this iPhone and appears anywhere this Mac is shown.")
+                Text("This nickname stays on this iPhone and appears anywhere this computer is shown.")
                     .font(AppFont.caption())
                     .foregroundStyle(.secondary)
 
@@ -1056,7 +1092,7 @@ private struct SettingsMacNameSheet: View {
             .padding(20)
             .presentationDetents([.height(300)])
             .presentationDragIndicator(.visible)
-            .navigationTitle("Edit Mac Name")
+            .navigationTitle("Edit Computer Name")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

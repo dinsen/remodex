@@ -1,5 +1,5 @@
 // FILE: CodexService+TrustedPairPresentation.swift
-// Purpose: Derives a compact UI-facing summary for the connected or remembered Mac pair.
+// Purpose: Derives a compact UI-facing summary for the connected or remembered host pair.
 // Layer: Service extension
 // Exports: CodexTrustedPairPresentation, CodexService trusted-pair presentation helpers
 // Depends on: Foundation
@@ -14,10 +14,10 @@ struct CodexTrustedPairPresentation: Equatable, Sendable {
     let detail: String?
 }
 
-enum SidebarMacNicknameStore {
-    private static let keyPrefix = "codex.sidebarMacNickname."
+enum SidebarComputerNicknameStore {
+    private static let keyPrefix = "codex.sidebarComputerNickname."
 
-    // Keeps sidebar aliases scoped to a stable Mac id instead of a single global setting.
+    // Keeps sidebar aliases scoped to a stable host id instead of a single global setting.
     static func nickname(for deviceId: String?) -> String {
         guard let storageKey = storageKey(for: deviceId) else {
             return ""
@@ -54,15 +54,15 @@ enum SidebarMacNicknameStore {
 extension CodexService {
     // Builds the minimal pair summary shown by Home and Settings so both surfaces stay in sync.
     var trustedPairPresentation: CodexTrustedPairPresentation? {
-        let macName = trustedPairDisplayName
-        let macFingerprint = trustedPairFingerprint
-        guard macName != nil || macFingerprint != nil else {
+        let hostName = trustedPairDisplayName
+        let hostFingerprint = trustedPairFingerprint
+        guard hostName != nil || hostFingerprint != nil else {
             return nil
         }
 
-        let fallbackName = "Mac \(macFingerprint ?? "")".trimmingCharacters(in: .whitespacesAndNewlines)
-        let systemName = macName ?? fallbackName
-        let nickname = SidebarMacNicknameStore.nickname(for: trustedPairDeviceId)
+        let fallbackName = "\(hostComputerLabel.capitalized) \(hostFingerprint ?? "")".trimmingCharacters(in: .whitespacesAndNewlines)
+        let systemName = hostName ?? fallbackName
+        let nickname = SidebarComputerNicknameStore.nickname(for: trustedPairDeviceId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveName = nickname.isEmpty ? systemName : nickname
 
@@ -71,14 +71,14 @@ extension CodexService {
             title: trustedPairTitle,
             name: effectiveName,
             systemName: nickname.isEmpty ? nil : systemName,
-            detail: trustedPairDetail(displayName: macName, fingerprint: macFingerprint)
+            detail: trustedPairDetail(displayName: hostName, fingerprint: hostFingerprint)
         )
     }
 }
 
 private extension CodexService {
-    // Chooses the Mac identity the UI should surface first: the live relay target when available,
-    // otherwise the explicitly selected current trusted Mac.
+    // Chooses the host identity the UI should surface first: the live relay target when available,
+    // otherwise the explicitly selected current trusted computer.
     var visibleTrustedMacRecord: CodexTrustedMacRecord? {
         if let normalizedRelayMacDeviceId,
            (normalizedCurrentTrustedMacDeviceId == nil
@@ -90,7 +90,7 @@ private extension CodexService {
         return currentTrustedMacRecord
     }
 
-    // Reuses the connected device id when available, otherwise falls back to the explicit current Mac.
+    // Reuses the connected device id when available, otherwise falls back to the explicit current host.
     var trustedPairDeviceId: String? {
         visibleTrustedMacRecord?.macDeviceId ?? normalizedRelayMacDeviceId
     }
@@ -112,7 +112,7 @@ private extension CodexService {
 
         switch secureConnectionState {
         case .handshaking:
-            return "Pairing Mac"
+            return "Pairing Computer"
         case .liveSessionUnresolved, .reconnecting, .trustedMac:
             return "Saved Pair"
         case .rePairRequired:

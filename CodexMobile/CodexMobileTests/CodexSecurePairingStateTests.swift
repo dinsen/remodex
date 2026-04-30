@@ -259,7 +259,7 @@ final class CodexSecurePairingStateTests: XCTestCase {
         XCTAssertNil(service.normalizedRelaySessionId)
     }
 
-    func testInitializationMigratesLegacyPlanAndWorktreeDefaultsIntoCurrentMacScope() throws {
+    func testInitializationMigratesLegacyMacScopedDefaultsIntoCurrentMacScope() throws {
         let macDeviceID = "mac-\(UUID().uuidString)"
         let suiteName = "CodexSecurePairingStateTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard
@@ -267,8 +267,11 @@ final class CodexSecurePairingStateTests: XCTestCase {
 
         let legacyPlanSources = try JSONEncoder().encode(["thread-1": CodexPlanSessionSource.requested])
         let legacyWorktreePaths = try JSONEncoder().encode(["thread-1": "/tmp/worktree"])
+        let legacyTurnTerminalStates = try JSONEncoder().encode(["turn-1": CodexTurnTerminalState.completed])
         defaults.set(legacyPlanSources, forKey: CodexService.planSessionSourcesDefaultsKey)
         defaults.set(legacyWorktreePaths, forKey: CodexService.associatedManagedWorktreePathsDefaultsKey)
+        defaults.set(["deleted-thread"], forKey: CodexService.locallyDeletedThreadIDsKey)
+        defaults.set(legacyTurnTerminalStates, forKey: CodexService.turnTerminalStatesDefaultsKey)
 
         SecureStore.writeCodable(
             CodexTrustedMacRegistry(
@@ -288,13 +291,23 @@ final class CodexSecurePairingStateTests: XCTestCase {
 
         XCTAssertEqual(service.planSessionSourceByThread["thread-1"], .requested)
         XCTAssertEqual(service.associatedManagedWorktreePath(for: "thread-1"), "/tmp/worktree")
+        XCTAssertEqual(service.locallyDeletedThreadIDs, Set(["deleted-thread"]))
+        XCTAssertEqual(service.turnTerminalState(for: "turn-1"), .completed)
         XCTAssertNil(defaults.object(forKey: CodexService.planSessionSourcesDefaultsKey))
         XCTAssertNil(defaults.object(forKey: CodexService.associatedManagedWorktreePathsDefaultsKey))
+        XCTAssertNil(defaults.object(forKey: CodexService.locallyDeletedThreadIDsKey))
+        XCTAssertNil(defaults.object(forKey: CodexService.turnTerminalStatesDefaultsKey))
         XCTAssertNotNil(
             defaults.data(forKey: service.macScopedDefaultsKey(CodexService.planSessionSourcesDefaultsKey, macDeviceId: macDeviceID))
         )
         XCTAssertNotNil(
             defaults.data(forKey: service.macScopedDefaultsKey(CodexService.associatedManagedWorktreePathsDefaultsKey, macDeviceId: macDeviceID))
+        )
+        XCTAssertNotNil(
+            defaults.array(forKey: service.macScopedDefaultsKey(CodexService.locallyDeletedThreadIDsKey, macDeviceId: macDeviceID))
+        )
+        XCTAssertNotNil(
+            defaults.data(forKey: service.macScopedDefaultsKey(CodexService.turnTerminalStatesDefaultsKey, macDeviceId: macDeviceID))
         )
     }
 

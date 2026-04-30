@@ -11,7 +11,11 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const { __test, gitStatus } = require("../src/git-handler");
+const { __test, gitStatus, handleGitRequest } = require("../src/git-handler");
+
+test.afterEach(() => {
+  __test.resetRunStructuredCodexJsonImplementation();
+});
 
 function git(cwd, ...args) {
   return execFileSync("git", args, {
@@ -64,6 +68,61 @@ test("normalizeBranchListEntry strips linked-worktree markers from branch labels
     isCheckedOutElsewhere: false,
     name: "feature/mobile",
   });
+});
+
+test("gitStatus reports non-repository directories without failing", async () => {
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-git-handler-nonrepo-"));
+
+  try {
+    fs.writeFileSync(path.join(projectDir, "README.md"), "# New project\n");
+
+    const result = await gitStatus(projectDir);
+
+    assert.equal(result.isRepo, false);
+    assert.equal(result.state, "not_initialized");
+    assert.equal(result.branch, null);
+    assert.deepEqual(result.files, []);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("gitInit creates a main unborn branch without committing files", async () => {
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-git-handler-init-"));
+
+  try {
+    fs.writeFileSync(path.join(projectDir, "README.md"), "# New project\n");
+
+    const result = await __test.gitInit(projectDir);
+    const head = git(projectDir, "symbolic-ref", "--short", "HEAD");
+    const commitCount = git(projectDir, "rev-list", "--count", "--all");
+
+    assert.equal(head, "main");
+    assert.equal(commitCount, "0");
+    assert.equal(result.status.isRepo, true);
+    assert.equal(result.status.branch, "main");
+    assert.equal(result.status.hasHeadCommit, false);
+    assert.equal(result.status.hasPushRemote, false);
+    assert.equal(result.status.canPush, false);
+    assert.equal(result.status.dirty, true);
+    assert.ok(result.status.files.some((file) => file.path === "README.md" && file.status === "??"));
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("gitBranchesWithStatus returns explicit non-repository state", async () => {
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-git-handler-branches-nonrepo-"));
+
+  try {
+    const result = await __test.gitBranchesWithStatus(projectDir);
+
+    assert.deepEqual(result.branches, []);
+    assert.equal(result.status.isRepo, false);
+    assert.equal(result.status.state, "not_initialized");
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
 });
 
 test("gitBranches marks branches that are checked out in another worktree", async () => {
@@ -298,10 +357,108 @@ test("gitStatus reports local-only commits when remotes exist but upstream is mi
 
     assert.equal(result.tracking, null);
     assert.equal(result.state, "no_upstream");
+    assert.equal(result.hasPushRemote, true);
+    assert.equal(result.canPush, true);
     assert.equal(result.localOnlyCommitCount, 1);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("gitStatus does not mark commits pushable when origin is missing", async () => {
+  const repoDir = makeTempRepo();
+
+  try {
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\nlocal\n");
+    git(repoDir, "add", "README.md");
+    git(repoDir, "commit", "-m", "Local commit");
+
+    const result = await gitStatus(repoDir);
+
+    assert.equal(result.hasHeadCommit, true);
+    assert.equal(result.hasPushRemote, false);
+    assert.equal(result.canPush, false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("gitStatus keeps branches pushable when their upstream remote is not origin", async () => {
+  const repoDir = makeTempRepo();
+  const remoteDir = makeBareRemote();
+
+  try {
+    git(remoteDir, "init", "--bare");
+    git(repoDir, "remote", "add", "upstream", remoteDir);
+    git(repoDir, "push", "-u", "upstream", "main");
+
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\nnon-origin remote\n");
+    git(repoDir, "add", "README.md");
+    git(repoDir, "commit", "-m", "Local commit");
+
+    const result = await gitStatus(repoDir);
+
+    assert.equal(result.tracking, "upstream/main");
+    assert.equal(result.hasPushRemote, true);
+    assert.equal(result.canPush, true);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("gitPush allows an existing upstream remote that is not origin", async () => {
+  const repoDir = makeTempRepo();
+  const remoteDir = makeBareRemote();
+
+  try {
+    git(remoteDir, "init", "--bare");
+    git(repoDir, "remote", "add", "upstream", remoteDir);
+    git(repoDir, "push", "-u", "upstream", "main");
+
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\npush upstream\n");
+    git(repoDir, "add", "README.md");
+    git(repoDir, "commit", "-m", "Push upstream");
+
+    const response = await new Promise((resolve) => {
+      handleGitRequest(
+        JSON.stringify({
+          id: 1,
+          method: "git/push",
+          params: { cwd: repoDir },
+        }),
+        (rawResponse) => resolve(JSON.parse(rawResponse))
+      );
+    });
+
+    assert.equal(response.error, undefined);
+    assert.equal(response.result.remote, "upstream");
+    assert.equal(response.result.status.canPush, false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("gitPush rejects before running push when origin is missing", async () => {
+  const repoDir = makeTempRepo();
+
+  try {
+    const response = await new Promise((resolve) => {
+      handleGitRequest(
+        JSON.stringify({
+          id: 1,
+          method: "git/push",
+          params: { cwd: repoDir },
+        }),
+        (rawResponse) => resolve(JSON.parse(rawResponse))
+      );
+    });
+
+    assert.equal(response.error.data.errorCode, "no_remote");
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
@@ -398,6 +555,208 @@ test("gitStatus marks a branch as published when origin has it even without loca
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(remoteDir, { recursive: true, force: true });
   }
+});
+
+test("gitGenerateCommitMessage forwards the selected model and includes tracked plus untracked changes", async () => {
+  const repoDir = makeTempRepo();
+  let capturedInvocation = null;
+
+  try {
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\nupdated\n");
+    fs.writeFileSync(path.join(repoDir, "new-file.txt"), "hello from untracked\n");
+
+    __test.setRunStructuredCodexJsonImplementation(async (payload) => {
+      capturedInvocation = payload;
+      return {
+        subject: "Update repository docs",
+        body: "- Refresh the README content\n- Add a new untracked file for the workflow",
+        fullMessage: "ignored by normalization",
+      };
+    });
+
+    const result = await __test.gitGenerateCommitMessage(repoDir, { model: "gpt-5.4-mini" });
+
+    assert.equal(result.subject, "Update repository docs");
+    assert.equal(
+      result.fullMessage,
+      "Update repository docs\n\n- Refresh the README content\n- Add a new untracked file for the workflow"
+    );
+    assert.equal(capturedInvocation?.model, "gpt-5.4-mini");
+    assert.equal(capturedInvocation?.cwd, repoDir);
+    assert.match(capturedInvocation?.prompt || "", /README\.md/);
+    assert.match(capturedInvocation?.prompt || "", /new-file\.txt/);
+    assert.match(capturedInvocation?.prompt || "", /updated/);
+    assert.match(capturedInvocation?.prompt || "", /hello from untracked/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("gitGeneratePullRequestDraft summarizes branch changes against the default branch", async () => {
+  const repoDir = makeTempRepo();
+  const remoteDir = makeBareRemote();
+  let capturedInvocation = null;
+
+  try {
+    git(remoteDir, "init", "--bare");
+    git(repoDir, "remote", "add", "origin", remoteDir);
+    git(repoDir, "push", "-u", "origin", "main");
+    git(repoDir, "checkout", "-b", "remodex/pr-draft");
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\nbranch change\n");
+    git(repoDir, "add", "README.md");
+    git(repoDir, "commit", "-m", "Update readme on branch");
+
+    __test.setRunStructuredCodexJsonImplementation(async (payload) => {
+      capturedInvocation = payload;
+      return {
+        title: "Improve README branch summary",
+        body: "## Summary\n- Update the README content for the branch\n\n## Testing\n- Not run (not requested)\n\n## Notes\n- Keeps the change scoped to documentation",
+      };
+    });
+
+    const result = await __test.gitGeneratePullRequestDraft(repoDir, { model: "gpt-5.4-mini", baseBranch: "main" });
+
+    assert.equal(result.title, "Improve README branch summary");
+    assert.match(capturedInvocation?.prompt || "", /Base branch: main/);
+    assert.match(capturedInvocation?.prompt || "", /Current branch: remodex\/pr-draft/);
+    assert.match(capturedInvocation?.prompt || "", /Update readme on branch/);
+    assert.match(capturedInvocation?.prompt || "", /branch change/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("gitGenerateCommitMessage surfaces generation failures without falling back to a default message", async () => {
+  const repoDir = makeTempRepo();
+
+  try {
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test\n\nupdated\n");
+
+    __test.setRunStructuredCodexJsonImplementation(async () => {
+      throw new Error("Auth failed");
+    });
+
+    await assert.rejects(
+      __test.gitGenerateCommitMessage(repoDir, { model: "gpt-5.4-mini" }),
+      (error) =>
+        error?.errorCode === "commit_message_generation_failed"
+          && error?.userMessage === "Could not generate a commit message. Auth failed."
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("gitGenerateCommitMessage supports repositories without an initial commit", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-git-handler-unborn-"));
+  let capturedInvocation = null;
+
+  try {
+    git(repoDir, "init", "-b", "main");
+    git(repoDir, "config", "user.name", "Remodex Tests");
+    git(repoDir, "config", "user.email", "tests@example.com");
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# First commit\n");
+
+    __test.setRunStructuredCodexJsonImplementation(async (payload) => {
+      capturedInvocation = payload;
+      return {
+        subject: "Create initial project files",
+        body: "- Add the first tracked project file\n- Prepare the repository for its initial commit",
+        fullMessage: "ignored by normalization",
+      };
+    });
+
+    const result = await __test.gitGenerateCommitMessage(repoDir, { model: "gpt-5.4-mini" });
+
+    assert.equal(result.subject, "Create initial project files");
+    assert.match(capturedInvocation?.prompt || "", /README\.md/);
+    assert.match(capturedInvocation?.prompt || "", /First commit/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("threadGenerateTitle uses Codex structured JSON with read-only title constraints", async () => {
+  let capturedInvocation = null;
+
+  __test.setRunStructuredCodexJsonImplementation(async (payload) => {
+    capturedInvocation = payload;
+    return { title: "fix the sidebar thread title please" };
+  });
+
+  const result = await __test.threadGenerateTitle({
+    message: "Can you fix the sidebar thread title so it summarizes the first request?",
+    model: "gpt-5.4-mini",
+    attachmentCount: 2,
+  });
+
+  assert.equal(result.title, "Fix the sidebar thread");
+  assert.equal(capturedInvocation?.model, "gpt-5.4-mini");
+  assert.equal(capturedInvocation?.skipGitRepoCheck, true);
+  assert.equal(capturedInvocation?.sandboxMode, "read-only");
+  assert.match(capturedInvocation?.prompt || "", /maximum 4 words/);
+  assert.match(capturedInvocation?.prompt || "", /Attachments: 2 images/);
+});
+
+test("threadGenerateTitle falls back to a sanitized first-message title", async () => {
+  __test.setRunStructuredCodexJsonImplementation(async () => {
+    return { title: "" };
+  });
+
+  const result = await __test.threadGenerateTitle({
+    message: "rename this conversation after first send",
+  });
+
+  assert.equal(result.title, "Rename this conversation after");
+});
+
+test("threadNameSet normalizes mobile rename params", () => {
+  const result = __test.threadNameSet({
+    thread_id: " thread-1 ",
+    name: "  Fix Thread Naming  ",
+  });
+
+  assert.deepEqual(result, {
+    threadId: "thread-1",
+    thread_id: "thread-1",
+    name: "Fix Thread Naming",
+    title: "Fix Thread Naming",
+  });
+});
+
+test("handleGitRequest owns thread rename and emits the rename hook", async () => {
+  const responses = [];
+  const notifications = [];
+  const handled = handleGitRequest(
+    JSON.stringify({
+      id: "rename-1",
+      method: "thread/name/set",
+      params: {
+        threadId: "thread-1",
+        title: "Polish loading states",
+      },
+    }),
+    (response) => responses.push(JSON.parse(response)),
+    {
+      onThreadNameSet: (result) => notifications.push(result),
+    }
+  );
+
+  assert.equal(handled, true);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(responses.length, 1);
+  assert.deepEqual(responses[0], {
+    id: "rename-1",
+    result: {
+      threadId: "thread-1",
+      thread_id: "thread-1",
+      name: "Polish loading states",
+      title: "Polish loading states",
+    },
+  });
+  assert.deepEqual(notifications, [responses[0].result]);
 });
 
 test("gitCreateWorktree creates a managed worktree under CODEX_HOME/worktrees", async () => {

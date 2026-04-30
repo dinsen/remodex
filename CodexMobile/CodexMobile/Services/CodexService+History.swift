@@ -76,7 +76,7 @@ extension CodexService {
             guard let turnObject = turnValue.objectValue else { continue }
             let turnID = turnObject["id"]?.stringValue
             let turnTimestamp = decodeHistoryTimestamp(from: turnObject)
-            let turnCompleted = isCompletedHistoryTurn(turnObject)
+            let turnCompleted = historyTurnTerminalState(turnObject) == .completed
             let items = turnObject["items"]?.arrayValue ?? []
 
             for itemValue in items {
@@ -132,6 +132,21 @@ extension CodexService {
                         itemId: itemID,
                         createdAt: timestamp,
                         attachments: imageAttachments
+                    )
+
+                case "imagegeneration", "imagegenerationcall", "imagegenerationend", "imageview":
+                    guard let generatedImageText = decodeGeneratedImageMarkdown(from: itemObject) else {
+                        continue
+                    }
+                    appendHistoryMessage(
+                        to: &result,
+                        role: .assistant,
+                        kind: .chat,
+                        text: generatedImageText,
+                        threadId: threadId,
+                        turnId: turnID,
+                        itemId: itemID,
+                        createdAt: timestamp
                     )
 
                 case "reasoning":
@@ -289,27 +304,54 @@ extension CodexService {
         return result
     }
 
+    // Extracts persisted turn outcomes from canonical history so render grouping survives app relaunch.
+    func decodeTurnTerminalStatesFromThreadRead(_ threadObject: [String: JSONValue]) -> [String: CodexTurnTerminalState] {
+        let turns = threadObject["turns"]?.arrayValue ?? []
+        var result: [String: CodexTurnTerminalState] = [:]
+
+        for turnValue in turns {
+            guard let turnObject = turnValue.objectValue,
+                  let turnID = turnObject["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !turnID.isEmpty,
+                  let terminalState = historyTurnTerminalState(turnObject) else {
+                continue
+            }
+            result[turnID] = terminalState
+        }
+
+        return result
+    }
+
     func decodeHistoryBaseDate(from threadObject: [String: JSONValue]) -> Date {
         if let rawCreatedAt = threadObject["createdAt"]?.doubleValue {
-            return decodeUnixTimestamp(rawCreatedAt)
+            return CodexTimestampParser.decodeUnixTimestamp(rawCreatedAt)
         }
         if let rawCreatedAt = threadObject["created_at"]?.doubleValue {
-            return decodeUnixTimestamp(rawCreatedAt)
+            return CodexTimestampParser.decodeUnixTimestamp(rawCreatedAt)
         }
 
         if let rawUpdatedAt = threadObject["updatedAt"]?.doubleValue {
-            return decodeUnixTimestamp(rawUpdatedAt)
+            return CodexTimestampParser.decodeUnixTimestamp(rawUpdatedAt)
         }
         if let rawUpdatedAt = threadObject["updated_at"]?.doubleValue {
-            return decodeUnixTimestamp(rawUpdatedAt)
+            return CodexTimestampParser.decodeUnixTimestamp(rawUpdatedAt)
         }
 
         if let rawCreatedAt = threadObject["createdAt"]?.stringValue,
-           let parsed = parseHistoryDateString(rawCreatedAt) {
+           let parsed = CodexTimestampParser.parseString(rawCreatedAt) {
             return parsed
         }
         if let rawCreatedAt = threadObject["created_at"]?.stringValue,
-           let parsed = parseHistoryDateString(rawCreatedAt) {
+           let parsed = CodexTimestampParser.parseString(rawCreatedAt) {
+            return parsed
+        }
+
+        if let rawUpdatedAt = threadObject["updatedAt"]?.stringValue,
+           let parsed = CodexTimestampParser.parseString(rawUpdatedAt) {
+            return parsed
+        }
+        if let rawUpdatedAt = threadObject["updated_at"]?.stringValue,
+           let parsed = CodexTimestampParser.parseString(rawUpdatedAt) {
             return parsed
         }
 
@@ -318,8 +360,7 @@ extension CodexService {
     }
 
     func decodeUnixTimestamp(_ rawValue: Double) -> Date {
-        let secondsValue = rawValue > 10_000_000_000 ? rawValue / 1000 : rawValue
-        return Date(timeIntervalSince1970: secondsValue)
+        CodexTimestampParser.decodeUnixTimestamp(rawValue)
     }
 
     func decodeItemText(from itemObject: [String: JSONValue]) -> String {
@@ -371,6 +412,45 @@ extension CodexService {
         }
 
         return ""
+    }
+
+    func decodeGeneratedImageMarkdown(from itemObject: [String: JSONValue]) -> String? {
+        let imagePath = firstNonEmptyString([
+            itemObject["saved_path"]?.stringValue,
+            itemObject["savedPath"]?.stringValue,
+            itemObject["path"]?.stringValue,
+            itemObject["file_path"]?.stringValue
+        ])?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let imagePath, Self.isGeneratedImagePath(imagePath) else {
+            return nil
+        }
+
+        return "![Generated image](\(Self.markdownImagePath(imagePath)))"
+    }
+
+    nonisolated static func isGeneratedImagePath(_ path: String) -> Bool {
+        let lowercased = path.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowercased.hasSuffix(".png")
+            || lowercased.hasSuffix(".jpg")
+            || lowercased.hasSuffix(".jpeg")
+            || lowercased.hasSuffix(".gif")
+            || lowercased.hasSuffix(".webp")
+            || lowercased.hasSuffix(".heic")
+            || lowercased.hasSuffix(".heif")
+    }
+
+    nonisolated static func markdownImagePath(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains(")") || trimmed.contains(" ") || trimmed.contains("%") {
+            let escaped = trimmed
+                .replacingOccurrences(of: "%", with: "%25")
+                .replacingOccurrences(of: ">", with: "%3E")
+                .replacingOccurrences(of: ")", with: "%29")
+            return "<\(escaped)>"
+        }
+        return trimmed
     }
 
     // Extracts user images from history payload and converts them into renderable thumbnail attachments.
@@ -433,7 +513,9 @@ extension CodexService {
         if existing.isEmpty {
             // History messages arrive in server order; assign sequential orderIndex values
             // so that the stable sort preserves server-provided chronology.
-            var sorted = history.sorted(by: { $0.createdAt < $1.createdAt })
+            var sorted = AssistantReplayDeduper.dedupeBlockReplays(
+                in: history.sorted(by: { $0.createdAt < $1.createdAt })
+            )
             for index in sorted.indices {
                 sorted[index].orderIndex = CodexMessageOrderCounter.next()
             }
@@ -456,47 +538,18 @@ extension CodexService {
 
             if message.role == .assistant,
                let turnId = message.turnId, !turnId.isEmpty,
-               let index = merged.lastIndex(where: { candidate in
-                   candidate.role == .assistant
-                       && candidate.turnId == turnId
-                       && normalizedMessageText(candidate.text) == normalizedMessageText(message.text)
-               }) {
-                merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
-                continue
-            }
-
-            // Fallback: match assistant by turnId alone when text-based matching missed
-            // (e.g. history arrives while streaming is in progress, or itemId mismatch).
-            if message.role == .assistant,
-               let turnId = message.turnId, !turnId.isEmpty,
-               let incomingItemId = normalizedHistoryIdentifier(message.itemId),
-               let index = merged.lastIndex(where: { candidate in
-                   candidate.role == .assistant
-                       && candidate.turnId == turnId
-                       && (normalizedHistoryIdentifier(candidate.itemId) == nil
-                           || normalizedHistoryIdentifier(candidate.itemId) == incomingItemId)
-               }) {
-                merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
-                continue
-            }
-
-            // Legacy fallback for servers that still omit assistant item ids in history snapshots.
-            if message.role == .assistant,
-               let turnId = message.turnId, !turnId.isEmpty,
-               normalizedHistoryIdentifier(message.itemId) == nil,
-               let index = merged.lastIndex(where: { candidate in
-                   candidate.role == .assistant
-                       && candidate.turnId == turnId
-                       && normalizedHistoryIdentifier(candidate.itemId) == nil
-               }) {
+               let index = uniqueAssistantHistoryTextMergeIndex(
+                   in: merged,
+                   message: message,
+                   turnId: turnId
+               ) {
                 merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
                 continue
             }
 
             // Forced resume snapshots can materialize a real assistant itemId after the
-            // live row was already created with a placeholder/stale identity. When the
-            // turn is still active, prefer merging into the streaming row instead of
-            // appending a second assistant bubble for the same response.
+            // live row was already created with provisional identity. Only merge when
+            // the identity is compatible, otherwise stale history can pollute the live row.
             if message.role == .assistant,
                let turnId = message.turnId, !turnId.isEmpty,
                (activeThreadIDs.contains(message.threadId) || runningThreadIDs.contains(message.threadId)),
@@ -504,8 +557,27 @@ extension CodexService {
                    candidate.role == .assistant
                        && candidate.turnId == turnId
                        && candidate.isStreaming
+                       && assistantHistoryIdentityAllowsRunningReconcile(
+                           localMessage: candidate,
+                           serverMessage: message
+                       )
                }) {
                 merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
+                continue
+            }
+
+            // Running turn snapshots without item identity are too ambiguous to append
+            // beside a live item-scoped assistant row.
+            if message.role == .assistant,
+               let turnId = message.turnId, !turnId.isEmpty,
+               normalizedHistoryIdentifier(message.itemId) == nil,
+               (activeThreadIDs.contains(message.threadId) || runningThreadIDs.contains(message.threadId)),
+               merged.contains(where: { candidate in
+                   candidate.role == .assistant
+                       && candidate.turnId == turnId
+                       && candidate.isStreaming
+                       && hasStableAssistantIdentity(candidate.itemId)
+               }) {
                 continue
             }
 
@@ -679,6 +751,16 @@ extension CodexService {
                 continue
             }
 
+            if message.role == .assistant,
+               AssistantReplayDeduper.isReplayMessage(
+                   in: merged,
+                   threadId: message.threadId,
+                   turnId: message.turnId,
+                   text: message.text
+               ) {
+                continue
+            }
+
             merged.append(message)
         }
 
@@ -737,16 +819,13 @@ extension CodexService {
 
         for key in numericKeys {
             if let value = object[key]?.doubleValue {
-                return decodeUnixTimestamp(value)
+                return CodexTimestampParser.decodeUnixTimestamp(value)
             }
             if let value = object[key]?.intValue {
-                return decodeUnixTimestamp(Double(value))
+                return CodexTimestampParser.decodeUnixTimestamp(Double(value))
             }
             if let value = object[key]?.stringValue {
-                if let numeric = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    return decodeUnixTimestamp(numeric)
-                }
-                if let parsed = parseHistoryDateString(value) {
+                if let parsed = CodexTimestampParser.parseString(value) {
                     return parsed
                 }
             }
@@ -756,18 +835,7 @@ extension CodexService {
     }
 
     func parseHistoryDateString(_ value: String) -> Date? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: trimmed) {
-            return date
-        }
-
-        let fallbackFormatter = ISO8601DateFormatter()
-        fallbackFormatter.formatOptions = [.withInternetDateTime]
-        return fallbackFormatter.date(from: trimmed)
+        CodexTimestampParser.parseString(value)
     }
 
     func reconcileExistingMessage(_ localMessage: CodexMessage, with serverMessage: CodexMessage) -> CodexMessage {
@@ -795,19 +863,25 @@ extension CodexService {
             value.deliveryState = .confirmed
         }
 
+        if CodexTimestampParser.isTrustworthyServerDate(serverMessage.createdAt),
+           abs(value.createdAt.timeIntervalSince(serverMessage.createdAt)) > 0.5 {
+            value.createdAt = serverMessage.createdAt
+        }
+
         if value.turnId == nil {
             value.turnId = serverMessage.turnId
         }
         let localItemId = normalizedHistoryIdentifier(value.itemId)
         let serverItemId = normalizedHistoryIdentifier(serverMessage.itemId)
-        if localItemId == nil
-            || (
-                preservesRunningPresentation
-                    && value.role == .assistant
-                    && localMessage.isStreaming
-                    && serverItemId != nil
-                    && localItemId != serverItemId
-            )
+        let shouldAttachMissingItemId = localItemId == nil
+        let shouldRebindRunningAssistantItem = preservesRunningPresentation
+            && value.role == .assistant
+            && localMessage.isStreaming
+            && serverItemId != nil
+            && localItemId != serverItemId
+            && !hasStableAssistantIdentity(localItemId)
+        if shouldAttachMissingItemId
+            || shouldRebindRunningAssistantItem
             || (
                 value.role == .system
                     && value.kind == .toolActivity
@@ -827,9 +901,19 @@ extension CodexService {
         if value.role == .assistant {
             let serverText = normalizedMessageText(serverMessage.text)
             if !serverText.isEmpty {
-                value.text = preservesRunningPresentation
-                    ? mergeStreamingSnapshotText(existingText: value.text, incomingText: serverMessage.text)
-                    : serverMessage.text
+                if preservesRunningPresentation {
+                    if assistantHistoryIdentityAllowsRunningReconcile(
+                        localMessage: localMessage,
+                        serverMessage: serverMessage
+                    ) {
+                        value.text = mergeAssistantRunningSnapshotText(
+                            existingText: value.text,
+                            incomingText: serverMessage.text
+                        )
+                    }
+                } else {
+                    value.text = serverMessage.text
+                }
             }
             value.isStreaming = preservesRunningPresentation
                 ? (localMessage.isStreaming || serverMessage.isStreaming || runningThreadIDs.contains(localMessage.threadId))
@@ -872,6 +956,78 @@ extension CodexService {
         }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    // Mirrors t3code's provider-message identity as closely as the mobile schema allows.
+    nonisolated static func stableAssistantMessageID(threadId: String, turnId: String?, itemId: String?) -> String? {
+        guard let itemId = normalizedHistoryIdentifier(itemId) else {
+            return nil
+        }
+        return "assistant:\(threadId):item:\(itemId)"
+    }
+
+    // Real provider item ids must not be rebound to a different history item mid-stream.
+    nonisolated static func hasStableAssistantIdentity(_ itemId: String?) -> Bool {
+        guard let itemId = normalizedHistoryIdentifier(itemId) else {
+            return false
+        }
+        return !itemId.hasPrefix("turn:") && !itemId.hasPrefix("rollout-")
+    }
+
+    // Running assistant rows may absorb history only when the provider item identity agrees.
+    nonisolated static func assistantHistoryIdentityAllowsRunningReconcile(
+        localMessage: CodexMessage,
+        serverMessage: CodexMessage
+    ) -> Bool {
+        let localItemId = normalizedHistoryIdentifier(localMessage.itemId)
+        let serverItemId = normalizedHistoryIdentifier(serverMessage.itemId)
+
+        if let localItemId, let serverItemId {
+            return localItemId == serverItemId || !hasStableAssistantIdentity(localItemId)
+        }
+
+        if let localItemId, serverItemId == nil {
+            return !hasStableAssistantIdentity(localItemId)
+        }
+
+        return true
+    }
+
+    // History can revisit an assistant turn multiple times while local rows still
+    // have provisional identity. Only reconcile by text when the candidate is unique.
+    nonisolated static func uniqueAssistantHistoryTextMergeIndex(
+        in messages: [CodexMessage],
+        message: CodexMessage,
+        turnId: String
+    ) -> Int? {
+        let normalizedText = normalizedMessageText(message.text)
+        guard !normalizedText.isEmpty else {
+            return nil
+        }
+
+        let normalizedTurnId = normalizedHistoryIdentifier(turnId) ?? turnId
+        let candidates = messages.indices.filter { index in
+            let candidate = messages[index]
+            let candidateTurnId = normalizedHistoryIdentifier(candidate.turnId)
+            return candidate.role == .assistant
+                && (candidateTurnId == nil || candidateTurnId == normalizedTurnId)
+                && normalizedMessageText(candidate.text) == normalizedText
+        }
+
+        guard candidates.count == 1,
+              let index = candidates.last else {
+            return nil
+        }
+
+        let localItemId = normalizedHistoryIdentifier(messages[index].itemId)
+        let incomingItemId = normalizedHistoryIdentifier(message.itemId)
+        if let localItemId, let incomingItemId, localItemId != incomingItemId,
+           hasStableAssistantIdentity(localItemId),
+           hasStableAssistantIdentity(incomingItemId) {
+            return nil
+        }
+
+        return index
     }
 
     nonisolated static func shouldReconcileToolActivityRow(
@@ -948,6 +1104,10 @@ extension CodexService {
         }
 
         if incomingText.count > existingText.count, incomingText.hasPrefix(existingText) {
+            let suffix = incomingText.dropFirst(existingText.count)
+            if !existingText.isEmpty, suffix.range(of: existingText) != nil {
+                return existingText
+            }
             return incomingText
         }
 
@@ -967,6 +1127,28 @@ extension CodexService {
         return incomingText
     }
 
+    // Assistant history snapshots can be flattened across messages during reconnect.
+    // Keep the live bubble anchored to live deltas unless history is an exact/stale match.
+    nonisolated static func mergeAssistantRunningSnapshotText(existingText: String, incomingText: String) -> String {
+        if existingText.isEmpty {
+            return incomingText
+        }
+
+        if incomingText == existingText {
+            return existingText
+        }
+
+        if existingText.hasSuffix(incomingText) {
+            return existingText
+        }
+
+        if existingText.count > incomingText.count, existingText.hasPrefix(incomingText) {
+            return existingText
+        }
+
+        return existingText
+    }
+
     // Closed-turn snapshots are only allowed to replace the visible assistant reply
     // when they are clearly the same message and at least as complete.
     nonisolated static func shouldReplaceClosedAssistantMessage(
@@ -984,7 +1166,31 @@ extension CodexService {
             return true
         }
 
-        return serverText.count > localText.count && serverText.hasPrefix(localText)
+        if localText.count > serverText.count, localText.hasPrefix(serverText) {
+            return false
+        }
+
+        if looksLikeFlattenedAssistantReplacement(localText: localText, serverText: serverText) {
+            return false
+        }
+
+        return true
+    }
+
+    // Rejects closed assistant replacements that look like multiple assistant rows
+    // collapsed into one payload instead of a single canonical final message.
+    nonisolated static func looksLikeFlattenedAssistantReplacement(localText: String, serverText: String) -> Bool {
+        if serverText.hasPrefix(localText) {
+            let suffix = serverText.dropFirst(localText.count)
+            return suffix.range(of: "\n\n") != nil || suffix.range(of: localText) != nil
+        }
+
+        if let range = serverText.range(of: localText),
+           range.lowerBound != serverText.startIndex {
+            return true
+        }
+
+        return serverText.range(of: "\n\n") != nil
     }
 
     nonisolated static func attachmentSignature(for attachments: [CodexImageAttachment]) -> String {
@@ -1157,6 +1363,9 @@ extension CodexService {
 
         result.append(
             CodexMessage(
+                id: role == .assistant
+                    ? (Self.stableAssistantMessageID(threadId: threadId, turnId: turnId, itemId: itemId) ?? UUID().uuidString)
+                    : UUID().uuidString,
                 threadId: threadId,
                 role: role,
                 kind: kind,
@@ -1230,7 +1439,7 @@ extension CodexService {
         }
 
         if sections.isEmpty {
-            return "Thinking..."
+            return ""
         }
 
         return sections.joined(separator: "\n\n")
@@ -1289,6 +1498,10 @@ extension CodexService {
     }
 
     func isCompletedHistoryTurn(_ turnObject: [String: JSONValue]) -> Bool {
+        historyTurnTerminalState(turnObject) == .completed
+    }
+
+    func historyTurnTerminalState(_ turnObject: [String: JSONValue]) -> CodexTurnTerminalState? {
         let statusObject = turnObject["status"]?.objectValue
         let rawStatus = firstNonEmptyString([
             turnObject["status"]?.stringValue,
@@ -1298,11 +1511,7 @@ extension CodexService {
             turnObject["result"]?.stringValue,
         ]) ?? ""
 
-        guard let terminalState = threadTerminalState(from: normalizeThreadStatusType(rawStatus)) else {
-            return false
-        }
-
-        return terminalState == .completed
+        return threadTerminalState(from: normalizeThreadStatusType(rawStatus))
     }
 
     // Parses collabAgentToolCall payloads into a stable summary row the timeline can render.

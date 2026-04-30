@@ -26,6 +26,9 @@ enum GitActionsError: LocalizedError {
         switch code {
         case "nothing_to_commit": return "Nothing to commit."
         case "nothing_to_push": return "Nothing to push."
+        case "already_git_repository": return fallback ?? "This folder is already inside a Git repository."
+        case "git_metadata_exists": return fallback ?? "A .git entry already exists in this folder."
+        case "git_init_failed": return fallback ?? "Could not initialize Git in this folder."
         case "push_rejected": return "Push rejected. Pull changes first."
         case "branch_is_main": return "Cannot operate on the main branch."
         case "protected_branch": return "This branch is protected."
@@ -91,6 +94,15 @@ final class GitActionsService {
         return result
     }
 
+    func initializeRepository() async throws -> GitInitResult {
+        let json = try await request(method: "git/init")
+        let result = GitInitResult(from: json)
+        if let status = result.status {
+            rememberRepoRoot(from: status)
+        }
+        return result
+    }
+
     func diff() async throws -> GitRepoDiffResult {
         let json = try await request(method: "git/diff")
         return GitRepoDiffResult(from: json)
@@ -103,6 +115,15 @@ final class GitActionsService {
         }
         let json = try await request(method: "git/commit", params: params)
         return GitCommitResult(from: json)
+    }
+
+    func generateCommitMessage(model: String?) async throws -> GitGeneratedCommitMessageResult {
+        var params: [String: JSONValue] = [:]
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["model"] = .string(model)
+        }
+        let json = try await request(method: "git/generateCommitMessage", params: params)
+        return GitGeneratedCommitMessageResult(from: json)
     }
 
     func push() async throws -> GitPushResult {
@@ -200,6 +221,21 @@ final class GitActionsService {
     func remoteUrl() async throws -> GitRemoteUrlResult {
         let json = try await request(method: "git/remoteUrl")
         return GitRemoteUrlResult(from: json)
+    }
+
+    func generatePullRequestDraft(
+        model: String?,
+        baseBranch: String?
+    ) async throws -> GitPullRequestDraftResult {
+        var params: [String: JSONValue] = [:]
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["model"] = .string(model)
+        }
+        if let baseBranch, !baseBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["baseBranch"] = .string(baseBranch)
+        }
+        let json = try await request(method: "git/generatePullRequestDraft", params: params)
+        return GitPullRequestDraftResult(from: json)
     }
 
     func branchesWithStatus() async throws -> GitBranchesWithStatusResult {

@@ -595,8 +595,9 @@ extension ContentViewModel {
 
             try await connectWithAutoRecovery(
                 codex: codex,
-                serverURL: fullURL,
-                performAutoRetry: true
+                performAutoRetry: true,
+                continueWhile: { !self.isCancellingMacSwitch },
+                serverURLProvider: { fullURL }
             )
             codex.setCurrentTrustedMacDeviceId(normalizedTargetMacDeviceId)
             endMacSwitchContext(codex: codex)
@@ -662,8 +663,9 @@ extension ContentViewModel {
         do {
             try await connectWithAutoRecovery(
                 codex: codex,
-                serverURL: "\(pairingPayload.relay)/\(pairingPayload.sessionId)",
-                performAutoRetry: true
+                performAutoRetry: true,
+                continueWhile: { !self.isCancellingMacSwitch },
+                serverURLProvider: { "\(pairingPayload.relay)/\(pairingPayload.sessionId)" }
             )
             endMacSwitchContext(codex: codex)
         } catch is CancellationError {
