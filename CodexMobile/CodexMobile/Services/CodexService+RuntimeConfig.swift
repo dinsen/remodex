@@ -13,6 +13,23 @@ private let runtimeDebugTimestampFormatter: DateFormatter = {
     return formatter
 }()
 
+private enum RuntimeConfigLoadingPolicy {
+    static let modelListTimeoutNanoseconds: UInt64 = 8_000_000_000
+}
+
+private enum RuntimeSelectionDefaults {
+    static let modelId = "gpt-5.5"
+    static let reasoningEffort = "medium"
+
+    static func reasoningEffort(for unresolvedModelId: String?) -> String? {
+        guard let unresolvedModelId,
+              unresolvedModelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == modelId else {
+            return nil
+        }
+        return reasoningEffort
+    }
+}
+
 extension CodexService {
     // Resolves the effective per-chat override record after normalizing the thread id.
     func threadRuntimeOverride(for threadId: String?) -> CodexThreadRuntimeOverride? {
@@ -62,7 +79,9 @@ extension CodexService {
                     "cursor": .null,
                     "limit": .integer(50),
                     "includeHidden": .bool(false),
-                ])
+                ]),
+                timeoutNanoseconds: RuntimeConfigLoadingPolicy.modelListTimeoutNanoseconds,
+                timeoutMessage: "model/list timed out while syncing runtime options."
             )
 
             guard let resultObject = response.result?.objectValue else {
@@ -89,7 +108,12 @@ extension CodexService {
 
     func setSelectedModelId(_ modelId: String?) {
         let normalized = modelId?.trimmingCharacters(in: .whitespacesAndNewlines)
-        selectedModelId = (normalized?.isEmpty == false) ? normalized : nil
+        if normalized?.isEmpty == false {
+            selectedModelId = normalized
+        } else {
+            selectedModelId = RuntimeSelectionDefaults.modelId
+            selectedReasoningEffort = RuntimeSelectionDefaults.reasoningEffort
+        }
         normalizeRuntimeSelectionsAfterModelsUpdate()
     }
 
@@ -220,7 +244,9 @@ extension CodexService {
 
     func selectedReasoningEffortForSelectedModel(threadId: String? = nil) -> String? {
         guard let model = selectedModelOption() else {
-            return nil
+            return RuntimeSelectionDefaults.reasoningEffort(for: selectedModelId)
+                ?? selectedReasoningEffort
+                ?? RuntimeSelectionDefaults.reasoningEffort
         }
 
         let supported = Set(model.supportedReasoningEfforts.map { $0.reasoningEffort })
@@ -253,7 +279,7 @@ extension CodexService {
     }
 
     func runtimeModelIdentifierForTurn() -> String? {
-        selectedModelOption()?.model
+        selectedModelOption()?.model ?? selectedModelId ?? RuntimeSelectionDefaults.modelId
     }
 
     func effectiveServiceTier(for threadId: String? = nil) -> CodexServiceTier? {
@@ -451,6 +477,8 @@ private extension CodexService {
 
     func normalizeRuntimeSelectionsAfterModelsUpdate() {
         guard !availableModels.isEmpty else {
+            selectedModelId = selectedModelId ?? RuntimeSelectionDefaults.modelId
+            selectedReasoningEffort = selectedReasoningEffort ?? RuntimeSelectionDefaults.reasoningEffort
             persistRuntimeSelections()
             return
         }

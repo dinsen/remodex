@@ -20,6 +20,18 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitFor(predicate, timeoutMs = 500) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = predicate();
+    if (value) {
+      return value;
+    }
+    await wait(5);
+  }
+  return predicate();
+}
+
 test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
   const macConfig = readBridgeConfig({
     env: {},
@@ -87,6 +99,7 @@ test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
     env: {
       REMODEX_CODEX_ENDPOINT: "ws://localhost:8080",
       REMODEX_REFRESH_ENABLED: "true",
+      REMODEX_DESKTOP_IPC_SOCKET: "/tmp/remodex-ipc.sock",
     },
     platform: "darwin",
     runtimeRoot: "/tmp/remodex-package",
@@ -121,6 +134,7 @@ test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
   assert.equal(linuxConfig.refreshEnabled, false);
   assert.equal(linuxCommandConfig.refreshEnabled, false);
   assert.equal(explicitOnConfig.refreshEnabled, true);
+  assert.equal(explicitOnConfig.desktopIpcSocketPath, "/tmp/remodex-ipc.sock");
   assert.equal(explicitOffConfig.refreshEnabled, false);
   assert.equal(explicitOffConfig.keepMacAwakeEnabled, false);
 });
@@ -237,7 +251,7 @@ test("thread/start falls back once to the new-thread route when thread id is sti
     params: {},
   }));
 
-  await wait(40);
+  await waitFor(() => refreshCalls.length === 1);
 
   assert.deepEqual(refreshCalls, ["codex://threads/new"]);
   refresher.handleTransportReset();

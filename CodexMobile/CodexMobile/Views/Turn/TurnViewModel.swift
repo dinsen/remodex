@@ -168,8 +168,16 @@ final class TurnViewModel {
     // MARK: - Git state
 
     var runningGitAction: TurnGitActionKind? = nil
+    // Real-time progress for the in-flight git action; drives the toast title and checklist.
+    var gitActionProgress: TurnGitActionProgress? = nil
+    // Brief success state shown after the action completes; carries optional CTAs (e.g. View PR).
+    var gitActionSuccess: TurnGitActionSuccess? = nil
     var inlineCommitAndPushPhase: InlineCommitAndPushPhase? = nil
     var isRunningGitAction: Bool { runningGitAction != nil }
+    var gitActionLoadingTitle: String? {
+        gitActionProgress?.activeTitle
+    }
+    @ObservationIgnored private var gitActionSuccessDismissTask: Task<Void, Never>?
     var isShowingNothingToCommitAlert = false
     var gitSyncAlert: TurnGitSyncAlert? = nil
     var isLoadingGitBranchTargets = false
@@ -190,10 +198,13 @@ final class TurnViewModel {
         if !canCreatePullRequest {
             disabledActions.insert(.createPR)
         }
+        if !canCommitPushCreatePullRequest {
+            disabledActions.insert(.commitPushCreatePR)
+        }
         if gitRepoSync?.canPush != true {
             disabledActions.insert(.push)
         }
-        if gitRepoSync?.hasPushRemote != true {
+        if gitRepoSync?.hasPushRemote != true || !(gitRepoSync?.isDirty == true || gitRepoSync?.canPush == true) {
             disabledActions.insert(.commitAndPush)
         }
         return disabledActions
@@ -218,18 +229,37 @@ final class TurnViewModel {
             return "Switch to a feature branch before creating a PR."
         }
 
-        let trackingBranch = repoSync.trackingBranch?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trackingBranch.isEmpty || repoSync.isPublishedToRemote else {
-            return "Push this branch before creating a PR."
+        guard !repoSync.isDirty else {
+            return "Commit local changes before creating a PR."
         }
 
-        guard repoSync.aheadCount == 0 else {
-            return "Push this branch before creating a PR."
+        guard repoSync.hasPushRemote else {
+            return "Add a Git remote before creating a PR."
+        }
+
+        guard repoSync.behindCount == 0 else {
+            return "Pull remote changes before creating a PR."
         }
 
         return nil
     }
     var canCreatePullRequest: Bool { createPullRequestValidationMessage == nil }
+    var canCommitPushCreatePullRequest: Bool {
+        guard let repoSync = gitRepoSync, repoSync.isGitRepository else {
+            return false
+        }
+
+        let branch = (repoSync.currentBranch ?? currentGitBranch).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branch.isEmpty,
+              !gitDefaultBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              repoSync.hasPushRemote,
+              repoSync.behindCount == 0
+        else {
+            return false
+        }
+
+        return repoSync.isDirty || repoSync.aheadCount > 0 || !repoSync.isPublishedToRemote
+    }
     var localSelectableGitDefaultBranch: String? {
         remodexSelectableDefaultBranch(
             defaultBranch: gitDefaultBranch,
@@ -642,22 +672,17 @@ final class TurnViewModel {
         resetSlashCommandState(clearPendingSelection: true)
 
         let query = token.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard query.count >= 2 else {
-            skillAutocompleteDebounceTask?.cancel()
-            skillAutocompleteDebounceTask = nil
-            skillAutocompleteItems = []
-            skillAutocompleteQuery = query
-            isSkillAutocompleteLoading = false
-            isSkillAutocompleteVisible = false
-            return
-        }
-
         let normalizedRoot = root
         skillAutocompleteQuery = query
         isSkillAutocompleteVisible = true
         let hasCachedSkillIndex = cachedSkillSearchIndexByRoot[normalizedRoot] != nil
         let rootIsUnsupported = unsupportedSkillsAutocompleteRoots.contains(normalizedRoot)
         isSkillAutocompleteLoading = !hasCachedSkillIndex && !rootIsUnsupported
+        if let cachedIndex = cachedSkillSearchIndexByRoot[normalizedRoot] {
+            skillAutocompleteItems = filteredSkillAutocompleteItems(for: query, indexedSkills: cachedIndex)
+        } else {
+            skillAutocompleteItems = []
+        }
         skillAutocompleteDebounceTask?.cancel()
 
         let expectedQuery = query
@@ -927,6 +952,9 @@ final class TurnViewModel {
         case .codeReview:
             removeTrailingSlashCommandTokenFromInputIfNeeded()
             armCodeReviewSelection(command: command, target: nil)
+        case .compact:
+            removeTrailingSlashCommandTokenFromInputIfNeeded()
+            resetSlashCommandState(clearPendingSelection: true)
         case .feedback:
             removeTrailingSlashCommandTokenFromInputIfNeeded()
             resetSlashCommandState(clearPendingSelection: true)
@@ -1216,12 +1244,17 @@ final class TurnViewModel {
                     fileMentions: confirmedFileMentionPaths(from: nextDraft.rawFileMentions),
                     collaborationMode: nextDraft.collaborationMode
                 )
+                codex.lastErrorMessage = nil
             } catch {
                 shouldAnchorToAssistantResponse = false
                 prependQueuedDraft(nextDraft, codex: codex, threadID: threadID)
                 let queueErrorMessage = codex.userFacingTurnErrorMessage(from: error)
                 setQueuePauseState(.paused(errorMessage: queueErrorMessage), codex: codex, threadID: threadID)
-                codex.lastErrorMessage = "Queue paused: \(queueErrorMessage)"
+                if let footerMessage = codex.userFacingTurnErrorMessageForFooter(from: error) {
+                    codex.lastErrorMessage = "Queue paused: \(footerMessage)"
+                } else {
+                    codex.lastErrorMessage = nil
+                }
             }
         }
     }
@@ -1292,13 +1325,16 @@ final class TurnViewModel {
                     matchingText: draft.text,
                     matchingAttachments: draft.attachments
                 )
-                codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)
+                codex.lastErrorMessage = codex.userFacingTurnErrorMessageForFooter(from: error)
             }
         }
     }
 
     func resumeQueueAndFlushIfPossible(codex: CodexService, threadID: String) {
         setQueuePauseState(.active, codex: codex, threadID: threadID)
+        if codex.lastErrorMessage?.hasPrefix("Queue paused:") == true {
+            codex.lastErrorMessage = nil
+        }
         flushQueueIfPossible(codex: codex, threadID: threadID)
     }
 
@@ -1448,12 +1484,12 @@ final class TurnViewModel {
 
     // Extracts only a final `$query` token at the end of composer text.
     static func trailingSkillAutocompleteToken(in text: String) -> TurnTrailingSkillAutocompleteToken? {
-        guard let token = trailingToken(in: text, trigger: "$") else {
+        guard let token = trailingToken(in: text, trigger: "$", allowsEmptyQuery: true) else {
             return nil
         }
 
         // Reject pure-numeric queries like `$100`, `$42` — not skill names.
-        guard token.query.contains(where: { $0.isLetter }) else {
+        guard token.query.isEmpty || token.query.contains(where: { $0.isLetter }) else {
             return nil
         }
 
@@ -1750,7 +1786,8 @@ final class TurnViewModel {
     // Shared parser for final-token autocomplete triggers (`@`, `$`).
     private static func trailingToken(
         in text: String,
-        trigger: Character
+        trigger: Character,
+        allowsEmptyQuery: Bool = false
     ) -> TurnTrailingToken? {
         guard !text.isEmpty else {
             return nil
@@ -1774,7 +1811,7 @@ final class TurnViewModel {
         let queryStart = text.index(after: tokenStart)
         let query = String(text[queryStart..<text.endIndex])
         guard !query.contains(where: { $0.isWhitespace }),
-              !query.isEmpty else {
+              (allowsEmptyQuery || !query.isEmpty) else {
             return nil
         }
 
@@ -2043,9 +2080,9 @@ final class TurnViewModel {
                shouldRearmPlanModeAfterSendFailure(error) {
                 isPlanModeArmed = true
             }
-            let fallbackMessage = codex.userFacingTurnErrorMessage(from: error)
+            let fallbackMessage = codex.userFacingTurnErrorMessageForFooter(from: error)
             if (codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-                && !fallbackMessage.isEmpty {
+                && !(fallbackMessage?.isEmpty ?? true) {
                 codex.lastErrorMessage = fallbackMessage
             }
         }
@@ -2351,10 +2388,15 @@ final class TurnViewModel {
     ) {
         guard !isRunningGitAction else { return }
         runningGitAction = action
+        beginGitActionProgress(action)
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.runningGitAction = nil }
+            defer {
+                self.runningGitAction = nil
+                self.gitActionProgress = nil
+                self.inlineCommitAndPushPhase = nil
+            }
 
             let gitService = GitActionsService(codex: codex, workingDirectory: workingDirectory)
             let gitWriterModel = codex.gitWriterModelIdentifier()
@@ -2390,24 +2432,35 @@ final class TurnViewModel {
                     }
 
                 case .commit:
-                    let result = try await gitService.commit(
-                        message: await generatedGitCommitMessageOrNil(
-                            gitService: gitService,
-                            model: gitWriterModel
-                        )
+                    let result = try await runStackedGitAction(
+                        .commit,
+                        gitService: gitService,
+                        model: gitWriterModel
                     )
-                    let statusAfter = try? await gitService.status()
-                    if let statusAfter { applyGitRepoSync(statusAfter) }
-                    _ = result // commit succeeded
+                    if let status = result.status { applyGitRepoSync(status) }
+                    presentGitActionSuccess(.init(
+                        kind: .commit,
+                        title: "Committed",
+                        subtitle: result.status?.currentBranch
+                    ))
 
                 case .push:
-                    let result = try await gitService.push()
-                    handleSuccessfulPush(
+                    let result = try await runStackedGitAction(
+                        .push,
+                        gitService: gitService,
+                        model: gitWriterModel
+                    )
+                    handleSuccessfulStackedGitAction(
                         result,
                         codex: codex,
                         workingDirectory: workingDirectory,
                         threadID: threadID
                     )
+                    presentGitActionSuccess(.init(
+                        kind: .push,
+                        title: "Pushed",
+                        subtitle: result.status?.currentBranch
+                    ))
 
                 case .commitAndPush:
                     guard gitRepoSync?.hasPushRemote == true else {
@@ -2416,54 +2469,46 @@ final class TurnViewModel {
                             message: "Add a Git remote before using Commit & Push."
                         )
                     }
-                    _ = try await gitService.commit(
-                        message: await generatedGitCommitMessageOrNil(
-                            gitService: gitService,
-                            model: gitWriterModel
-                        )
+                    let result = try await runStackedGitAction(
+                        .commitAndPush,
+                        gitService: gitService,
+                        model: gitWriterModel
                     )
-                    let pushResult = try await gitService.push()
-                    handleSuccessfulPush(
-                        pushResult,
-                        codex: codex,
-                        workingDirectory: workingDirectory,
-                        threadID: threadID
+                    handleSuccessfulStackedGitAction(result, codex: codex, workingDirectory: workingDirectory, threadID: threadID)
+                    presentGitActionSuccess(.init(
+                        kind: .push,
+                        title: "Commit & push complete",
+                        subtitle: result.status?.currentBranch
+                    ))
+
+                case .commitPushCreatePR:
+                    let result = try await runStackedGitAction(
+                        .commitPushCreatePR,
+                        gitService: gitService,
+                        model: gitWriterModel
                     )
+                    handleSuccessfulStackedGitAction(result, codex: codex, workingDirectory: workingDirectory, threadID: threadID)
+                    presentGitActionSuccess(.init(
+                        kind: .pullRequest(url: result.pullRequest.url),
+                        title: "Pull request opened",
+                        subtitle: result.pullRequest.url
+                    ))
 
                 case .createPR:
                     if let validationMessage = createPullRequestValidationMessage {
                         throw GitActionsError.bridgeError(code: "pull_request_unavailable", message: validationMessage)
                     }
-                    let remoteResult = try await getRemoteURL(codex: codex, workingDirectory: workingDirectory)
-                    guard let ownerRepo = remoteResult.ownerRepo else {
-                        throw GitActionsError.bridgeError(code: "no_remote", message: "Could not determine repository from remote URL.")
-                    }
-                    let branch = gitRepoSync?.currentBranch ?? currentGitBranch.nilIfEmpty ?? ""
-                    guard !branch.isEmpty else {
-                        throw GitActionsError.bridgeError(code: "no_branch", message: "No current branch found.")
-                    }
-                    let base = gitDefaultBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !base.isEmpty else {
-                        throw GitActionsError.bridgeError(
-                            code: "no_default_branch",
-                            message: "Could not determine the repository default branch."
-                        )
-                    }
-                    let draft = await generatedPullRequestDraftOrNil(
+                    let result = try await runStackedGitAction(
+                        .createPR,
                         gitService: gitService,
-                        model: gitWriterModel,
-                        baseBranch: base
+                        model: gitWriterModel
                     )
-                    let prURL = remodexBuildPullRequestURL(
-                        ownerRepo: ownerRepo,
-                        branch: branch,
-                        base: base,
-                        title: draft?.title ?? "",
-                        body: draft?.body ?? ""
-                    )
-                    if let url = URL(string: prURL) {
-                        await UIApplication.shared.open(url)
-                    }
+                    handleSuccessfulStackedGitAction(result, codex: codex, workingDirectory: workingDirectory, threadID: threadID)
+                    presentGitActionSuccess(.init(
+                        kind: .pullRequest(url: result.pullRequest.url),
+                        title: "Pull request opened",
+                        subtitle: result.pullRequest.url
+                    ))
 
                 case .discardRuntimeChangesAndSync:
                     let unpushedCommitWarning: String
@@ -2506,32 +2551,36 @@ final class TurnViewModel {
     func inlineCommitAndPush(codex: CodexService, workingDirectory: String?, threadID: String) {
         guard !isRunningGitAction else { return }
         runningGitAction = .commitAndPush
+        beginGitActionProgress(.commitAndPush)
         inlineCommitAndPushPhase = .committing
 
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 self.runningGitAction = nil
+                self.gitActionProgress = nil
                 self.inlineCommitAndPushPhase = nil
             }
 
             let gitService = GitActionsService(codex: codex, workingDirectory: workingDirectory)
             let gitWriterModel = codex.gitWriterModelIdentifier()
             do {
-                _ = try await gitService.commit(
-                    message: await generatedGitCommitMessageOrNil(
-                        gitService: gitService,
-                        model: gitWriterModel
-                    )
+                let result = try await runStackedGitAction(
+                    .commitAndPush,
+                    gitService: gitService,
+                    model: gitWriterModel
                 )
-                inlineCommitAndPushPhase = .pushing
-                let pushResult = try await gitService.push()
-                handleSuccessfulPush(
-                    pushResult,
+                handleSuccessfulStackedGitAction(
+                    result,
                     codex: codex,
                     workingDirectory: workingDirectory,
                     threadID: threadID
                 )
+                presentGitActionSuccess(.init(
+                    kind: .push,
+                    title: "Commit & push complete",
+                    subtitle: result.status?.currentBranch
+                ))
             } catch let error as GitActionsError {
                 switch error {
                 case .bridgeError(let code, _) where code == "nothing_to_commit":
@@ -2553,9 +2602,155 @@ final class TurnViewModel {
         }
     }
 
-    private func getRemoteURL(codex: CodexService, workingDirectory: String?) async throws -> GitRemoteUrlResult {
-        let gitService = GitActionsService(codex: codex, workingDirectory: workingDirectory)
-        return try await gitService.remoteUrl()
+    // Centralizes the mobile-to-bridge mapping for stacked Git publishing actions.
+    // Drives `gitActionProgress` so the toast can reflect the live phase reported by the bridge.
+    private func runStackedGitAction(
+        _ action: TurnGitActionKind,
+        gitService: GitActionsService,
+        model: String?
+    ) async throws -> GitStackedActionResult {
+        guard let actionIdentifier = action.stackedActionIdentifier else {
+            throw GitActionsError.bridgeError(code: "invalid_git_action", message: "Unsupported Git action.")
+        }
+
+        let baseBranch = gitDefaultBranch.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let latestRepoSync = (try? await gitService.status()) ?? gitRepoSync
+        if let latestRepoSync {
+            applyGitRepoSync(latestRepoSync)
+        }
+        let branch = (latestRepoSync?.currentBranch ?? currentGitBranch).trimmingCharacters(in: .whitespacesAndNewlines)
+        let shouldCreateFeatureBranch = action == .commitPushCreatePR && (baseBranch.map { branch == $0 } ?? false)
+
+        let hasWorkingTreeChanges = latestRepoSync?.isDirty ?? true
+        let wantsCommitStep = action == .commit || ((action == .commitAndPush || action == .commitPushCreatePR) && hasWorkingTreeChanges)
+        let needsCommitMessageGeneration = wantsCommitStep
+        // Recompute the plan now that we know the feature-branch decision and commit-message intent.
+        recomputeGitActionPlannedPhases(
+            for: action,
+            hasCustomCommitMessage: !needsCommitMessageGeneration,
+            willCreateFeatureBranch: shouldCreateFeatureBranch,
+            hasWorkingTreeChanges: hasWorkingTreeChanges
+        )
+
+        let commitMessage: String?
+        if needsCommitMessageGeneration {
+            advanceGitActionPhase(to: .generatingCommit)
+            commitMessage = await generatedGitCommitMessageOrNil(gitService: gitService, model: model)
+            completeGitActionPhase(.generatingCommit)
+        } else {
+            commitMessage = nil
+        }
+
+        return try await gitService.runStackedAction(
+            action: actionIdentifier,
+            commitMessage: commitMessage,
+            model: model,
+            baseBranch: baseBranch,
+            featureBranch: shouldCreateFeatureBranch,
+            onProgress: { [weak self] phase, status in
+                self?.applyGitActionProgressEvent(phase: phase, status: status)
+            }
+        )
+    }
+
+    // MARK: Progress + success helpers
+
+    private func beginGitActionProgress(_ action: TurnGitActionKind) {
+        gitActionSuccessDismissTask?.cancel()
+        gitActionSuccessDismissTask = nil
+        gitActionSuccess = nil
+        inlineCommitAndPushPhase = nil
+        let phases = action.plannedPhases(
+            repoSync: gitRepoSync,
+            hasCustomCommitMessage: false,
+            willCreateFeatureBranch: false,
+            hasWorkingTreeChanges: gitRepoSync?.isDirty
+        )
+        gitActionProgress = TurnGitActionProgress(action: action, plannedPhases: phases)
+    }
+
+    private func recomputeGitActionPlannedPhases(
+        for action: TurnGitActionKind,
+        hasCustomCommitMessage: Bool,
+        willCreateFeatureBranch: Bool,
+        hasWorkingTreeChanges: Bool? = nil
+    ) {
+        guard var progress = gitActionProgress, progress.action == action else { return }
+        let phases = action.plannedPhases(
+            repoSync: gitRepoSync,
+            hasCustomCommitMessage: hasCustomCommitMessage,
+            willCreateFeatureBranch: willCreateFeatureBranch,
+            hasWorkingTreeChanges: hasWorkingTreeChanges
+        )
+        progress = TurnGitActionProgress(
+            action: action,
+            plannedPhases: phases,
+            currentPhase: progress.currentPhase,
+            completedPhases: progress.completedPhases.intersection(phases),
+            skippedPhases: progress.skippedPhases.intersection(phases)
+        )
+        gitActionProgress = progress
+    }
+
+    private func advanceGitActionPhase(to phase: TurnGitActionPhase) {
+        guard var progress = gitActionProgress else { return }
+        progress.currentPhase = phase
+        gitActionProgress = progress
+    }
+
+    private func completeGitActionPhase(_ phase: TurnGitActionPhase) {
+        guard var progress = gitActionProgress else { return }
+        progress.completedPhases.insert(phase)
+        if progress.currentPhase == phase {
+            progress.currentPhase = nil
+        }
+        gitActionProgress = progress
+    }
+
+    private func applyGitActionProgressEvent(
+        phase: TurnGitActionPhase,
+        status: TurnGitActionPhaseStatus
+    ) {
+        guard var progress = gitActionProgress else { return }
+        switch status {
+        case .started:
+            progress.currentPhase = phase
+            // Mirror the bridge's commit phase to the inline button title.
+            if phase == .commit {
+                inlineCommitAndPushPhase = .committing
+            } else if phase == .push {
+                inlineCommitAndPushPhase = .pushing
+            }
+        case .completed:
+            progress.completedPhases.insert(phase)
+            progress.skippedPhases.remove(phase)
+            if progress.currentPhase == phase {
+                progress.currentPhase = nil
+            }
+        case .skipped:
+            progress.skippedPhases.insert(phase)
+            if progress.currentPhase == phase {
+                progress.currentPhase = nil
+            }
+        }
+        gitActionProgress = progress
+    }
+
+    private func presentGitActionSuccess(_ success: TurnGitActionSuccess) {
+        gitActionSuccess = success
+        gitActionSuccessDismissTask?.cancel()
+        gitActionSuccessDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self, self.gitActionSuccess?.id == success.id else { return }
+            self.gitActionSuccess = nil
+        }
+    }
+
+    func dismissGitActionSuccess() {
+        gitActionSuccessDismissTask?.cancel()
+        gitActionSuccessDismissTask = nil
+        gitActionSuccess = nil
     }
 
     // AI writing is a polish layer; Git actions must still work when the writer is unavailable.
@@ -2570,49 +2765,6 @@ final class TurnViewModel {
         }
     }
 
-    private func generatedPullRequestDraftOrNil(
-        gitService: GitActionsService,
-        model: String?,
-        baseBranch: String
-    ) async -> GitPullRequestDraftResult? {
-        do {
-            return try await gitService.generatePullRequestDraft(model: model, baseBranch: baseBranch)
-        } catch {
-            return nil
-        }
-    }
-
-}
-
-func remodexBuildPullRequestURL(
-    ownerRepo: String,
-    branch: String,
-    base: String,
-    title: String,
-    body: String
-) -> String {
-    let encodedBranch = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
-    let encodedBase = base.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? base
-    let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-    let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmedTitle.isEmpty || !trimmedBody.isEmpty else {
-        return "https://github.com/\(ownerRepo)/compare/\(encodedBase)...\(encodedBranch)?expand=1"
-    }
-
-    var components = URLComponents(
-        string: "https://github.com/\(ownerRepo)/compare/\(encodedBase)...\(encodedBranch)"
-    )
-    components?.queryItems = [
-        URLQueryItem(name: "quick_pull", value: "1"),
-        URLQueryItem(name: "title", value: trimmedTitle),
-        URLQueryItem(name: "body", value: trimmedBody),
-    ]
-    guard let urlString = components?.url?.absoluteString else {
-        let encodedTitle = trimmedTitle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let encodedBody = trimmedBody.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        return "https://github.com/\(ownerRepo)/compare/\(encodedBase)...\(encodedBranch)?quick_pull=1&title=\(encodedTitle)&body=\(encodedBody)"
-    }
-    return urlString
 }
 
 struct TurnComposerMentionedFile: Identifiable, Equatable {
@@ -2662,11 +2814,12 @@ private struct TurnSkillSearchIndexEntry: Equatable {
     init(skill: CodexSkillMetadata) {
         self.skill = skill
         let name = skill.name.lowercased()
+        let displayName = SkillDisplayNameFormatter.displayName(for: skill.name).lowercased()
         let description = skill.description?.lowercased() ?? ""
         if description.isEmpty {
-            self.searchBlob = name
+            self.searchBlob = "\(name)\n\(displayName)"
         } else {
-            self.searchBlob = "\(name)\n\(description)"
+            self.searchBlob = "\(name)\n\(displayName)\n\(description)"
         }
     }
 }

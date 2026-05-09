@@ -82,7 +82,7 @@ struct TurnComposerHostView: View {
         )
         let accessoryState = TurnComposerAccessoryState(
             queuedDrafts: viewModel.queuedDraftsList(codex: codex, threadID: thread.id),
-            canSteerQueuedDrafts: isThreadRunning,
+            canSteerQueuedDrafts: isThreadRunning && activeTurnID != nil,
             canRestoreQueuedDrafts: viewModel.canRestoreQueuedDrafts,
             steeringDraftID: viewModel.steeringDraftID,
             composerAttachments: viewModel.composerAttachments,
@@ -100,6 +100,10 @@ struct TurnComposerHostView: View {
             reasoningDisplayOptions: reasoningDisplayOptions
         )
         let runtimeActions = TurnComposerRuntimeActions.resolve(codex: codex)
+        // Keep the runtime pill in a loading state until both chat metadata and models finish hydrating.
+        let isRuntimeSelectionLoading = codex.isBootstrappingConnectionSync
+            || codex.isLoadingThreads
+            || codex.isLoadingModels
 
         TurnComposerView(
             input: $viewModel.input,
@@ -109,6 +113,7 @@ struct TurnComposerHostView: View {
             remainingAttachmentSlots: viewModel.remainingAttachmentSlots,
             isComposerInteractionLocked: viewModel.isComposerInteractionLocked(activeTurnID: activeTurnID),
             isSendDisabled: viewModel.isSendDisabled(isConnected: codex.isConnected, activeTurnID: activeTurnID),
+            isSending: viewModel.isSending,
             isPlanModeArmed: viewModel.isPlanModeArmed,
             queuedCount: viewModel.queuedCount(codex: codex, threadID: thread.id),
             isQueuePaused: viewModel.isQueuePaused(codex: codex, threadID: thread.id),
@@ -117,9 +122,10 @@ struct TurnComposerHostView: View {
             isEmptyThread: isEmptyThread,
             isWorktreeProject: isWorktreeProject,
             orderedModelOptions: orderedModelOptions,
-            selectedModelID: codex.selectedModelOption()?.id,
+            selectedModelID: isRuntimeSelectionLoading ? nil : (codex.selectedModelOption()?.id ?? codex.selectedModelId),
             selectedModelTitle: selectedModelTitle,
             isLoadingModels: codex.isLoadingModels,
+            isRuntimeSelectionLoading: isRuntimeSelectionLoading,
             runtimeState: runtimeState,
             runtimeActions: runtimeActions,
             voiceButtonPresentation: voiceButtonPresentation,
@@ -200,6 +206,11 @@ struct TurnComposerHostView: View {
                 switch command {
                 case .codeReview:
                     viewModel.onSelectSlashCommand(command)
+                case .compact:
+                    viewModel.onSelectSlashCommand(command)
+                    Task {
+                        try? await codex.compactThread(thread.id)
+                    }
                 case .feedback:
                     viewModel.onSelectSlashCommand(command)
                     onOpenFeedbackMail()

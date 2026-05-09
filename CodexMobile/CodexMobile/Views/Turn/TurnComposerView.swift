@@ -16,6 +16,7 @@ struct TurnComposerView: View {
     let remainingAttachmentSlots: Int
     let isComposerInteractionLocked: Bool
     let isSendDisabled: Bool
+    let isSending: Bool
     let isPlanModeArmed: Bool
     let queuedCount: Int
     let isQueuePaused: Bool
@@ -28,6 +29,7 @@ struct TurnComposerView: View {
     let selectedModelID: String?
     let selectedModelTitle: String
     let isLoadingModels: Bool
+    let isRuntimeSelectionLoading: Bool
 
     let runtimeState: TurnComposerRuntimeState
     let runtimeActions: TurnComposerRuntimeActions
@@ -118,7 +120,7 @@ struct TurnComposerView: View {
 
                 ZStack(alignment: .topLeading) {
                     if input.isEmpty {
-                        Text("Ask anything... @plugins, $skills, /commands")
+                        Text(placeholderText)
                             .font(AppFont.body())
                             .foregroundStyle(Color(.placeholderText))
                             .allowsHitTesting(false)
@@ -159,11 +161,13 @@ struct TurnComposerView: View {
                     selectedModelID: selectedModelID,
                     selectedModelTitle: selectedModelTitle,
                     isLoadingModels: isLoadingModels,
+                    isRuntimeSelectionLoading: isRuntimeSelectionLoading,
                     runtimeState: runtimeState,
                     runtimeActions: runtimeActions,
                     remainingAttachmentSlots: remainingAttachmentSlots,
                     isComposerInteractionLocked: isComposerInteractionLocked,
                     isSendDisabled: isSendDisabled,
+                    isSending: isSending,
                     isPlanModeArmed: isPlanModeArmed,
                     queuedCount: queuedCount,
                     isQueuePaused: isQueuePaused,
@@ -251,6 +255,10 @@ struct TurnComposerView: View {
         .padding(.bottom, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.easeInOut(duration: 0.18), value: isInputFocused.wrappedValue)
+    }
+
+    private var placeholderText: String {
+        isEmptyThread ? "Ask anything... @plugins, $skills, /commands" : "Ask for follow-up changes"
     }
 
 }
@@ -687,6 +695,7 @@ private struct ComposerPreviewContent: View {
             remainingAttachmentSlots: 4,
             isComposerInteractionLocked: false,
             isSendDisabled: false,
+            isSending: false,
             isPlanModeArmed: isPlanModeArmed,
             queuedCount: queuedCount,
             isQueuePaused: false,
@@ -698,6 +707,7 @@ private struct ComposerPreviewContent: View {
             selectedModelID: "gpt-5.5",
             selectedModelTitle: "GPT-5.5",
             isLoadingModels: false,
+            isRuntimeSelectionLoading: false,
             runtimeState: TurnComposerRuntimeState(
                 reasoningDisplayOptions: reasoningOptions,
                 effectiveReasoningEffort: "high",

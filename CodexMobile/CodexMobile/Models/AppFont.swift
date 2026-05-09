@@ -357,3 +357,118 @@ enum AppFont {
         return .system(size: size, weight: weight)
     }
 }
+
+// User prompt bubble palette shared by Settings and timeline rendering.
+enum UserBubbleColor: String, CaseIterable, Identifiable {
+    case `default`
+    case red
+    case orange
+    case yellow
+    case green
+    case mint
+    case blue
+    case indigo
+    case teal
+    case cyan
+    case pink
+    case purple
+    case brown
+    case black
+
+    var id: String { rawValue }
+
+    static var storageKey: String { "codex.userBubbleColor" }
+    static var defaultStoredRawValue: String { UserBubbleColor.default.rawValue }
+
+    var title: String {
+        switch self {
+        case .default: return "Default"
+        case .red: return "Red"
+        case .orange: return "Orange"
+        case .yellow: return "Yellow"
+        case .green: return "Green"
+        case .mint: return "Mint"
+        case .blue: return "Blue"
+        case .indigo: return "Indigo"
+        case .teal: return "Teal"
+        case .cyan: return "Cyan"
+        case .pink: return "Pink"
+        case .purple: return "Purple"
+        case .brown: return "Brown"
+        case .black: return "Primary"
+        }
+    }
+
+    var swatchColor: Color {
+        Color(uiColor: uiColor)
+    }
+
+    var uiColor: UIColor {
+        switch self {
+        case .default:
+            return .systemGray3
+        case .red:
+            return .systemRed
+        case .orange:
+            return .systemOrange
+        case .yellow:
+            return .systemYellow
+        case .green:
+            return .systemGreen
+        case .mint:
+            return .systemMint
+        case .blue:
+            return .systemBlue
+        case .indigo:
+            return .systemIndigo
+        case .teal:
+            return .systemTeal
+        case .cyan:
+            return .systemCyan
+        case .pink:
+            return UIColor { traitCollection in
+                traitCollection.userInterfaceStyle == .dark
+                    ? UIColor(red: 1.0, green: 0.32, blue: 0.70, alpha: 1.0)
+                    : UIColor(red: 1.0, green: 0.18, blue: 0.62, alpha: 1.0)
+            }
+        case .purple:
+            return .systemPurple
+        case .brown:
+            return .systemBrown
+        case .black:
+            return .label
+        }
+    }
+
+    // UIKit menu actions template SF Symbols by default, so provide an original-rendered swatch.
+    var menuSwatchImage: UIImage {
+        let configuration = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        let image = UIImage(systemName: "circle.fill", withConfiguration: configuration) ?? UIImage()
+        return image.withTintColor(uiColor, renderingMode: .alwaysOriginal)
+    }
+
+    func bubbleBackground(for colorScheme: ColorScheme) -> Color {
+        switch self {
+        case .default:
+            return Color(.tertiarySystemFill).opacity(0.8)
+        default:
+            let color = Color(uiColor: uiColor)
+            return colorScheme == .dark ? color.opacity(0.9) : color
+        }
+    }
+
+    func bubbleForeground(for _: ColorScheme) -> Color {
+        switch self {
+        case .default:
+            return .primary
+        case .black:
+            return Color(.systemBackground)
+        default:
+            return .white
+        }
+    }
+
+    func mentionForeground(for colorScheme: ColorScheme, fallback: Color) -> Color {
+        self == .default ? fallback : bubbleForeground(for: colorScheme)
+    }
+}

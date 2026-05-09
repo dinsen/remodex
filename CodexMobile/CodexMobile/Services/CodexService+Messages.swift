@@ -7,13 +7,6 @@
 import Foundation
 import UIKit
 
-private enum TurnTimelineProjectionPolicy {
-    // Long chats can contain thousands of persisted rows. Keep initial/open-chat projection
-    // bounded to the recent tail so selecting one thread does not freeze the whole screen.
-    static let rawMessageLimit = 400
-    static let eagerHydrationMessageLimit = 400
-}
-
 private enum CanonicalHistoryReconcileRetryPolicy {
     // Transient thread/read failures should self-heal, but with a small delay so we do not
     // spin aggressively when the bridge or socket is still recovering.
@@ -43,6 +36,8 @@ extension CodexService {
         case skippedForRunningThread
         case loadedCanonicalHistory
         case loadedRecentWindow
+        case loadedPaginatedWindow
+        case deferredAfterTimeout
 
         var didCompleteCanonicalReconcile: Bool {
             self == .loadedCanonicalHistory
@@ -85,20 +80,27 @@ extension CodexService {
             return .ready
         }
 
+        if loadingThreadIDs.contains(threadId) {
+            return .loading
+        }
+
+        let shouldShowBlankComposer = shouldShowImmediateEmptyPlaceholder(
+            threadId: threadId,
+            hasVisibleMessages: hasVisibleMessages,
+            isThreadRunning: isThreadRunning
+        )
+        if supportsTurnPagination,
+           !initialTurnsLoadedByThreadID.contains(threadId),
+           !shouldShowBlankComposer {
+            return .loading
+        }
+
         if shouldSkipInitialDisplayHydration(
             threadId: threadId,
             hasVisibleMessages: hasVisibleMessages,
             isThreadRunning: isThreadRunning
-        ) || shouldShowImmediateEmptyPlaceholder(
-            threadId: threadId,
-            hasVisibleMessages: hasVisibleMessages,
-            isThreadRunning: isThreadRunning
-        ) {
+        ) || shouldShowBlankComposer {
             return .empty
-        }
-
-        if loadingThreadIDs.contains(threadId) {
-            return .loading
         }
 
         if !hydratedThreadIDs.contains(threadId) {
@@ -170,6 +172,14 @@ extension CodexService {
         threadsPendingCompletionHaptic.remove(threadId)
         threadsNeedingCanonicalHistoryReconcile.remove(threadId)
         threadsWithSatisfiedDeferredHistoryHydration.remove(threadId)
+        olderThreadHistoryCursorByThreadID.removeValue(forKey: threadId)
+        exhaustedOlderThreadHistoryCursorByThreadID.removeValue(forKey: threadId)
+        loadingOlderThreadHistoryIDs.remove(threadId)
+        threadTimelineProjectionLimitByThreadID.removeValue(forKey: threadId)
+        initialTurnsLoadedByThreadID.remove(threadId)
+        threadsWithAuthoritativeLocalHistoryStart.remove(threadId)
+        olderHistoryLoadErrorByThreadID.removeValue(forKey: threadId)
+        persistThreadHistoryPaginationState()
         canonicalHistoryReconcileTaskByThreadID[threadId]?.cancel()
         canonicalHistoryReconcileTaskByThreadID.removeValue(forKey: threadId)
         canonicalHistoryReconcileRetryTaskByThreadID[threadId]?.cancel()
@@ -189,6 +199,14 @@ extension CodexService {
         cancelAllPendingStreamingDeltaFlushes()
         threadsNeedingCanonicalHistoryReconcile.removeAll()
         threadsWithSatisfiedDeferredHistoryHydration.removeAll()
+        olderThreadHistoryCursorByThreadID.removeAll()
+        exhaustedOlderThreadHistoryCursorByThreadID.removeAll()
+        loadingOlderThreadHistoryIDs.removeAll()
+        threadTimelineProjectionLimitByThreadID.removeAll()
+        initialTurnsLoadedByThreadID.removeAll()
+        threadsWithAuthoritativeLocalHistoryStart.removeAll()
+        olderHistoryLoadErrorByThreadID.removeAll()
+        persistThreadHistoryPaginationState()
         canonicalHistoryReconcileTaskByThreadID.values.forEach { $0.cancel() }
         canonicalHistoryReconcileTaskByThreadID.removeAll()
         canonicalHistoryReconcileRetryTaskByThreadID.values.forEach { $0.cancel() }
@@ -277,7 +295,14 @@ extension CodexService {
             completedTurnIDs: state.renderSnapshot.completedTurnIDs,
             stoppedTurnIDs: state.renderSnapshot.stoppedTurnIDs,
             assistantRevertStatesByMessageID: state.renderSnapshot.assistantRevertStatesByMessageID,
-            repoRefreshSignal: state.renderSnapshot.repoRefreshSignal
+            repoRefreshSignal: state.renderSnapshot.repoRefreshSignal,
+            hasOlderHistory: state.renderSnapshot.hasOlderHistory,
+            hasRemoteOlderHistory: state.renderSnapshot.hasRemoteOlderHistory,
+            hasLocallyProjectedOlderHistory: state.renderSnapshot.hasLocallyProjectedOlderHistory,
+            usesPaginatedHistory: state.renderSnapshot.usesPaginatedHistory,
+            isLoadingOlderHistory: state.renderSnapshot.isLoadingOlderHistory,
+            initialTurnsLoaded: state.renderSnapshot.initialTurnsLoaded,
+            olderHistoryLoadErrorMessage: state.renderSnapshot.olderHistoryLoadErrorMessage
         )
     }
 
@@ -324,7 +349,14 @@ extension CodexService {
             completedTurnIDs: state.renderSnapshot.completedTurnIDs,
             stoppedTurnIDs: state.renderSnapshot.stoppedTurnIDs,
             assistantRevertStatesByMessageID: state.renderSnapshot.assistantRevertStatesByMessageID,
-            repoRefreshSignal: state.renderSnapshot.repoRefreshSignal
+            repoRefreshSignal: state.renderSnapshot.repoRefreshSignal,
+            hasOlderHistory: state.renderSnapshot.hasOlderHistory,
+            hasRemoteOlderHistory: state.renderSnapshot.hasRemoteOlderHistory,
+            hasLocallyProjectedOlderHistory: state.renderSnapshot.hasLocallyProjectedOlderHistory,
+            usesPaginatedHistory: state.renderSnapshot.usesPaginatedHistory,
+            isLoadingOlderHistory: state.renderSnapshot.isLoadingOlderHistory,
+            initialTurnsLoaded: state.renderSnapshot.initialTurnsLoaded,
+            olderHistoryLoadErrorMessage: state.renderSnapshot.olderHistoryLoadErrorMessage
         )
     }
 
@@ -439,6 +471,8 @@ extension CodexService {
                 guard !Task.isCancelled else { return }
                 if outcome.didCompleteCanonicalReconcile {
                     self.markThreadCanonicalHistoryReconciled(threadId)
+                } else if outcome == .loadedPaginatedWindow {
+                    self.markThreadPaginatedHistorySatisfied(threadId)
                 } else if outcome.needsCanonicalRetry,
                           self.threadsNeedingCanonicalHistoryReconcile.contains(threadId),
                           self.isConnected,
@@ -492,6 +526,11 @@ extension CodexService {
 
         threadsNeedingCanonicalHistoryReconcile.remove(threadId)
         threadsWithSatisfiedDeferredHistoryHydration.insert(threadId)
+    }
+
+    // With turn pagination, the cursor-backed store replaces one-shot full-history reconciliation.
+    func markThreadPaginatedHistorySatisfied(_ threadId: String) {
+        threadsNeedingCanonicalHistoryReconcile.remove(threadId)
     }
 
     // Returns the latest real terminal outcome seen for a thread.
@@ -723,6 +762,66 @@ extension CodexService {
         return true
     }
 
+    // A freshly started thread has metadata but no server history until the
+    // first user message materializes it. Treat that as an empty composer state.
+    func shouldTreatAsEmptyUnmaterializedThreadHistory(
+        _ error: CodexServiceError,
+        threadId: String,
+        markHydratedWhenNotMaterialized: Bool
+    ) -> Bool {
+        guard case .rpcError(let rpcError) = error else {
+            return false
+        }
+
+        let message = rpcError.message.lowercased()
+        guard message.contains("not materialized")
+                && message.contains("before first user message")
+                && shouldShowImmediateEmptyPlaceholder(
+                    threadId: threadId,
+                    hasVisibleMessages: !messages(for: threadId).isEmpty,
+                    isThreadRunning: threadHasActiveOrRunningTurn(threadId)
+                ) else {
+            return false
+        }
+
+        if markHydratedWhenNotMaterialized
+            && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId) {
+            hydratedThreadIDs.insert(threadId)
+            initialTurnsLoadedByThreadID.insert(threadId)
+        }
+        olderHistoryLoadErrorByThreadID.removeValue(forKey: threadId)
+        if activeThreadId == threadId {
+            lastErrorMessage = nil
+        }
+        refreshThreadTimelineState(for: threadId)
+        return true
+    }
+
+    // The first turn can be running before Codex has persisted a readable
+    // history page. During that window, live events own the timeline.
+    func shouldDeferRunningThreadHistoryHydration(threadId: String, forceRefresh: Bool) -> Bool {
+        guard threadHasActiveOrRunningTurn(threadId) else {
+            return false
+        }
+        guard forceRefresh else {
+            return true
+        }
+
+        let threadMessages = messagesByThread[threadId] ?? []
+        let userMessageCount = threadMessages.filter { $0.role == .user }.count
+        let hasAssistantOutput = threadMessages.contains { message in
+            message.role == .assistant
+                && message.kind != .thinking
+                && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        return initialTurnsLoadedByThreadID.contains(threadId)
+            && !hasRemoteOlderThreadHistoryCursor(threadId: threadId)
+            && !hasKnownLocalHistoryStart(threadId: threadId)
+            && userMessageCount <= 1
+            && !hasAssistantOutput
+    }
+
     // Prefers the locally persisted transcript when a non-running thread is already huge.
     // The active sync loop can still refresh lighter chats, but giant histories should not
     // block first paint or crash the device just because the user tapped the row.
@@ -806,7 +905,7 @@ extension CodexService {
         clearRunningThreadWatch(normalizedNext)
     }
 
-    // Loads thread/read(includeTurns=true) once per thread to backfill old messages.
+    // Loads the recent history page once per thread, leaving older pages behind a cursor.
     @discardableResult
     func loadThreadHistoryIfNeeded(
         threadId: String,
@@ -817,7 +916,21 @@ extension CodexService {
         if forceRefresh {
             forcedHistoryLoadThreadIDs.insert(threadId)
         }
-        if !forceRefresh, hydratedThreadIDs.contains(threadId) {
+        if shouldShowImmediateEmptyPlaceholder(
+            threadId: threadId,
+            hasVisibleMessages: !messages(for: threadId).isEmpty,
+            isThreadRunning: threadHasActiveOrRunningTurn(threadId)
+        ) {
+            forcedHistoryLoadThreadIDs.remove(threadId)
+            hydratedThreadIDs.insert(threadId)
+            initialTurnsLoadedByThreadID.insert(threadId)
+            olderHistoryLoadErrorByThreadID.removeValue(forKey: threadId)
+            refreshThreadTimelineState(for: threadId)
+            return .alreadyHydrated
+        }
+        if !forceRefresh,
+           hydratedThreadIDs.contains(threadId),
+           hasSatisfiedInitialThreadHistoryLoad(threadId: threadId) {
             return .alreadyHydrated
         }
         if !markHydratedWhenNotMaterialized {
@@ -843,8 +956,12 @@ extension CodexService {
 
         let refreshGeneration = currentPerThreadRefreshGeneration(for: threadId)
         let task = Task<ThreadHistoryLoadOutcome, Error> { @MainActor in
+            let hadInitialTurnsLoadedBeforeRefresh = initialTurnsLoadedByThreadID.contains(threadId)
+            let hadAuthoritativeLocalStartBeforeRefresh = hasAuthoritativeLocalHistoryStart(threadId: threadId)
+            var initialTurnsTask: Task<ThreadTurnsHistoryPage, Error>?
             loadingThreadIDs.insert(threadId)
             defer {
+                initialTurnsTask?.cancel()
                 // Only clear bookkeeping for the latest refresh generation.
                 if isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) {
                     loadingThreadIDs.remove(threadId)
@@ -854,58 +971,136 @@ extension CodexService {
                 }
             }
 
-            // First try with includeTurns to get full history.
-            // Falls back without includeTurns if the thread has no messages yet
-            // (server returns -32600 "not materialized yet").
-            let paramsWithTurns: JSONValue = .object([
-                "threadId": .string(threadId),
-                "includeTurns": .bool(true),
-            ])
-
-            let response: RPCMessage
-            do {
-                response = try await sendRequest(method: "thread/read", params: paramsWithTurns)
-            } catch let error as CodexServiceError {
-                if case .rpcError(let rpcError) = error, rpcError.code == -32600 {
-                    // Sidebar/timeline metadata fetches should keep retrying while the child thread
-                    // is still materializing, but full history hydration can stop here.
-                    let shouldMarkHydrated = markHydratedWhenNotMaterialized
-                        && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId)
-                    if shouldMarkHydrated {
-                        hydratedThreadIDs.insert(threadId)
-                    }
-                    return .notMaterialized
-                }
-                throw error
-            }
-
-            guard !Task.isCancelled,
-                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
-                throw CancellationError()
-            }
-
-            guard let resultObject = response.result?.objectValue,
-                  let threadObject = resultObject["thread"]?.objectValue else {
-                throw CodexServiceError.invalidResponse("thread/read response missing thread payload")
-            }
-
-            extractContextWindowUsageIfAvailable(threadId: threadId, threadObject: threadObject)
-
-            // Upsert thread metadata (name, agentNickname, agentRole, model, etc.)
-            // so subagent identity resolves without navigating into the child thread.
-            if let threadData = try? JSONEncoder().encode(JSONValue.object(threadObject)),
-               let decoded = try? JSONDecoder().decode(CodexThread.self, from: threadData) {
-                upsertThread(decoded, treatAsServerState: true)
-            }
-
             let shouldForceRefresh = forceRefresh || forcedHistoryLoadThreadIDs.contains(threadId)
 
-            // A turn may have started while thread/read was in flight. Normal background
+            // A turn may have started while chat-open work was in flight. Normal background
             // history loads should still stay out of the way, but forced refreshes are
             // used when reopening a running thread and need to merge the latest snapshot.
-            if threadHasActiveOrRunningTurn(threadId) && !shouldForceRefresh {
+            if shouldDeferRunningThreadHistoryHydration(
+                threadId: threadId,
+                forceRefresh: shouldForceRefresh
+            ) {
                 hydratedThreadIDs.insert(threadId)
+                if !supportsTurnPagination {
+                    initialTurnsLoadedByThreadID.insert(threadId)
+                }
                 return .skippedForRunningThread
+            }
+
+            if supportsTurnPagination {
+                initialTurnsTask = Task { @MainActor in
+                    try await self.fetchInitialThreadTurnsHistoryPage(threadId: threadId)
+                }
+            }
+
+            var loadedViaPagination = false
+            var threadObject: RPCObject
+            if supportsTurnPagination {
+                do {
+                    let turnsPage: ThreadTurnsHistoryPage
+                    if let initialTurnsTask {
+                        turnsPage = try await initialTurnsTask.value
+                    } else {
+                        turnsPage = try await fetchInitialThreadTurnsHistoryPage(threadId: threadId)
+                    }
+                    loadedViaPagination = true
+                    let shouldSeedInitialCursor = !hadInitialTurnsLoadedBeforeRefresh
+                        || (
+                            !hasRemoteOlderThreadHistoryCursor(threadId: threadId)
+                                && !hadAuthoritativeLocalStartBeforeRefresh
+                        )
+                    updateOlderThreadHistoryCursorFromInitialPage(
+                        threadId: threadId,
+                        cursor: turnsPage.nextCursor,
+                        isFreshInitialLoad: shouldSeedInitialCursor
+                    )
+                    threadObject = [
+                        "id": .string(threadId),
+                        "turns": .array(chronologicalTurnsFromDescendingPage(turnsPage.turns)),
+                    ]
+                } catch let error as CodexServiceError {
+                    if shouldTreatAsEmptyUnmaterializedThreadHistory(
+                        error,
+                        threadId: threadId,
+                        markHydratedWhenNotMaterialized: markHydratedWhenNotMaterialized
+                    ) {
+                        return .notMaterialized
+                    }
+                    if case .rpcError(let rpcError) = error, rpcError.code == -32600 {
+                        let shouldMarkHydrated = markHydratedWhenNotMaterialized
+                            && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId)
+                        if shouldMarkHydrated {
+                            hydratedThreadIDs.insert(threadId)
+                            initialTurnsLoadedByThreadID.insert(threadId)
+                        }
+                        return .notMaterialized
+                    }
+                    if shouldDeferThreadHistoryAfterTimeout(error) {
+                        markThreadHistoryDeferredAfterTimeout(threadId: threadId)
+                        debugSyncLog("thread/turns/list timed out for thread=\(threadId); showing local timeline while history is deferred")
+                        return .deferredAfterTimeout
+                    }
+                    if consumeUnsupportedTurnPagination(error, attemptedMethod: "thread/turns/list") {
+                        do {
+                            threadObject = try await fetchLegacyThreadHistoryObject(threadId: threadId)
+                        } catch let legacyError as CodexServiceError {
+                            if case .rpcError(let rpcError) = legacyError, rpcError.code == -32600 {
+                                let shouldMarkHydrated = markHydratedWhenNotMaterialized
+                                    && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId)
+                                if shouldMarkHydrated {
+                                    hydratedThreadIDs.insert(threadId)
+                                    initialTurnsLoadedByThreadID.insert(threadId)
+                                }
+                                return .notMaterialized
+                            }
+                            if shouldDeferThreadHistoryAfterTimeout(legacyError) {
+                                markThreadHistoryDeferredAfterTimeout(threadId: threadId)
+                                debugSyncLog("legacy thread/read timed out for thread=\(threadId); showing local timeline while history is deferred")
+                                return .deferredAfterTimeout
+                            }
+                            throw legacyError
+                        }
+                        extractContextWindowUsageIfAvailable(threadId: threadId, threadObject: threadObject)
+                        if let threadData = try? JSONEncoder().encode(JSONValue.object(threadObject)),
+                           let decoded = try? JSONDecoder().decode(CodexThread.self, from: threadData) {
+                            upsertThread(decoded, treatAsServerState: true)
+                        }
+                    } else {
+                        throw error
+                    }
+                }
+            } else {
+                do {
+                    threadObject = try await fetchLegacyThreadHistoryObject(threadId: threadId)
+                } catch let error as CodexServiceError {
+                    if shouldTreatAsEmptyUnmaterializedThreadHistory(
+                        error,
+                        threadId: threadId,
+                        markHydratedWhenNotMaterialized: markHydratedWhenNotMaterialized
+                    ) {
+                        return .notMaterialized
+                    }
+                    if case .rpcError(let rpcError) = error, rpcError.code == -32600 {
+                        let shouldMarkHydrated = markHydratedWhenNotMaterialized
+                            && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId)
+                        if shouldMarkHydrated {
+                            hydratedThreadIDs.insert(threadId)
+                            initialTurnsLoadedByThreadID.insert(threadId)
+                        }
+                        return .notMaterialized
+                    }
+                    if shouldDeferThreadHistoryAfterTimeout(error) {
+                        markThreadHistoryDeferredAfterTimeout(threadId: threadId)
+                        debugSyncLog("legacy thread/read timed out for thread=\(threadId); showing local timeline while history is deferred")
+                        return .deferredAfterTimeout
+                    }
+                    throw error
+                }
+                extractContextWindowUsageIfAvailable(threadId: threadId, threadObject: threadObject)
+                if let threadData = try? JSONEncoder().encode(JSONValue.object(threadObject)),
+                   let decoded = try? JSONDecoder().decode(CodexThread.self, from: threadData) {
+                    upsertThread(decoded, treatAsServerState: true)
+                }
             }
 
             let historyTerminalStates = decodeTurnTerminalStatesFromThreadRead(threadObject)
@@ -915,7 +1110,18 @@ extension CodexService {
             )
             let historyMessages = decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
             registerSubagentThreads(from: historyMessages, parentThreadId: threadId)
-            var outcome: ThreadHistoryLoadOutcome = .loadedCanonicalHistory
+            if loadedViaPagination {
+                seedThreadTimelineProjectionForPaginatedHistory(
+                    threadId: threadId,
+                    decodedMessageCount: historyMessages.count
+                )
+                initialTurnsLoadedByThreadID.insert(threadId)
+            } else {
+                updateThreadTimelineProjectionForEmbeddedHistory(threadId: threadId, decodedMessageCount: historyMessages.count)
+            }
+            var outcome: ThreadHistoryLoadOutcome = loadedViaPagination
+                ? .loadedPaginatedWindow
+                : .loadedCanonicalHistory
             if !historyMessages.isEmpty {
                 let existingMessages = messagesByThread[threadId] ?? []
                 let activeThreadIDs = Set(activeTurnIdByThread.keys)
@@ -926,6 +1132,19 @@ extension CodexService {
                         existingCount: existingMessages.count,
                         historyCount: historyMessages.count
                     )
+                if loadedViaPagination,
+                   shouldTrustExistingCacheAsPrePaginationFullHistory(
+                    threadId: threadId,
+                    existingMessages: existingMessages,
+                    paginatedMessages: historyMessages,
+                    hadInitialTurnsLoadedBeforeRefresh: hadInitialTurnsLoadedBeforeRefresh,
+                    hadAuthoritativeLocalStartBeforeRefresh: hadAuthoritativeLocalStartBeforeRefresh
+                   ) {
+                    markThreadLocalHistoryStartAuthoritative(threadId, clearRemoteCursor: true)
+                    debugSyncLog("thread history migrated pre-pagination full cache thread=\(threadId) local=\(existingMessages.count) firstPage=\(historyMessages.count)")
+                } else if !loadedViaPagination, !usedRecentWindow {
+                    markThreadLocalHistoryStartAuthoritative(threadId, clearRemoteCursor: true)
+                }
                 if usedRecentWindow {
                     markThreadNeedingCanonicalHistoryReconcile(threadId)
                 }
@@ -944,8 +1163,12 @@ extension CodexService {
                     hydratedThreadIDs.insert(threadId)
                     return .skippedForRunningThread
                 }
-                if merged != existingMessages {
-                    messagesByThread[threadId] = merged
+
+                // Litter keeps any already-hydrated local transcript and merges pages into it.
+                // Do not shrink a legacy/full local cache down to only the first 5-turn page.
+                let nextMessages = merged
+                if nextMessages != existingMessages {
+                    messagesByThread[threadId] = nextMessages
                     persistMessages()
                     updateCurrentOutput(for: threadId)
                 } else if didUpdateTerminalStates {
@@ -956,7 +1179,7 @@ extension CodexService {
                     if !threadHasActiveOrRunningTurn(threadId) {
                         scheduleCanonicalHistoryReconcileIfNeeded(for: threadId)
                     }
-                } else if !threadHasActiveOrRunningTurn(threadId) {
+                } else if outcome.didCompleteCanonicalReconcile, !threadHasActiveOrRunningTurn(threadId) {
                     markThreadCanonicalHistoryReconciled(threadId)
                 }
             } else if didUpdateTerminalStates {
@@ -967,10 +1190,15 @@ extension CodexService {
                   isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
                 throw CancellationError()
             }
-            if outcome.didCompleteCanonicalReconcile, !threadHasActiveOrRunningTurn(threadId) {
+            if outcome == .loadedPaginatedWindow, !threadHasActiveOrRunningTurn(threadId) {
+                markThreadPaginatedHistorySatisfied(threadId)
+            } else if outcome.didCompleteCanonicalReconcile, !threadHasActiveOrRunningTurn(threadId) {
                 markThreadCanonicalHistoryReconciled(threadId)
             }
+            clearDeferredThreadHistoryErrorIfNeeded(threadId: threadId)
+            initialTurnsLoadedByThreadID.insert(threadId)
             hydratedThreadIDs.insert(threadId)
+            refreshThreadTimelineState(for: threadId)
             return outcome
         }
 
@@ -4107,11 +4335,16 @@ extension CodexService {
         let revision = messageRevisionByThread[threadId] ?? 0
         let activeTurnID = activeTurnIdByThread[threadId]
         let isThreadRunning = threadHasActiveOrRunningTurn(threadId)
-        let projectionSourceMessages = snapshotProjectionSourceMessages(from: messages)
+        let usesPaginatedHistory = supportsTurnPagination && initialTurnsLoadedByThreadID.contains(threadId)
+        let projectionSourceMessages = snapshotProjectionSourceMessages(
+            threadId: threadId,
+            from: messages,
+            usesPaginatedHistory: usesPaginatedHistory
+        )
         let stoppedTurnIDs = rebuildStoppedTurnIDs(for: threadId, messages: projectionSourceMessages)
         let latestTurnTerminalState = latestTurnTerminalStateByThread[threadId]
         let projectedMessages = TurnTimelineReducer.project(messages: projectionSourceMessages).messages
-        let planMatchingMessages = messages.filter { $0.kind == .userInputPrompt }
+        let planMatchingMessages = projectionSourceMessages.filter { $0.kind == .userInputPrompt }
         let completedTurnIDs = Set(
             projectedMessages.compactMap { message -> String? in
                 guard let turnId = message.turnId,
@@ -4130,6 +4363,13 @@ extension CodexService {
             messageRevision: revision,
             revertStateRevision: assistantRevertStateRevision
         )
+        let hasLocallyProjectedOlderHistory = hasLocallyProjectedEarlierThreadHistory(threadId: threadId)
+        let hasRemoteOlderHistory = hasRemoteOlderThreadHistoryCursor(threadId: threadId)
+            && !hasKnownLocalHistoryStart(threadId: threadId)
+        let hasOlderHistory = hasRemoteOlderHistory || hasLocallyProjectedOlderHistory
+        let isLoadingOlderHistory = loadingOlderThreadHistoryIDs.contains(threadId)
+        let initialTurnsLoaded = !supportsTurnPagination || initialTurnsLoadedByThreadID.contains(threadId)
+        let olderHistoryLoadErrorMessage = olderHistoryLoadErrorByThreadID[threadId]
 
         state.messages = messages
         state.messageRevision = revision
@@ -4139,6 +4379,13 @@ extension CodexService {
         state.completedTurnIDs = completedTurnIDs
         state.stoppedTurnIDs = stoppedTurnIDs
         state.repoRefreshSignal = repoRefreshSignal
+        state.hasOlderHistory = hasOlderHistory
+        state.hasRemoteOlderHistory = hasRemoteOlderHistory
+        state.hasLocallyProjectedOlderHistory = hasLocallyProjectedOlderHistory
+        state.usesPaginatedHistory = usesPaginatedHistory
+        state.isLoadingOlderHistory = isLoadingOlderHistory
+        state.initialTurnsLoaded = initialTurnsLoaded
+        state.olderHistoryLoadErrorMessage = olderHistoryLoadErrorMessage
         state.renderSnapshot = TurnTimelineRenderSnapshot(
             threadID: threadId,
             messages: projectedMessages,
@@ -4151,18 +4398,33 @@ extension CodexService {
             completedTurnIDs: completedTurnIDs,
             stoppedTurnIDs: stoppedTurnIDs,
             assistantRevertStatesByMessageID: assistantRevertStates,
-            repoRefreshSignal: repoRefreshSignal
+            repoRefreshSignal: repoRefreshSignal,
+            hasOlderHistory: hasOlderHistory,
+            hasRemoteOlderHistory: hasRemoteOlderHistory,
+            hasLocallyProjectedOlderHistory: hasLocallyProjectedOlderHistory,
+            usesPaginatedHistory: usesPaginatedHistory,
+            isLoadingOlderHistory: isLoadingOlderHistory,
+            initialTurnsLoaded: initialTurnsLoaded,
+            olderHistoryLoadErrorMessage: olderHistoryLoadErrorMessage
         )
     }
 
-    // Bounds expensive render-only projection work to the recent transcript tail.
-    // The service still keeps the full raw history for sync, diff summaries, and persistence.
-    func snapshotProjectionSourceMessages(from messages: [CodexMessage]) -> [CodexMessage] {
-        guard messages.count > TurnTimelineProjectionPolicy.rawMessageLimit else {
+    // Both paginated and legacy threads use the same bounded render window. Paginated fetches
+    // prepend pages into the backing cache, then this projection reveals them deliberately.
+    func snapshotProjectionSourceMessages(
+        threadId: String,
+        from messages: [CodexMessage],
+        usesPaginatedHistory _: Bool
+    ) -> [CodexMessage] {
+        let limit = max(
+            TurnTimelineProjectionPolicy.initialMessageLimit,
+            threadTimelineProjectionLimitByThreadID[threadId] ?? TurnTimelineProjectionPolicy.initialMessageLimit
+        )
+        guard messages.count > limit else {
             return messages
         }
 
-        return Array(messages.suffix(TurnTimelineProjectionPolicy.rawMessageLimit))
+        return Array(messages.suffix(limit))
     }
 
     // Refreshes every known timeline state when repo-busy status changes across threads.
@@ -4263,10 +4525,13 @@ extension CodexService {
         messageRevision: Int,
         revertStateRevision: Int
     ) -> [String: AssistantRevertPresentation] {
+        let trimmedWorkingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cacheWorkingDirectory = trimmedWorkingDirectory?.isEmpty == false ? trimmedWorkingDirectory : nil
         if let cached = assistantRevertStateCacheByThread[threadId],
            cached.messageRevision == messageRevision,
            cached.busyRepoRevision == busyRepoRootsRevision,
-           cached.revertStateRevision == revertStateRevision {
+           cached.revertStateRevision == revertStateRevision,
+           cached.workingDirectory == cacheWorkingDirectory {
             return cached.statesByMessageID
         }
 
@@ -4284,6 +4549,7 @@ extension CodexService {
             messageRevision: messageRevision,
             busyRepoRevision: busyRepoRootsRevision,
             revertStateRevision: revertStateRevision,
+            workingDirectory: cacheWorkingDirectory,
             statesByMessageID: statesByMessageID
         )
         return statesByMessageID

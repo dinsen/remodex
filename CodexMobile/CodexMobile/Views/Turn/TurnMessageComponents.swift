@@ -71,71 +71,132 @@ private struct FileChangeInlineActionRow: View {
 // MARK: - FileChangeSummaryBox
 // Renders turn-end file edits as one compact recap instead of chat-like rows.
 private struct FileChangeSummaryBox: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     let entries: [TurnFileChangeSummaryEntry]
     let fallbackText: String
+    let messageID: String
+
+    // Default to expanded so the recap stays informative without an extra tap;
+    // collapse remains available for long lists or visual decluttering.
+    @State private var isExpanded: Bool = true
+    @State private var selectedEntry: TurnFileChangeSummaryEntry?
+
+    private var canCollapse: Bool {
+        !entries.isEmpty || !fallbackText.isEmpty
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "pencil.line")
-                    .font(AppFont.footnote(weight: .semibold))
-                    .foregroundStyle(.secondary)
+            header
 
-                Text(title)
-                    .font(AppFont.footnote(weight: .semibold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, entries.isEmpty ? 10 : 8)
+            if isExpanded {
+                if !entries.isEmpty {
+                    Divider()
 
-            if !entries.isEmpty {
-                Divider()
+                    ForEach(entries.indices, id: \.self) { index in
+                        let entry = entries[index]
+                        let isLastEntry = index == entries.index(before: entries.endIndex)
 
-                ForEach(entries.indices, id: \.self) { index in
-                    let entry = entries[index]
-                    let isLastEntry = index == entries.index(before: entries.endIndex)
+                        Button {
+                            selectedEntry = entry
+                        } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(entry.compactPath)
+                                    .font(AppFont.subheadline())
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
 
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(entry.compactPath)
-                            .font(AppFont.subheadline())
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                                Spacer(minLength: 8)
 
-                        Spacer(minLength: 8)
+                                if entry.additions > 0 || entry.deletions > 0 {
+                                    DiffCountsLabel(additions: entry.additions, deletions: entry.deletions)
+                                        .font(AppFont.mono(.caption))
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
 
-                        if entry.additions > 0 || entry.deletions > 0 {
-                            DiffCountsLabel(additions: entry.additions, deletions: entry.deletions)
-                                .font(AppFont.mono(.caption))
+                        if !isLastEntry {
+                            Divider()
+                                .padding(.leading, 12)
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-
-                    if !isLastEntry {
-                        Divider()
-                            .padding(.leading, 12)
-                    }
+                } else if !fallbackText.isEmpty {
+                    Text(fallbackText)
+                        .font(AppFont.footnote())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 10)
                 }
-            } else if !fallbackText.isEmpty {
-                Text(fallbackText)
-                    .font(AppFont.footnote())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            Color(.secondarySystemBackground),
+            UserBubbleColor.default.bubbleBackground(for: colorScheme),
             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
         )
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color(.separator).opacity(0.4), lineWidth: 0.5)
         }
-        .padding(4)
+        .padding(2)
+        .sheet(item: $selectedEntry) { entry in
+            TurnDiffSheet(
+                title: entry.compactPath,
+                entries: [entry],
+                bodyText: fallbackText,
+                messageID: messageID,
+                restrictToPath: entry.path
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        let content = HStack(spacing: 6) {
+            Image(systemName: "pencil.line")
+                .font(AppFont.footnote(weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text(title)
+                .font(AppFont.footnote(weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Spacer(minLength: 8)
+
+            if canCollapse {
+                Image(systemName: "chevron.down")
+                    .font(AppFont.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, isExpanded && !entries.isEmpty ? 8 : 10)
+        .contentShape(Rectangle())
+
+        if canCollapse {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                content
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityHint(isExpanded ? "Collapse list" : "Expand list")
+            .accessibilityAddTraits(.isButton)
+        } else {
+            content
+        }
     }
 
     private var title: String {
@@ -158,8 +219,8 @@ enum MarkdownParseCacheReset {
 }
 
 // Wraps the default Textual markdown parser with a bounded AttributedString
-// cache so Foundation's markdown parser is not re-run when LazyVStack
-// recycles a cell on upward scroll.
+// cache so Foundation's markdown parser is not re-run during timeline redraws
+// or when a future lazy container recycles a row on upward scroll.
 @MainActor
 private struct CachingMarkdownParser: MarkupParser {
     static let shared = CachingMarkdownParser()
@@ -1078,6 +1139,9 @@ private struct UserBubbleTextBlock<Content: View>: View {
 
 struct MessageRow: View, Equatable {
 
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
+
     let message: CodexMessage
     let isRetryAvailable: Bool
     let onRetryUserMessage: (String) -> Void
@@ -1093,8 +1157,9 @@ struct MessageRow: View, Equatable {
     var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
-    // Passed as init params instead of @Environment so .equatable() can short-circuit
-    // without environment rebinding forcing a body re-evaluation on scroll-up cell reuse.
+    // Passed as init params so .equatable() can invalidate only for row-visible action state.
+    var inlineCommitAndPushAction: (() -> Void)? = nil
+    var inlineCommitAndPushPhase: InlineCommitAndPushPhase? = nil
     var assistantRevertAction: ((CodexMessage) -> Void)? = nil
     var subagentOpenAction: ((CodexSubagentThreadPresentation) -> Void)? = nil
     @State private var previewImage: PreviewImagePayload?
@@ -1113,6 +1178,8 @@ struct MessageRow: View, Equatable {
             && lhs.currentWorkingDirectory == rhs.currentWorkingDirectory
             && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
+            && (lhs.inlineCommitAndPushAction != nil) == (rhs.inlineCommitAndPushAction != nil)
+            && lhs.inlineCommitAndPushPhase == rhs.inlineCommitAndPushPhase
     }
 
     // Computed once per body evaluation and reused by all sub-views.
@@ -1173,7 +1240,8 @@ struct MessageRow: View, Equatable {
     }
 
     private func userBubble(text: String) -> some View {
-        HStack {
+        let bubbleColor = selectedUserBubbleColor
+        return HStack {
             Spacer(minLength: 60)
             VStack(alignment: .trailing, spacing: 4) {
                 if !message.attachments.isEmpty {
@@ -1189,14 +1257,15 @@ struct MessageRow: View, Equatable {
                         contentIdentity: message.id,
                         rawText: text
                     ) {
-                        userBubbleText(text)
+                        userBubbleText(text, bubbleColor: bubbleColor)
                             .font(AppFont.body())
+                            .foregroundStyle(bubbleColor.bubbleForeground(for: colorScheme))
                     }
                         .padding(.vertical, 12)
                         .padding(.horizontal, 16)
                         .background {
                             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                .fill(Color(.tertiarySystemFill).opacity(0.8))
+                                .fill(bubbleColor.bubbleBackground(for: colorScheme))
                         }
                 }
 
@@ -1233,9 +1302,13 @@ struct MessageRow: View, Equatable {
         }
     }
 
+    private var selectedUserBubbleColor: UserBubbleColor {
+        UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
+    }
+
     // Renders inline @file/plugin and $skill mentions inside one AttributedString so large
     // messages do not build an arbitrarily deep SwiftUI Text concatenation chain.
-    private func userBubbleText(_ rawText: String) -> Text {
+    private func userBubbleText(_ rawText: String, bubbleColor: UserBubbleColor) -> Text {
         let normalizedRawText = SkillReferenceFormatter.replacingSkillReferences(
             in: rawText,
             style: .mentionToken
@@ -1267,7 +1340,8 @@ struct MessageRow: View, Equatable {
                 from: normalizedRawText,
                 matches: matches,
                 nsText: nsText,
-                confirmedFileMentions: confirmedFileMentions
+                confirmedFileMentions: confirmedFileMentions,
+                bubbleColor: bubbleColor
             )
         )
     }
@@ -1294,7 +1368,8 @@ struct MessageRow: View, Equatable {
         from text: String,
         matches: [NSTextCheckingResult],
         nsText: NSString,
-        confirmedFileMentions: Set<String>
+        confirmedFileMentions: Set<String>,
+        bubbleColor: UserBubbleColor
     ) -> AttributedString {
         var attributed = AttributedString()
         var cursor = 0
@@ -1335,13 +1410,13 @@ struct MessageRow: View, Equatable {
                 if trigger == "@", isConfirmedFileMention {
                     let fileName = (normalizedToken as NSString).lastPathComponent
                     displayName = fileName.isEmpty ? normalizedToken : fileName
-                    color = .blue
+                    color = bubbleColor.mentionForeground(for: colorScheme, fallback: .blue)
                 } else if trigger == "@" {
                     displayName = SkillDisplayNameFormatter.displayName(for: normalizedToken)
-                    color = .blue
+                    color = bubbleColor.mentionForeground(for: colorScheme, fallback: .blue)
                 } else {
                     displayName = SkillDisplayNameFormatter.displayName(for: normalizedToken)
-                    color = .indigo
+                    color = bubbleColor.mentionForeground(for: colorScheme, fallback: .indigo)
                 }
 
                 var highlightedSegment = AttributedString(displayName)
@@ -1668,7 +1743,11 @@ struct MessageRow: View, Equatable {
             )
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                FileChangeSummaryBox(entries: allEntries, fallbackText: fallbackText)
+                FileChangeSummaryBox(
+                    entries: allEntries,
+                    fallbackText: fallbackText,
+                    messageID: message.id
+                )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
@@ -1754,8 +1833,6 @@ struct MessageRow: View, Equatable {
         }
     }
 
-    @Environment(\.inlineCommitAndPushAction) private var inlineCommitAction
-    @Environment(\.inlineCommitAndPushPhase) private var inlineCommitAndPushPhase
     @State private var isShowingBlockDiffSheet = false
 
     private var hasTurnEndActions: Bool {
@@ -1814,7 +1891,7 @@ struct MessageRow: View, Equatable {
                         }
                     }
 
-                    if let action = inlineCommitAction {
+                    if let action = inlineCommitAndPushAction {
                         Button {
                             HapticFeedback.shared.triggerImpactFeedback(style: .light)
                             action()
@@ -2020,8 +2097,8 @@ private struct SelectableMessageTextSheet: View {
 // Centralizes the inline reasoning row so thinking-specific spacing, fonts, and
 // disclosure behavior are easy to tweak without hunting through MessageRow.
 // Kept as one flat struct (no sub-view nesting) to minimise per-cell view-tree
-// depth inside the LazyVStack — extra struct layers cost allocation + diffing on
-// every scroll frame.
+// depth in the scrolling timeline; extra struct layers cost allocation + diffing
+// on every scroll frame.
 private struct ThinkingSystemBlock: View {
     let messageID: String
     let isStreaming: Bool
@@ -2214,6 +2291,7 @@ private struct CommandExecutionStatusCard: View {
     @State private var isLoadingImagePreview = false
     @State private var imagePreviewError: String?
     @State private var previewImage: PreviewImagePayload?
+    @State private var unavailableImagePreviewPaths: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2260,11 +2338,14 @@ private struct CommandExecutionStatusCard: View {
         guard let details = detailModel else {
             return nil
         }
-        return CommandOutputImageReferenceParser.firstReference(
+        guard let reference = CommandOutputImageReferenceParser.firstReference(
             command: details.fullCommand,
             outputTail: details.outputTail,
             cwd: details.cwd
-        )
+        ) else {
+            return nil
+        }
+        return unavailableImagePreviewPaths.contains(reference.path) ? nil : reference
     }
 
     private func commandImagePreviewButton(for reference: CommandOutputImageReference) -> some View {
@@ -2345,9 +2426,22 @@ private struct CommandExecutionStatusCard: View {
                     title: result.fileName.isEmpty ? reference.fileName : result.fileName
                 )
             } catch {
+                if Self.isMissingWorkspaceImageError(error) {
+                    unavailableImagePreviewPaths.insert(reference.path)
+                    return
+                }
                 imagePreviewError = error.localizedDescription
             }
         }
+    }
+
+    // Stale temp image previews are expected after streaming; hide the ghost row instead of interrupting the user.
+    private static func isMissingWorkspaceImageError(_ error: Error) -> Bool {
+        if case CodexServiceError.rpcError(let rpcError) = error {
+            return rpcError.message.localizedCaseInsensitiveContains("image file no longer exists")
+                || rpcError.message.localizedCaseInsensitiveContains("no longer exists")
+        }
+        return error.localizedDescription.localizedCaseInsensitiveContains("image file no longer exists")
     }
 
     private var imagePreviewErrorIsPresented: Binding<Bool> {

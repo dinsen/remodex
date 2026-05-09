@@ -4,18 +4,11 @@
 // Exports: SettingsView
 
 import SwiftUI
+import StoreKit
 import UIKit
 
 struct SettingsView: View {
-    @Environment(CodexService.self) private var codex
-    @Environment(SubscriptionService.self) private var subscriptions
-
     @AppStorage("codex.appFontStyle") private var appFontStyleRawValue = AppFont.defaultStoredStyleRawValue
-    @State private var isShowingComputerNameSheet = false
-
-    private let runtimeAutoValue = "__AUTO__"
-    private let runtimeNormalValue = "__NORMAL__"
-    private let settingsAccentColor = Color(.plan)
 
     var body: some View {
         ScrollView {
@@ -26,30 +19,15 @@ struct SettingsView: View {
                 SettingsGPTAccountCard()
                 SettingsSubscriptionCard()
                 SettingsBridgeVersionCard()
-                runtimeDefaultsSection
+                SettingsRuntimeDefaultsCard()
                 SettingsAboutCard()
                 SettingsUsageCard()
-                connectionSection
+                SettingsConnectionCard()
             }
             .padding()
         }
         .font(AppFont.body())
         .navigationTitle("Settings")
-        .sheet(isPresented: $isShowingComputerNameSheet) {
-            if let trustedPairPresentation = codex.trustedPairPresentation {
-                SettingsComputerNameSheet(
-                    nickname: sidebarComputerNicknameBinding(for: trustedPairPresentation),
-                    currentName: trustedPairPresentation.name,
-                    systemName: trustedPairPresentation.systemName ?? trustedPairPresentation.name
-                )
-            }
-        }
-        .task {
-            guard subscriptions.bootstrapState == .idle else {
-                return
-            }
-            await subscriptions.bootstrap()
-        }
     }
 
     private var appFontStyleBinding: Binding<AppFont.Style> {
@@ -58,22 +36,16 @@ struct SettingsView: View {
             set: { appFontStyleRawValue = $0.rawValue }
         )
     }
+}
 
-    private var keepMacAwakeWhileBridgeRunsBinding: Binding<Bool> {
-        Binding(
-            get: { codex.keepMacAwakeWhileBridgeRuns },
-            set: { nextValue in
-                codex.setKeepMacAwakeWhileBridgeRunsPreference(nextValue)
-                Task { @MainActor in
-                    await codex.syncBridgeKeepMacAwakePreferenceIfNeeded(showFailureInUI: true)
-                }
-            }
-        )
-    }
+private struct SettingsRuntimeDefaultsCard: View {
+    @Environment(CodexService.self) private var codex
 
-    // MARK: - Runtime defaults
+    private let runtimeAutoValue = "__AUTO__"
+    private let runtimeNormalValue = "__NORMAL__"
+    private let settingsAccentColor = Color(.plan)
 
-    @ViewBuilder private var runtimeDefaultsSection: some View {
+    var body: some View {
         SettingsCard(title: "Runtime defaults") {
             HStack {
                 Text("Model")
@@ -157,9 +129,71 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Connection
+    private var runtimeModelOptions: [CodexModelOption] {
+        TurnComposerMetaMapper.orderedModels(from: codex.availableModels)
+    }
 
-    @ViewBuilder private var connectionSection: some View {
+    private var runtimeReasoningOptions: [TurnComposerReasoningDisplayOption] {
+        TurnComposerMetaMapper.reasoningDisplayOptions(
+            from: codex.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort)
+        )
+    }
+
+    private var runtimeModelSelection: Binding<String> {
+        Binding(
+            get: { codex.selectedModelOption()?.id ?? runtimeAutoValue },
+            set: { selection in
+                codex.setSelectedModelId(selection == runtimeAutoValue ? nil : selection)
+            }
+        )
+    }
+
+    private var runtimeReasoningSelection: Binding<String> {
+        Binding(
+            get: { codex.selectedReasoningEffort ?? runtimeAutoValue },
+            set: { selection in
+                codex.setSelectedReasoningEffort(selection == runtimeAutoValue ? nil : selection)
+            }
+        )
+    }
+
+    private var runtimeAccessSelection: Binding<CodexAccessMode> {
+        Binding(
+            get: { codex.selectedAccessMode },
+            set: { codex.setSelectedAccessMode($0) }
+        )
+    }
+
+    private var runtimeServiceTierSelection: Binding<String> {
+        Binding(
+            get: { codex.selectedServiceTier?.rawValue ?? runtimeNormalValue },
+            set: { selection in
+                codex.setSelectedServiceTier(
+                    selection == runtimeNormalValue ? nil : CodexServiceTier(rawValue: selection)
+                )
+            }
+        )
+    }
+
+    private var gitWriterModelOptions: [CodexModelOption] {
+        TurnComposerMetaMapper.orderedModels(from: codex.availableModels)
+    }
+
+    private var gitWriterModelSelection: Binding<String> {
+        Binding(
+            get: { codex.selectedGitWriterModelOption()?.id ?? gitWriterModelOptions.first?.id ?? "" },
+            set: { codex.setSelectedGitWriterModelId($0.isEmpty ? nil : $0) }
+        )
+    }
+}
+
+private struct SettingsConnectionCard: View {
+    @Environment(CodexService.self) private var codex
+    @State private var isShowingComputerNameSheet = false
+
+    private let settingsAccentColor = Color(.plan)
+
+    var body: some View {
         SettingsCard(title: "Connection") {
             if let trustedPairPresentation = codex.trustedPairPresentation {
                 SettingsTrustedComputerCard(
@@ -228,6 +262,27 @@ struct SettingsView: View {
                 }
             }
         }
+        .sheet(isPresented: $isShowingComputerNameSheet) {
+            if let trustedPairPresentation = codex.trustedPairPresentation {
+                SettingsComputerNameSheet(
+                    nickname: sidebarComputerNicknameBinding(for: trustedPairPresentation),
+                    currentName: trustedPairPresentation.name,
+                    systemName: trustedPairPresentation.systemName ?? trustedPairPresentation.name
+                )
+            }
+        }
+    }
+
+    private var keepMacAwakeWhileBridgeRunsBinding: Binding<Bool> {
+        Binding(
+            get: { codex.keepMacAwakeWhileBridgeRuns },
+            set: { nextValue in
+                codex.setKeepMacAwakeWhileBridgeRunsPreference(nextValue)
+                Task { @MainActor in
+                    await codex.syncBridgeKeepMacAwakePreferenceIfNeeded(showFailureInUI: true)
+                }
+            }
+        )
     }
 
     private var connectionPhaseShowsProgress: Bool {
@@ -276,65 +331,6 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Runtime bindings
-
-    private var runtimeModelOptions: [CodexModelOption] {
-        TurnComposerMetaMapper.orderedModels(from: codex.availableModels)
-    }
-
-    private var runtimeReasoningOptions: [TurnComposerReasoningDisplayOption] {
-        TurnComposerMetaMapper.reasoningDisplayOptions(
-            from: codex.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort)
-        )
-    }
-
-    private var runtimeModelSelection: Binding<String> {
-        Binding(
-            get: { codex.selectedModelOption()?.id ?? runtimeAutoValue },
-            set: { selection in
-                codex.setSelectedModelId(selection == runtimeAutoValue ? nil : selection)
-            }
-        )
-    }
-
-    private var runtimeReasoningSelection: Binding<String> {
-        Binding(
-            get: { codex.selectedReasoningEffort ?? runtimeAutoValue },
-            set: { selection in
-                codex.setSelectedReasoningEffort(selection == runtimeAutoValue ? nil : selection)
-            }
-        )
-    }
-
-    private var runtimeAccessSelection: Binding<CodexAccessMode> {
-        Binding(
-            get: { codex.selectedAccessMode },
-            set: { codex.setSelectedAccessMode($0) }
-        )
-    }
-
-    private var runtimeServiceTierSelection: Binding<String> {
-        Binding(
-            get: { codex.selectedServiceTier?.rawValue ?? runtimeNormalValue },
-            set: { selection in
-                codex.setSelectedServiceTier(
-                    selection == runtimeNormalValue ? nil : CodexServiceTier(rawValue: selection)
-                )
-            }
-        )
-    }
-
-    private var gitWriterModelOptions: [CodexModelOption] {
-        TurnComposerMetaMapper.orderedModels(from: codex.availableModels)
-    }
-
-    private var gitWriterModelSelection: Binding<String> {
-        Binding(
-            get: { codex.selectedGitWriterModelOption()?.id ?? gitWriterModelOptions.first?.id ?? "" },
-            set: { codex.setSelectedGitWriterModelId($0.isEmpty ? nil : $0) }
-        )
-    }
-
     // Writes nicknames against the active trusted computer so switching pairs does not reuse the wrong alias.
     private func sidebarComputerNicknameBinding(for presentation: CodexTrustedPairPresentation) -> Binding<String> {
         Binding(
@@ -347,6 +343,7 @@ struct SettingsView: View {
 private struct SettingsSubscriptionCard: View {
     @Environment(SubscriptionService.self) private var subscriptions
     @State private var isPresentingPaywall = false
+    @State private var isPresentingOfferCodeRedemption = false
 
     var body: some View {
         SettingsCard(title: "Remodex Pro") {
@@ -371,6 +368,11 @@ private struct SettingsSubscriptionCard: View {
                 isPresentingPaywall = true
             }
 
+            SettingsButton("Redeem Code") {
+                isPresentingOfferCodeRedemption = true
+            }
+            .disabled(subscriptions.isPurchasing || subscriptions.isRestoring)
+
             SettingsButton(subscriptions.isRestoring ? "Restoring..." : "Restore Purchases", isLoading: subscriptions.isRestoring) {
                 Task {
                     await subscriptions.restorePurchases()
@@ -386,6 +388,21 @@ private struct SettingsSubscriptionCard: View {
         }
         .sheet(isPresented: $isPresentingPaywall) {
             RevenueCatPaywallView()
+        }
+        .offerCodeRedemption(isPresented: $isPresentingOfferCodeRedemption) { result in
+            Task {
+                if case .failure = result {
+                    await subscriptions.refreshCustomerInfoSilently()
+                } else {
+                    await subscriptions.syncPurchasesAfterOfferCodeRedemption()
+                }
+            }
+        }
+        .task {
+            guard subscriptions.bootstrapState == .idle else {
+                return
+            }
+            await subscriptions.bootstrap()
         }
     }
 }
@@ -518,6 +535,7 @@ private struct SettingsUsageCard: View {
 private struct SettingsAppearanceCard: View {
     @Binding var appFontStyle: AppFont.Style
     @AppStorage("codex.useLiquidGlass") private var useLiquidGlass = true
+    @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
     private let settingsAccentColor = Color(.plan)
 
     var body: some View {
@@ -535,23 +553,158 @@ private struct SettingsAppearanceCard: View {
                 .tint(settingsAccentColor)
             }
 
-            Text(appFontStyle.subtitle)
-                .font(AppFont.caption())
-                .foregroundStyle(.secondary)
+            Divider()
+
+            HStack {
+                Text("Message Bubble")
+                Menu {
+                    ForEach(UserBubbleColor.allCases) { color in
+                        Button {
+                            userBubbleColorRawValue = color.rawValue
+                        } label: {
+                            Label {
+                                Text(color.title)
+                            } icon: {
+                                Image(uiImage: color.menuSwatchImage)
+                                    .renderingMode(.original)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Spacer()
+                        Circle()
+                            .fill(selectedUserBubbleColor.swatchColor)
+                            .frame(width: 14, height: 14)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .trailing)
+                    .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Message Bubble color")
+                .accessibilityValue(selectedUserBubbleColor.title)
+                .tint(settingsAccentColor)
+            }
 
             if GlassPreference.isSupported {
                 Divider()
 
                 Toggle("Liquid Glass", isOn: $useLiquidGlass)
                     .tint(settingsAccentColor)
+            }
 
-                Text(useLiquidGlass
-                     ? "Liquid Glass effects are enabled."
-                     : "Using solid material fallback.")
-                    .font(AppFont.caption())
-                    .foregroundStyle(.secondary)
+            Divider()
+
+            SettingsPetCompanionSection(settingsAccentColor: settingsAccentColor)
+        }
+    }
+
+    private var selectedUserBubbleColor: UserBubbleColor {
+        UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
+    }
+}
+
+private struct SettingsPetCompanionSection: View {
+    @Environment(CodexService.self) private var codex
+    @Environment(PetCompanionStore.self) private var petStore
+
+    let settingsAccentColor: Color
+
+    var body: some View {
+        Group {
+            Toggle(isOn: petEnabledBinding) {
+                HStack(spacing: 8) {
+                    Text("Companion Pet")
+                    Text("BETA")
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(0.5)
+                        .foregroundStyle(settingsAccentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(settingsAccentColor.opacity(0.15))
+                        )
+                }
+            }
+            .tint(settingsAccentColor)
+
+            if petStore.isEnabled {
+                if petStore.availablePets.isEmpty {
+                    Text(petStore.isLoading
+                         ? "Loading local Codex pets from your Mac..."
+                         : "No local Codex pets found in ~/.codex/pets.")
+                        .font(AppFont.caption())
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack {
+                        Text("Pet")
+                        Spacer()
+                        Picker("Pet", selection: selectedPetBinding) {
+                            ForEach(petStore.availablePets) { pet in
+                                Text(pet.displayName).tag(pet.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .tint(settingsAccentColor)
+                    }
+
+                    if let description = petStore.selectedPet?.description,
+                       !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(description)
+                            .font(AppFont.caption())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let errorMessage = petStore.errorMessage {
+                    Text(errorMessage)
+                        .font(AppFont.caption())
+                        .foregroundStyle(.red)
+                }
+
+                SettingsButton("Refresh Pets", isLoading: petStore.isLoading) {
+                    HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                    Task {
+                        await petStore.refreshPets(codex: codex)
+                    }
+                }
             }
         }
+        .task(id: codex.isConnected) {
+            guard codex.isConnected, petStore.isEnabled else {
+                return
+            }
+            await petStore.loadPetsIfNeeded(codex: codex)
+            await petStore.loadSelectedPet(codex: codex)
+        }
+    }
+
+    private var petEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { petStore.isEnabled },
+            set: { isEnabled in
+                petStore.setEnabled(isEnabled)
+                guard isEnabled else {
+                    return
+                }
+                Task {
+                    await petStore.loadPetsIfNeeded(codex: codex)
+                    await petStore.loadSelectedPet(codex: codex)
+                }
+            }
+        )
+    }
+
+    private var selectedPetBinding: Binding<String> {
+        Binding(
+            get: { petStore.selectedPet?.id ?? "" },
+            set: { selectedID in
+                petStore.selectPet(id: selectedID.isEmpty ? nil : selectedID)
+                Task {
+                    await petStore.loadSelectedPet(codex: codex)
+                }
+            }
+        )
     }
 }
 

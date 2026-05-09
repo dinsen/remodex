@@ -327,6 +327,46 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(messageIDs, toolMessages.map(\.id))
     }
 
+    func testTimelineRenderProjectionSkipsPlaceholderOnlyThinkingRows() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "tool-1",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed git status",
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "tool-1"
+            ),
+            makeMessage(
+                id: "thinking-placeholder",
+                threadID: "thread",
+                role: .system,
+                kind: .thinking,
+                text: "Thinking...",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "thinking-1",
+                isStreaming: true
+            ),
+            makeMessage(
+                id: "tool-2",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed git show --stat",
+                createdAt: now.addingTimeInterval(2),
+                turnID: "turn-1",
+                itemID: "tool-2"
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(messages: messages)
+        XCTAssertEqual(items.map(\.id), ["tool-1", "tool-2"])
+    }
+
     func testTimelineRenderProjectionSplitsToolRunsAcrossStableTurnIDs() {
         let now = Date()
         let messages = [
@@ -399,6 +439,18 @@ final class TurnTimelineReducerTests: XCTestCase {
                 orderIndex: 3
             ),
             makeMessage(
+                id: "thinking-placeholder",
+                threadID: "thread",
+                role: .system,
+                kind: .thinking,
+                text: "Thinking...",
+                createdAt: now.addingTimeInterval(2.5),
+                turnID: "turn-1",
+                itemID: "thinking-item",
+                isStreaming: true,
+                orderIndex: 4
+            ),
+            makeMessage(
                 id: "final",
                 threadID: "thread",
                 role: .assistant,
@@ -406,7 +458,7 @@ final class TurnTimelineReducerTests: XCTestCase {
                 createdAt: now.addingTimeInterval(3),
                 turnID: "turn-1",
                 itemID: "final-item",
-                orderIndex: 4
+                orderIndex: 5
             ),
         ]
 
@@ -837,6 +889,72 @@ final class TurnTimelineReducerTests: XCTestCase {
             return XCTFail("Expected previous messages disclosure before priority artifacts")
         }
         XCTAssertEqual(previousGroup.messages.map(\.id), ["thinking", "assistant-status", "tool", "post-tool"])
+    }
+
+    func testTimelineProjectionKeepsCompletedPlanItemOutsidePreviousMessages() {
+        let now = Date()
+        var planMessage = makeMessage(
+            id: "plan",
+            threadID: "thread",
+            role: .system,
+            kind: .plan,
+            text: """
+            # Small Plan
+
+            - Keep the focused source edits.
+            - Remove generated build output.
+            - Run the focused verification.
+            """,
+            createdAt: now.addingTimeInterval(2),
+            turnID: "turn-1",
+            itemID: "plan-item",
+            orderIndex: 3
+        )
+        planMessage.planPresentation = .resultCompletedItem
+
+        let messages = [
+            makeMessage(
+                id: "user",
+                threadID: "thread",
+                role: .user,
+                text: "Review this change",
+                createdAt: now,
+                turnID: "turn-1",
+                orderIndex: 1
+            ),
+            makeMessage(
+                id: "thinking",
+                threadID: "thread",
+                role: .system,
+                kind: .thinking,
+                text: "Inspecting files",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                orderIndex: 2
+            ),
+            planMessage,
+            makeMessage(
+                id: "final",
+                threadID: "thread",
+                role: .assistant,
+                text: "The focused changes are ready to verify.",
+                createdAt: now.addingTimeInterval(3),
+                turnID: "turn-1",
+                itemID: "final-item",
+                orderIndex: 4
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(
+            messages: messages,
+            completedTurnIDs: ["turn-1"]
+        )
+
+        XCTAssertEqual(items.map(\.id), ["user", "previous-messages:final", "plan", "final"])
+        guard case .previousMessages(let previousGroup) = items[1] else {
+            return XCTFail("Expected previous messages disclosure before the visible plan")
+        }
+        XCTAssertEqual(previousGroup.messages.map(\.id), ["thinking"])
     }
 
     func testTimelineProjectionCollapsesTurnFileChangesIntoOneRenderedTable() {
@@ -2323,6 +2441,90 @@ final class TurnTimelineReducerTests: XCTestCase {
         ])
     }
 
+    func testEnforceIntraTurnOrderTrailsFileChangesInInterleavedDesktopMirrorTurn() {
+        let now = Date()
+        var order = 0
+        func nextOrder() -> Int { order += 1; return order }
+
+        let messages = [
+            makeMessage(
+                id: "user-1",
+                threadID: "thread",
+                role: .user,
+                kind: .chat,
+                text: "Implement sidechat",
+                createdAt: now,
+                turnID: "turn-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "thinking-1",
+                threadID: "thread",
+                role: .system,
+                kind: .thinking,
+                text: "Thinking...",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "thinking-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "assistant-status",
+                threadID: "thread",
+                role: .assistant,
+                kind: .chat,
+                text: "I found the local plumbing.",
+                createdAt: now.addingTimeInterval(2),
+                turnID: "turn-1",
+                itemID: "status-item",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "tool-after-status",
+                threadID: "thread",
+                role: .system,
+                kind: .toolActivity,
+                text: "Reading source files",
+                createdAt: now.addingTimeInterval(3),
+                turnID: "turn-1",
+                itemID: "tool-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "file-change",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: "Path: apps/web/src/composerSlashCommands.ts\nKind: update\nTotals: +1 -1",
+                createdAt: now.addingTimeInterval(4),
+                turnID: "turn-1",
+                itemID: "file-change-item",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "assistant-final",
+                threadID: "thread",
+                role: .assistant,
+                kind: .chat,
+                text: "Implemented sidechat.",
+                createdAt: now.addingTimeInterval(5),
+                turnID: "turn-1",
+                itemID: "final-item",
+                orderIndex: nextOrder()
+            ),
+        ]
+
+        let reordered = TurnTimelineReducer.enforceIntraTurnOrder(in: messages)
+        XCTAssertEqual(reordered.map(\.id), [
+            "user-1",
+            "thinking-1",
+            "assistant-status",
+            "tool-after-status",
+            "assistant-final",
+            "file-change",
+        ])
+    }
+
     func testEnforceIntraTurnOrderKeepsSteerUserNearBottomOfInterleavedTurn() {
         let now = Date()
         var order = 0
@@ -2403,6 +2605,77 @@ final class TurnTimelineReducerTests: XCTestCase {
             "user-steer",
             "thinking-2",
             "assistant-2",
+        ])
+    }
+
+    func testEnforceIntraTurnOrderTrailsFileChangesWhenSteerOccursInSameTurn() {
+        let now = Date()
+        var order = 0
+        func nextOrder() -> Int { order += 1; return order }
+
+        let messages = [
+            makeMessage(
+                id: "user-1",
+                threadID: "thread",
+                role: .user,
+                kind: .chat,
+                text: "Initial request",
+                createdAt: now,
+                turnID: "turn-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "assistant-1",
+                threadID: "thread",
+                role: .assistant,
+                kind: .chat,
+                text: "First pass",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "item-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "file-change",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: "Path: Sources/App.swift\nKind: update\nTotals: +2 -0",
+                createdAt: now.addingTimeInterval(2),
+                turnID: "turn-1",
+                itemID: "file-change-item",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "user-steer",
+                threadID: "thread",
+                role: .user,
+                kind: .chat,
+                text: "Also check the Mac mirror",
+                createdAt: now.addingTimeInterval(3),
+                turnID: "turn-1",
+                orderIndex: nextOrder()
+            ),
+            makeMessage(
+                id: "assistant-final",
+                threadID: "thread",
+                role: .assistant,
+                kind: .chat,
+                text: "Done",
+                createdAt: now.addingTimeInterval(4),
+                turnID: "turn-1",
+                itemID: "item-2",
+                orderIndex: nextOrder()
+            ),
+        ]
+
+        let reordered = TurnTimelineReducer.enforceIntraTurnOrder(in: messages)
+        XCTAssertEqual(reordered.map(\.id), [
+            "user-1",
+            "assistant-1",
+            "user-steer",
+            "assistant-final",
+            "file-change",
         ])
     }
 
@@ -3548,6 +3821,100 @@ final class TurnScrollStateTrackerTests: XCTestCase {
                 previousHeight: 356,
                 newHeight: 320,
                 isPinnedToBottom: false
+            )
+        )
+    }
+
+    func testFollowBottomKeepsPinnedAcrossTransientGeometryDrift() {
+        XCTAssertTrue(
+            TurnScrollStateTracker.shouldPinDuringGeometryChange(
+                currentMode: .followBottom,
+                isScrolledToBottom: false,
+                isAutomaticScrollingPaused: false,
+                assistantAnchorTargetExists: true
+            )
+        )
+    }
+
+    func testIgnoresTransientNotBottomOnlyWhileFollowSnapIsPending() {
+        XCTAssertTrue(
+            TurnScrollStateTracker.shouldIgnoreTransientNotBottomGeometry(
+                currentMode: .followBottom,
+                hasPendingFollowBottomScroll: true,
+                isAutomaticScrollingPaused: false
+            )
+        )
+
+        XCTAssertFalse(
+            TurnScrollStateTracker.shouldIgnoreTransientNotBottomGeometry(
+                currentMode: .followBottom,
+                hasPendingFollowBottomScroll: false,
+                isAutomaticScrollingPaused: false
+            )
+        )
+
+        XCTAssertFalse(
+            TurnScrollStateTracker.shouldIgnoreTransientNotBottomGeometry(
+                currentMode: .followBottom,
+                hasPendingFollowBottomScroll: true,
+                isAutomaticScrollingPaused: true
+            )
+        )
+    }
+
+    func testAcceptedNotBottomGeometrySwitchesFollowBottomToManual() {
+        XCTAssertEqual(
+            TurnScrollStateTracker.modeAfterAcceptedNotBottomGeometry(currentMode: .followBottom),
+            .manual
+        )
+
+        XCTAssertEqual(
+            TurnScrollStateTracker.modeAfterAcceptedNotBottomGeometry(currentMode: .manual),
+            .manual
+        )
+
+        XCTAssertEqual(
+            TurnScrollStateTracker.modeAfterAcceptedNotBottomGeometry(currentMode: .anchorAssistantResponse),
+            .anchorAssistantResponse
+        )
+    }
+
+    func testManualAndPausedModesDoNotPinDuringGeometryChange() {
+        XCTAssertFalse(
+            TurnScrollStateTracker.shouldPinDuringGeometryChange(
+                currentMode: .manual,
+                isScrolledToBottom: true,
+                isAutomaticScrollingPaused: false,
+                assistantAnchorTargetExists: false
+            )
+        )
+
+        XCTAssertFalse(
+            TurnScrollStateTracker.shouldPinDuringGeometryChange(
+                currentMode: .followBottom,
+                isScrolledToBottom: true,
+                isAutomaticScrollingPaused: true,
+                assistantAnchorTargetExists: false
+            )
+        )
+    }
+
+    func testAssistantAnchorPinsOnlyWhileWaitingForAssistantTarget() {
+        XCTAssertTrue(
+            TurnScrollStateTracker.shouldPinDuringGeometryChange(
+                currentMode: .anchorAssistantResponse,
+                isScrolledToBottom: true,
+                isAutomaticScrollingPaused: false,
+                assistantAnchorTargetExists: false
+            )
+        )
+
+        XCTAssertFalse(
+            TurnScrollStateTracker.shouldPinDuringGeometryChange(
+                currentMode: .anchorAssistantResponse,
+                isScrolledToBottom: true,
+                isAutomaticScrollingPaused: false,
+                assistantAnchorTargetExists: true
             )
         )
     }

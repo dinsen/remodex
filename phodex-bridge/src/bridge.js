@@ -24,6 +24,7 @@ const { handleGitRequest } = require("./git-handler");
 const { handleThreadContextRequest } = require("./thread-context-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
 const { handleProjectRequest } = require("./project-handler");
+const { handlePetRequest } = require("./pet-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
 const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
 const {
@@ -40,6 +41,9 @@ const {
 } = require("./secure-device-state");
 const { createBridgeSecureTransport } = require("./secure-transport");
 const { createRolloutLiveMirrorController } = require("./rollout-live-mirror");
+const {
+  createDesktopIpcActionFollower,
+} = require("./desktop-ipc-action-follower");
 const { version: bridgePackageVersion = "" } = require("../package.json");
 const {
   MINIMUM_SUPPORTED_IOS_APP_VERSION,
@@ -59,6 +63,24 @@ const RELAY_HISTORY_IMAGE_REFERENCE_URL = "remodex://history-image-elided";
 const RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES = 4 * 1024 * 1024;
 const RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS = 24_000;
 const RELAY_HISTORY_RECENT_TURN_TARGET = 40;
+const RELAY_TURNS_LIST_TARGET_BUDGET_MS = 5_500;
+const RELAY_TURNS_LIST_BUDGET_RESERVE_MS = 1_000;
+const RELAY_TURNS_LIST_RESULT_KEYS = ["data", "items", "turns"];
+const RELAY_TURNS_LIST_PAGINATION_RESULT_KEYS = [
+  "nextCursor",
+  "next_cursor",
+  "cursor",
+  "hasNextCursor",
+  "has_next_cursor",
+  "hasNextPage",
+  "has_next_page",
+  "hasMore",
+  "has_more",
+  "prevCursor",
+  "prev_cursor",
+  "previousCursor",
+  "previous_cursor",
+];
 function startBridge({
   config: explicitConfig = null,
   printPairingQr = true,
@@ -141,6 +163,7 @@ function startBridge({
   const relaySanitizedRequestMethods = new Set([
     "thread/read",
     "thread/resume",
+    "thread/turns/list",
   ]);
   const forwardedRequestMethodTTLms = 2 * 60_000;
   const pendingAuthLogin = {
@@ -173,6 +196,12 @@ function startBridge({
   const rolloutLiveMirror = !config.codexEndpoint
     ? createRolloutLiveMirrorController({
       sendApplicationResponse,
+    })
+    : null;
+  const desktopIpcActionFollower = !config.codexEndpoint
+    ? createDesktopIpcActionFollower({
+      sendApplicationResponse,
+      socketPath: config.desktopIpcSocketPath || undefined,
     })
     : null;
   let contextUsageWatcher = null;
@@ -410,6 +439,7 @@ function startBridge({
       }
       stopContextUsageWatcher();
       rolloutLiveMirror?.stopAll();
+      desktopIpcActionFollower?.stopAll();
       desktopRefresher.handleTransportReset();
       scheduleRelayReconnect(code);
     });
@@ -464,6 +494,7 @@ function startBridge({
     clearReconnectTimer();
     stopContextUsageWatcher();
     rolloutLiveMirror?.stopAll();
+    desktopIpcActionFollower?.stopAll();
     desktopRefresher.handleTransportReset();
     failBridgeManagedCodexRequests(new Error("Codex transport closed before the bridge request completed."));
     forwardedRequestMethodsById.clear();
@@ -507,6 +538,9 @@ function startBridge({
     if (handleProjectRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
+    if (handlePetRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (notificationsHandler.handleNotificationsRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
@@ -526,6 +560,12 @@ function startBridge({
     }
     desktopRefresher.handleInbound(rawMessage);
     rolloutLiveMirror?.observeInbound(rawMessage);
+    if (desktopIpcActionFollower?.observeInbound(rawMessage)) {
+      return;
+    }
+    if (handleBridgeManagedThreadTurnsListRequest(rawMessage)) {
+      return;
+    }
     rememberForwardedRequestMethod(rawMessage);
     rememberThreadFromMessage("phone", rawMessage);
     codex.send(rawMessage);
@@ -556,6 +596,35 @@ function startBridge({
         title: name,
       },
     }));
+  }
+
+  function handleBridgeManagedThreadTurnsListRequest(rawMessage) {
+    const request = parseAdaptiveThreadTurnsListRequest(rawMessage);
+    if (!request) {
+      return false;
+    }
+
+    rememberThreadFromMessage("phone", rawMessage);
+    (async () => {
+      try {
+        const response = await fetchAdaptiveThreadTurnsListForRelay(request, {
+          fetchPage: (params) => sendCodexRequest("thread/turns/list", params),
+        });
+        relaySanitizedResponseMethodsById.set(String(request.id), {
+          method: "thread/turns/list",
+          createdAt: Date.now(),
+        });
+        sendApplicationResponse(JSON.stringify(response));
+      } catch (error) {
+        sendApplicationResponse(createJsonRpcErrorResponse(
+          request.id,
+          error,
+          "thread_turns_list_failed"
+        ));
+      }
+    })();
+
+    return true;
   }
 
   // ─── Bridge-owned auth snapshot ─────────────────────────────
@@ -1357,9 +1426,228 @@ function normalizeNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
-// Shrinks `thread/read` and `thread/resume` snapshots for mobile relay delivery.
+function parseAdaptiveThreadTurnsListRequest(rawMessage) {
+  const parsed = parseBridgeJSON(rawMessage);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.method !== "thread/turns/list") {
+    return null;
+  }
+
+  if (parsed.id == null) {
+    return null;
+  }
+
+  const params = parsed.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return null;
+  }
+
+  if (!Number.isInteger(params.limit) || params.limit <= 0) {
+    return null;
+  }
+
+  return parsed;
+}
+
+async function fetchAdaptiveThreadTurnsListForRelay(request, {
+  fetchPage,
+  now = Date.now,
+  targetBudgetMs = RELAY_TURNS_LIST_TARGET_BUDGET_MS,
+  budgetReserveMs = RELAY_TURNS_LIST_BUDGET_RESERVE_MS,
+  rawPageSoftLimitBytes = RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES,
+  payloadSoftLimitBytes = RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES,
+  sanitizeForRelay = sanitizeThreadHistoryImagesForRelay,
+} = {}) {
+  if (typeof fetchPage !== "function") {
+    throw new Error("fetchPage is required for adaptive turns-list pagination.");
+  }
+
+  const params = request?.params;
+  const requestedLimit = Number.isInteger(params?.limit) && params.limit > 0
+    ? params.limit
+    : 1;
+  const startedAt = now();
+  let nextCursor = params?.cursor;
+  let turnsKey = null;
+  let firstResult = null;
+  let lastResult = null;
+  let combinedTurns = [];
+  let response = null;
+
+  while (combinedTurns.length < requestedLimit) {
+    const remaining = requestedLimit - combinedTurns.length;
+    const pageLimit = selectAdaptiveTurnsListBatchLimit(combinedTurns.length, remaining);
+    const pageParams = buildAdaptiveTurnsListPageParams(params, pageLimit, nextCursor);
+    let page;
+
+    try {
+      page = await fetchMeasuredAdaptiveTurnsListPage(fetchPage, pageParams, now);
+    } catch (error) {
+      if (response) {
+        return response;
+      }
+      throw error;
+    }
+
+    const pageResult = page.result;
+    const pageTurnsKey = findTurnsListResultKey(pageResult);
+    if (!pageTurnsKey) {
+      if (!response) {
+        return {
+          id: request.id,
+          result: pageResult ?? null,
+        };
+      }
+      return response;
+    }
+
+    if (!turnsKey) {
+      turnsKey = pageTurnsKey;
+    }
+    if (!firstResult) {
+      firstResult = pageResult;
+    }
+    lastResult = pageResult;
+
+    const pageTurns = pageResult[pageTurnsKey];
+    combinedTurns = combinedTurns.concat(pageTurns);
+    response = {
+      id: request.id,
+      result: buildAdaptiveTurnsListResult(firstResult, lastResult, turnsKey, combinedTurns),
+    };
+
+    nextCursor = readTurnsListNextCursor(pageResult);
+    if (combinedTurns.length >= requestedLimit || !hasRelayCursor(nextCursor) || pageTurns.length === 0) {
+      break;
+    }
+
+    const rawPageBytes = jsonByteLength(pageResult);
+    const sanitizedResponseBytes = measureSanitizedTurnsListResponseBytes(response, sanitizeForRelay);
+    const elapsedMs = Math.max(0, now() - startedAt);
+    const remainingBudgetMs = Math.max(0, targetBudgetMs - elapsedMs);
+    if (
+      rawPageBytes >= rawPageSoftLimitBytes
+      || sanitizedResponseBytes >= payloadSoftLimitBytes
+      || page.elapsedMs >= Math.max(0, targetBudgetMs - budgetReserveMs)
+      || remainingBudgetMs <= budgetReserveMs
+    ) {
+      break;
+    }
+  }
+
+  return response ?? {
+    id: request.id,
+    result: {
+      data: [],
+    },
+  };
+}
+
+async function fetchMeasuredAdaptiveTurnsListPage(fetchPage, params, now) {
+  const startedAt = now();
+  const result = await fetchPage(params);
+  const elapsedMs = Math.max(0, now() - startedAt);
+  return {
+    result,
+    elapsedMs,
+  };
+}
+
+function selectAdaptiveTurnsListBatchLimit(fetchedTurnCount, remainingTurnCount) {
+  if (fetchedTurnCount <= 0) {
+    return Math.min(1, remainingTurnCount);
+  }
+  if (fetchedTurnCount <= 1) {
+    return Math.min(4, remainingTurnCount);
+  }
+  return remainingTurnCount;
+}
+
+function buildAdaptiveTurnsListPageParams(baseParams, limit, cursor) {
+  const params = {
+    ...baseParams,
+    limit,
+  };
+  if (hasRelayCursor(cursor)) {
+    params.cursor = cursor;
+  } else {
+    delete params.cursor;
+  }
+  return params;
+}
+
+function findTurnsListResultKey(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  return RELAY_TURNS_LIST_RESULT_KEYS.find((key) => Array.isArray(result[key])) || null;
+}
+
+function buildAdaptiveTurnsListResult(firstResult, lastResult, turnsKey, turns) {
+  const result = {
+    ...firstResult,
+  };
+  for (const key of RELAY_TURNS_LIST_RESULT_KEYS) {
+    delete result[key];
+  }
+  result[turnsKey] = turns;
+
+  for (const key of RELAY_TURNS_LIST_PAGINATION_RESULT_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(lastResult, key)) {
+      result[key] = lastResult[key];
+    } else {
+      delete result[key];
+    }
+  }
+
+  return result;
+}
+
+function readTurnsListNextCursor(result) {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+  if (hasRelayCursor(result.nextCursor)) {
+    return result.nextCursor;
+  }
+  if (hasRelayCursor(result.next_cursor)) {
+    return result.next_cursor;
+  }
+  return undefined;
+}
+
+function hasRelayCursor(cursor) {
+  return cursor !== undefined && cursor !== null && cursor !== "";
+}
+
+function jsonByteLength(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function measureSanitizedTurnsListResponseBytes(response, sanitizeForRelay) {
+  try {
+    const rawResponse = JSON.stringify(response);
+    const sanitizedResponse = sanitizeForRelay(rawResponse, "thread/turns/list");
+    return Buffer.byteLength(sanitizedResponse, "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+// Shrinks thread history snapshots/pages for mobile relay delivery.
 // This elides bulky blobs and replaces oversized older history with a compact marker.
 function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
+  if (requestMethod === "thread/turns/list") {
+    return sanitizeThreadTurnsListForRelay(rawMessage);
+  }
+
   if (requestMethod !== "thread/read" && requestMethod !== "thread/resume") {
     return rawMessage;
   }
@@ -1370,68 +1658,10 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
     return rawMessage;
   }
 
-  let didSanitize = false;
-  const sanitizedTurns = thread.turns.map((turn) => {
-    if (!turn || typeof turn !== "object" || !Array.isArray(turn.items)) {
-      return turn;
-    }
-
-    let turnDidChange = false;
-    const threadId = normalizeNonEmptyString(thread.id)
-      || normalizeNonEmptyString(thread.threadId)
-      || normalizeNonEmptyString(thread.thread_id);
-
-    const sanitizedItems = turn.items.map((item) => {
-      if (!item || typeof item !== "object") {
-        return item;
-      }
-
-      let itemDidChange = false;
-      let sanitizedItem = annotateImageGenerationHistoryItem(item, threadId);
-      if (sanitizedItem !== item) {
-        itemDidChange = true;
-      }
-
-      if (Array.isArray(item.content)) {
-        const sanitizedContent = item.content.map((contentItem) => {
-          const sanitizedEntry = sanitizeInlineHistoryImageContentItem(contentItem);
-          if (sanitizedEntry !== contentItem) {
-            itemDidChange = true;
-          }
-          return sanitizedEntry;
-        });
-
-        if (itemDidChange) {
-          sanitizedItem = {
-            ...sanitizedItem,
-            content: sanitizedContent,
-          };
-        }
-      }
-
-      const sanitizedCompactionItem = sanitizeCompactionHistoryItem(sanitizedItem);
-      if (sanitizedCompactionItem !== sanitizedItem) {
-        sanitizedItem = sanitizedCompactionItem;
-        itemDidChange = true;
-      }
-
-      if (itemDidChange) {
-        turnDidChange = true;
-      }
-
-      return itemDidChange ? sanitizedItem : item;
-    });
-
-    if (!turnDidChange) {
-      return turn;
-    }
-
-    didSanitize = true;
-    return {
-      ...turn,
-      items: sanitizedItems,
-    };
-  });
+  const threadId = normalizeNonEmptyString(thread.id)
+    || normalizeNonEmptyString(thread.threadId)
+    || normalizeNonEmptyString(thread.thread_id);
+  const { turns: sanitizedTurns, didSanitize } = sanitizeRelayHistoryTurns(thread.turns, threadId);
 
   if (!didSanitize) {
     const trimmedPayload = trimThreadPayloadForRelay(parsed, thread);
@@ -1450,6 +1680,108 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod) {
   });
 
   return trimThreadPayloadForRelay(parseBridgeJSON(sanitizedPayload), null) ?? sanitizedPayload;
+}
+
+function sanitizeThreadTurnsListForRelay(rawMessage) {
+  const parsed = parseBridgeJSON(rawMessage);
+  const result = parsed?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return rawMessage;
+  }
+
+  const turnsKey = ["data", "items", "turns"].find((key) => Array.isArray(result[key]));
+  if (!turnsKey) {
+    return rawMessage;
+  }
+
+  const threadId = normalizeNonEmptyString(result.threadId)
+    || normalizeNonEmptyString(result.thread_id)
+    || normalizeNonEmptyString(result.thread?.id)
+    || normalizeNonEmptyString(result.thread?.threadId)
+    || normalizeNonEmptyString(result.thread?.thread_id);
+  const { turns: sanitizedTurns, didSanitize } = sanitizeRelayHistoryTurns(result[turnsKey], threadId);
+  const sanitizedParsed = didSanitize
+    ? {
+      ...parsed,
+      result: {
+        ...result,
+        [turnsKey]: sanitizedTurns,
+      },
+    }
+    : parsed;
+
+  return trimTurnsListPayloadForRelay(sanitizedParsed, turnsKey, didSanitize ? null : rawMessage);
+}
+
+function sanitizeRelayHistoryTurns(turns, threadId = "") {
+  let didSanitize = false;
+  const sanitizedTurns = turns.map((turn) => {
+    const sanitizedTurn = sanitizeRelayHistoryTurn(turn, threadId);
+    if (sanitizedTurn !== turn) {
+      didSanitize = true;
+    }
+    return sanitizedTurn;
+  });
+
+  return { turns: sanitizedTurns, didSanitize };
+}
+
+function sanitizeRelayHistoryTurn(turn, threadId = "") {
+  if (!turn || typeof turn !== "object" || !Array.isArray(turn.items)) {
+    return turn;
+  }
+
+  let turnDidChange = false;
+  const turnThreadId = normalizeNonEmptyString(threadId)
+    || normalizeNonEmptyString(turn.threadId)
+    || normalizeNonEmptyString(turn.thread_id);
+  const sanitizedItems = turn.items.map((item) => {
+    if (!item || typeof item !== "object") {
+      return item;
+    }
+
+    let itemDidChange = false;
+    let sanitizedItem = annotateImageGenerationHistoryItem(item, turnThreadId);
+    if (sanitizedItem !== item) {
+      itemDidChange = true;
+    }
+
+    if (Array.isArray(sanitizedItem.content)) {
+      const sanitizedContent = sanitizedItem.content.map((contentItem) => {
+        const sanitizedEntry = sanitizeInlineHistoryImageContentItem(contentItem);
+        if (sanitizedEntry !== contentItem) {
+          itemDidChange = true;
+        }
+        return sanitizedEntry;
+      });
+
+      if (itemDidChange) {
+        sanitizedItem = {
+          ...sanitizedItem,
+          content: sanitizedContent,
+        };
+      }
+    }
+
+    const sanitizedCompactionItem = sanitizeCompactionHistoryItem(sanitizedItem);
+    if (sanitizedCompactionItem !== sanitizedItem) {
+      sanitizedItem = sanitizedCompactionItem;
+      itemDidChange = true;
+    }
+
+    if (itemDidChange) {
+      turnDidChange = true;
+    }
+
+    return itemDidChange ? sanitizedItem : item;
+  });
+
+  return turnDidChange
+    ? {
+      ...turn,
+      items: sanitizedItems,
+    }
+    : turn;
 }
 
 // Annotates live image-generation notifications so the phone can render a local-file
@@ -1854,6 +2186,55 @@ function trimThreadPayloadForRelay(parsed, explicitThread = undefined) {
   return encodeRelayThreadPayload(parsed, candidateThread);
 }
 
+function trimTurnsListPayloadForRelay(parsed, turnsKey, originalRawMessage = null) {
+  const result = parsed?.result;
+  const turns = result?.[turnsKey];
+  if (!parsed || !result || !Array.isArray(turns)) {
+    return originalRawMessage ?? JSON.stringify(parsed);
+  }
+
+  const encoded = JSON.stringify(parsed);
+  if (Buffer.byteLength(encoded, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+    return originalRawMessage ?? encoded;
+  }
+
+  let fallbackCompactedPayload = null;
+  for (const maxChars of [
+    RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS,
+    Math.floor(RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS / 4),
+    1_000,
+    0,
+  ]) {
+    const compactedTurns = turns.map((turn) => compactTurnsListTurnForRelay(turn, maxChars));
+    const compactedPayload = JSON.stringify({
+      ...parsed,
+      result: {
+        ...result,
+        [turnsKey]: compactedTurns,
+        remodexPageCompactedForRelay: true,
+      },
+    });
+    fallbackCompactedPayload = compactedPayload;
+    if (Buffer.byteLength(compactedPayload, "utf8") <= RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+      return compactedPayload;
+    }
+  }
+
+  return fallbackCompactedPayload ?? (originalRawMessage ?? encoded);
+}
+
+function compactTurnsListTurnForRelay(turn, maxChars) {
+  if (!turn || typeof turn !== "object" || !Array.isArray(turn.items)) {
+    return turn;
+  }
+
+  return {
+    ...turn,
+    items: turn.items.map((item) => compactHistoryItemForRelay(item, maxChars)),
+    remodexPageCompactedForRelay: true,
+  };
+}
+
 function buildRelayHistoryCompactedThread(thread, turns, omittedTurnCount, keptTurnCount) {
   return {
     ...thread,
@@ -1981,7 +2362,7 @@ function compactHistoryItemForRelay(item, maxChars) {
     itemId: typeof item?.itemId === "string" ? item.itemId : undefined,
     relayPayloadTruncated: true,
   };
-  const tailText = firstRelayTextTail(item, maxChars);
+  const tailText = maxChars > 0 ? firstRelayTextTail(item, maxChars) : "";
   if (tailText) {
     compactItem.text = tailText;
   }
@@ -2083,6 +2464,7 @@ function persistBridgePreferences(
 module.exports = {
   buildHeartbeatBridgeStatus,
   createMacOSBridgeWakeAssertion,
+  fetchAdaptiveThreadTurnsListForRelay,
   hasRelayConnectionGoneStale,
   persistBridgePreferences,
   sanitizeLiveGeneratedImageMessageForRelay,

@@ -1,5 +1,5 @@
 // FILE: TurnGitDraftFlowTests.swift
-// Purpose: Verifies git draft generation is used before commit and PR URLs include GitHub prefill params.
+// Purpose: Verifies git draft generation and inline Git progress state stay in sync with bridge actions.
 // Layer: Unit Test
 // Exports: TurnGitDraftFlowTests
 // Depends on: XCTest, CodexMobile
@@ -103,8 +103,9 @@ final class TurnGitDraftFlowTests: XCTestCase {
         let commitExpectation = expectation(description: "Commit flow completes")
         service.requestTransportOverride = { method, params in
             recordedMethods.append(method)
-            if method == "git/commit" {
-                committedMessage = params?.objectValue?["message"]?.stringValue
+            if method == "git/runStackedAction" {
+                committedMessage = params?.objectValue?["commitMessage"]?.stringValue
+                XCTAssertEqual(params?.objectValue?["action"]?.stringValue, "commit")
                 commitExpectation.fulfill()
             }
 
@@ -119,30 +120,31 @@ final class TurnGitDraftFlowTests: XCTestCase {
                     ]),
                     includeJSONRPC: false
                 )
-            case "git/commit":
+            case "git/runStackedAction":
                 return RPCMessage(
                     id: .string(UUID().uuidString),
                     result: .object([
-                        "hash": .string("abc123"),
-                        "branch": .string("remodex/topic"),
-                        "summary": .string("1 file changed"),
-                    ]),
-                    includeJSONRPC: false
-                )
-            case "git/status":
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object([
-                        "branch": .string("remodex/topic"),
-                        "tracking": .string("origin/remodex/topic"),
-                        "dirty": .bool(false),
-                        "ahead": .integer(0),
-                        "behind": .integer(0),
-                        "localOnlyCommitCount": .integer(0),
-                        "state": .string("up_to_date"),
-                        "canPush": .bool(false),
-                        "publishedToRemote": .bool(true),
-                        "files": .array([]),
+                        "action": .string("commit"),
+                        "commit": .object([
+                            "status": .string("created"),
+                            "hash": .string("abc123"),
+                            "branch": .string("remodex/topic"),
+                            "summary": .string("1 file changed"),
+                        ]),
+                        "push": .object(["status": .string("skipped_not_requested")]),
+                        "pr": .object(["status": .string("skipped_not_requested")]),
+                        "status": .object([
+                            "branch": .string("remodex/topic"),
+                            "tracking": .string("origin/remodex/topic"),
+                            "dirty": .bool(false),
+                            "ahead": .integer(0),
+                            "behind": .integer(0),
+                            "localOnlyCommitCount": .integer(0),
+                            "state": .string("up_to_date"),
+                            "canPush": .bool(false),
+                            "publishedToRemote": .bool(true),
+                            "files": .array([]),
+                        ]),
                     ]),
                     includeJSONRPC: false
                 )
@@ -163,30 +165,76 @@ final class TurnGitDraftFlowTests: XCTestCase {
 
         await fulfillment(of: [commitExpectation], timeout: 2.0)
 
-        XCTAssertEqual(Array(recordedMethods.prefix(2)), ["git/generateCommitMessage", "git/commit"])
+        XCTAssertEqual(Array(recordedMethods.prefix(2)), ["git/generateCommitMessage", "git/runStackedAction"])
         XCTAssertEqual(
             committedMessage,
             "Update git flow\n\n- Draft a commit message before committing\n- Refresh status after the commit"
         )
     }
 
-    func testPullRequestURLIncludesGitHubPrefillQueryParameters() throws {
-        let urlString = remodexBuildPullRequestURL(
-            ownerRepo: "openai/remodex",
-            branch: "feature/topic",
-            base: "main",
-            title: "Improve local git drafts",
-            body: "## Summary\n- Add PR drafting\n\n## Testing\n- Not run\n\n## Notes\n- Uses quick pull"
+    func testToolbarPushClearsInlineCommitAndPushPhaseAfterCompletion() async throws {
+        let service = makeService()
+        let viewModel = TurnViewModel()
+        let pushExpectation = expectation(description: "Push flow completes")
+
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "git/status":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(Self.repoStatus(ahead: 1, canPush: true)),
+                    includeJSONRPC: false
+                )
+            case "git/runStackedAction":
+                XCTAssertEqual(params?.objectValue?["action"]?.stringValue, "push")
+                guard let progressId = params?.objectValue?["progressId"]?.stringValue else {
+                    XCTFail("Expected stacked action progress id")
+                    return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+                }
+
+                service.handleGitStackedActionProgress([
+                    "progressId": .string(progressId),
+                    "phase": .string("push"),
+                    "status": .string("started"),
+                ])
+                XCTAssertEqual(viewModel.inlineCommitAndPushPhase, .pushing)
+                pushExpectation.fulfill()
+
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "action": .string("push"),
+                        "push": .object([
+                            "state": .string("pushed"),
+                            "branch": .string("remodex/topic"),
+                            "remote": .string("origin"),
+                            "status": .object(Self.repoStatus(ahead: 0, canPush: false)),
+                        ]),
+                        "pr": .object(["status": .string("skipped_not_requested")]),
+                        "status": .object(Self.repoStatus(ahead: 0, canPush: false)),
+                    ]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method: \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        viewModel.triggerGitAction(
+            .push,
+            codex: service,
+            workingDirectory: "/tmp/project",
+            threadID: "thread-1",
+            activeTurnID: nil
         )
 
-        let components = try XCTUnwrap(URLComponents(string: urlString), "URL should be parseable")
+        await fulfillment(of: [pushExpectation], timeout: 2.0)
+        await waitForGitActionToFinish(viewModel)
 
-        XCTAssertEqual(components.queryItems?.first(where: { $0.name == "quick_pull" })?.value, "1")
-        XCTAssertEqual(components.queryItems?.first(where: { $0.name == "title" })?.value, "Improve local git drafts")
-        XCTAssertEqual(
-            components.queryItems?.first(where: { $0.name == "body" })?.value,
-            "## Summary\n- Add PR drafting\n\n## Testing\n- Not run\n\n## Notes\n- Uses quick pull"
-        )
+        XCTAssertFalse(viewModel.isRunningGitAction)
+        XCTAssertNil(viewModel.gitActionProgress)
+        XCTAssertNil(viewModel.inlineCommitAndPushPhase)
     }
 
     private func makeService() -> CodexService {
@@ -210,5 +258,31 @@ final class TurnGitDraftFlowTests: XCTestCase {
             ],
             defaultReasoningEffort: "medium"
         )
+    }
+
+    private func waitForGitActionToFinish(_ viewModel: TurnViewModel) async {
+        for _ in 0..<100 {
+            if !viewModel.isRunningGitAction {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private static func repoStatus(ahead: Int, canPush: Bool) -> [String: JSONValue] {
+        [
+            "isRepo": .bool(true),
+            "branch": .string("remodex/topic"),
+            "tracking": .string("origin/remodex/topic"),
+            "dirty": .bool(false),
+            "hasPushRemote": .bool(true),
+            "ahead": .integer(ahead),
+            "behind": .integer(0),
+            "localOnlyCommitCount": .integer(0),
+            "state": .string(ahead > 0 ? "ahead_only" : "up_to_date"),
+            "canPush": .bool(canPush),
+            "publishedToRemote": .bool(true),
+            "files": .array([]),
+        ]
     }
 }

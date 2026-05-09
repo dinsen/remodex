@@ -76,7 +76,7 @@ struct SlashCommandAutocompletePanel: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(item.commandToken)
                                         .font(AppFont.subheadline(weight: .semibold))
-                                        .foregroundStyle(isEnabled ? Color.teal : .secondary)
+                                        .foregroundStyle(commandPrimaryStyle(isEnabled: isEnabled))
                                         .lineLimit(1)
 
                                     Text(commandSubtitle(for: item))
@@ -237,15 +237,19 @@ struct SlashCommandAutocompletePanel: View {
                 .renderingMode(.template)
                 .resizable()
                 .scaledToFit()
-                .foregroundStyle(isEnabled ? .primary : .secondary)
+                .foregroundStyle(commandPrimaryStyle(isEnabled: isEnabled))
                 .frame(width: 16, height: 16)
                 .frame(width: 22)
         } else {
             Image(systemName: command.symbolName)
                 .font(AppFont.system(size: 15, weight: .semibold))
-                .foregroundStyle(isEnabled ? .primary : .secondary)
+                .foregroundStyle(commandPrimaryStyle(isEnabled: isEnabled))
                 .frame(width: 22)
         }
+    }
+
+    private func commandPrimaryStyle(isEnabled: Bool) -> Color {
+        isEnabled ? .primary : .secondary
     }
 
     @ViewBuilder
@@ -299,6 +303,8 @@ struct SlashCommandAutocompletePanel: View {
         switch command {
         case .codeReview:
             return !hasComposerContentConflictingWithReview
+        case .compact:
+            return !isThreadRunning
         case .feedback:
             return true
         case .fork:
@@ -311,7 +317,7 @@ struct SlashCommandAutocompletePanel: View {
     }
 
     private func commandSubtitle(for command: TurnComposerSlashCommand) -> String {
-        if command == .fork, isThreadRunning {
+        if (command == .compact || command == .fork), isThreadRunning {
             return "Wait for the current response to finish first"
         }
 

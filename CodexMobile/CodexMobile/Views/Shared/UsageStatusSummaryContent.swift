@@ -116,22 +116,20 @@ struct UsageStatusSummaryContent: View {
     }
 
     private var contextSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let displayUsage = contextWindowUsage ?? .zero
+
+        return VStack(alignment: .leading, spacing: 12) {
             Text("Context window")
                 .font(AppFont.subheadline(weight: .semibold))
 
-            if let contextWindowUsage {
-                metricRow(
-                    label: "Context",
-                    value: "\(contextWindowUsage.percentRemaining)% left",
-                    detail: "(\(compactTokenCount(contextWindowUsage.tokensUsed)) used / \(compactTokenCount(contextWindowUsage.tokenLimit)))",
-                    monospace: true
-                )
+            metricRow(
+                label: "Context",
+                value: contextValue(for: displayUsage),
+                detail: contextDetail(for: displayUsage),
+                monospace: true
+            )
 
-                progressBar(progress: contextWindowUsage.fractionUsed)
-            } else {
-                metricRow(label: "Context", value: "Unavailable", detail: "Waiting for token usage")
-            }
+            progressBar(progress: displayUsage.fractionUsed)
         }
     }
 
@@ -247,6 +245,15 @@ struct UsageStatusSummaryContent: View {
         default:
             return groupedTokenCount(count)
         }
+    }
+
+    private func contextValue(for usage: ContextWindowUsage) -> String {
+        usage.tokenLimit > 0 ? "\(usage.percentRemaining)% left" : "0 used"
+    }
+
+    private func contextDetail(for usage: ContextWindowUsage) -> String? {
+        guard usage.tokenLimit > 0 else { return nil }
+        return "(\(compactTokenCount(usage.tokensUsed)) used / \(compactTokenCount(usage.tokenLimit)))"
     }
 
     private func groupedTokenCount(_ count: Int) -> String {

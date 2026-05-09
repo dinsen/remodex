@@ -52,9 +52,6 @@ struct TurnComposerSecondaryBar: View {
                 HStack(spacing: 8) {
                     runtimePicker
 
-                    accessMenuLabel
-                    Spacer()
-
                     if showsGitBranchSelector {
                         TurnGitBranchSelector(
                             isEnabled: isGitBranchSelectorEnabled,
@@ -71,8 +68,12 @@ struct TurnComposerSecondaryBar: View {
                             onSelectGitBaseBranch: onSelectGitBaseBranch,
                             onRefreshGitBranches: onRefreshGitBranches
                         )
+                        .equatable()
                     }
 
+                    Spacer()
+
+                    accessMenuLabel
                     statusControlCircle
                 }
 

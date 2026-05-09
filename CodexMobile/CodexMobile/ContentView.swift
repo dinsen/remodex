@@ -73,7 +73,7 @@ struct ContentView: View {
     private let sidebarGestureLogBucketWidth: CGFloat = 40
     private let sidebarSwipeCommitDistance: CGFloat = 30
     private let sidebarSelectionSuppressionDuration: TimeInterval = 0.35
-    private let whatsNewReleaseVersion = "1.1"
+    private let whatsNewReleaseVersion = "1.5"
     private static let sidebarSpring = Animation.spring(response: 0.35, dampingFraction: 0.85)
     private static var isSidebarDebugLoggingEnabled: Bool { false }
 
@@ -285,9 +285,10 @@ struct ContentView: View {
     @ViewBuilder
     private var rootContent: some View {
         if !hasSeenOnboarding {
-            OnboardingView {
-                finishOnboardingAndShowScanner()
-            }
+            OnboardingView(
+                onScanQRCode: finishOnboardingAndShowScanner,
+                onPairWithCode: finishOnboardingAndShowPairingCode
+            )
         } else if subscriptions.bootstrapState == .failed && !subscriptions.hasAppAccess {
             SubscriptionBootstrapFailureView()
         } else if !subscriptions.hasAppAccess {
@@ -309,6 +310,14 @@ struct ContentView: View {
             hasDismissedAutomaticScanner = false
             scannerCanReturnToOnboarding = true
         }
+    }
+
+    // Opens code entry over the last onboarding page; a valid code completes onboarding after resolution.
+    private func finishOnboardingAndShowPairingCode() {
+        codex.shouldAutoReconnectOnForeground = false
+        codex.connectionRecoveryState = .idle
+        codex.lastErrorMessage = nil
+        presentManualPairingEntryAfterStoppingReconnect()
     }
 
     // Lets the scanner step back into onboarding on first run, or into the empty state later on.
@@ -381,6 +390,14 @@ struct ContentView: View {
                 ZStack(alignment: .leading) {
                     mainNavigationLayer
                         .frame(width: proxy.size.width, alignment: .leading)
+
+                    PetCompanionStatusSyncView()
+
+                    PetCompanionOverlay(
+                        isInteractionEnabled: !sidebarVisible,
+                        bottomExclusionHeight: 16
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height)
 
                     if sidebarVisible {
                         (colorScheme == .dark ? Color.white : Color.black)
@@ -779,7 +796,7 @@ struct ContentView: View {
                     codex.activeThreadId = restoredThread.id
                 }
             } catch {
-                codex.lastErrorMessage = error.localizedDescription
+                codex.lastErrorMessage = codex.userFacingTurnErrorMessageForFooter(from: error)
             }
 
             codex.requestImmediateActiveThreadSync(threadId: thread.id)
@@ -1365,6 +1382,12 @@ struct ContentView: View {
                 let pairingPayload = try await codex.resolvePairingCode(pendingCode)
                 isShowingManualPairingEntry = false
                 manualPairingCode = ""
+                withAnimation {
+                    hasSeenOnboarding = true
+                    isShowingManualScanner = false
+                    hasDismissedAutomaticScanner = true
+                    scannerCanReturnToOnboarding = false
+                }
                 await viewModel.connectToRelay(
                     pairingPayload: pairingPayload,
                     codex: codex

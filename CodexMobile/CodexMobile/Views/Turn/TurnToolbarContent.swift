@@ -27,6 +27,7 @@ struct TurnToolbarContent: ToolbarContent {
     let isGitActionEnabled: Bool
     let disabledGitActions: Set<TurnGitActionKind>
     let isRunningGitAction: Bool
+    let gitActionLoadingTitle: String?
     let showsDiscardRuntimeChangesAndSync: Bool
     let gitSyncState: String?
     var onTapMacHandoff: (() -> Void)?
@@ -137,6 +138,7 @@ struct TurnToolbarContent: ToolbarContent {
                         isEnabled: isGitActionEnabled,
                         disabledActions: disabledGitActions,
                         isRunningAction: isRunningGitAction,
+                        loadingTitle: gitActionLoadingTitle,
                         showsDiscardRuntimeChangesAndSync: showsDiscardRuntimeChangesAndSync,
                         gitSyncState: gitSyncState,
                         onSelect: onGitAction
@@ -323,6 +325,7 @@ struct TurnThreadPathSheet: View {
                                             .renderingMode(.template)
                                             .resizable()
                                             .scaledToFit()
+                                            .scaleEffect(x: -1, y: 1)
                                     }
                                 }
                                 .frame(width: 16, height: 16)

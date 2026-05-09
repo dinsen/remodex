@@ -156,6 +156,7 @@ extension CodexService {
         }
 
         do {
+            // Poll recent metadata only; full sidebar hydration happens in listThreads().
             let activeThreads = try await fetchServerThreads(limit: recentActiveThreadListLimit)
 
             // Also fetch server-archived threads so they survive app restarts.
@@ -853,6 +854,13 @@ extension CodexService {
         var didRunMirroredCatchup = false
         let shouldPreferDeferredClosedHydration = shouldDeferHeavyDisplayHydration(threadId: threadId)
             || threadsNeedingCanonicalHistoryReconcile.contains(threadId)
+
+        if !wasRunning,
+           hydratedThreadIDs.contains(threadId),
+           hasSatisfiedInitialThreadHistoryLoad(threadId: threadId),
+           !threadsNeedingCanonicalHistoryReconcile.contains(threadId) {
+            return
+        }
 
         // Long closed chats already have usable local rows. Avoid forcing a full thread/read
         // every sync tick after selection, which can reproduce the same open-chat crash.

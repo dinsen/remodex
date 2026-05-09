@@ -15,6 +15,8 @@ extension CodexService {
     private static let permanentRelayCloseCodeRawValues: Set<UInt16> = [4000, 4001, 4003]
     private static let explicitRelayDropCloseCodeRawValues: Set<UInt16> = [4004]
     private static let maxTrustedReconnectFailures = 3
+    private static let connectionBootstrapRequestTimeoutNanoseconds: UInt64 = 12_000_000_000
+    private static let planModeProbeTimeoutNanoseconds: UInt64 = 5_000_000_000
     private static let trustedReconnectRecoveryMessage =
         "Secure reconnect could not be restored from the saved session. Try reconnecting again."
 
@@ -94,10 +96,10 @@ extension CodexService {
             try await performSecureHandshake()
 
             isConnected = true
-            shouldAutoReconnectOnForeground = false
-            connectionRecoveryState = .idle
             lastErrorMessage = nil
             try await initializeSession()
+            shouldAutoReconnectOnForeground = false
+            connectionRecoveryState = .idle
             trustedReconnectFailureCount = 0
             if secureSession != nil {
                 secureConnectionState = .encrypted
@@ -159,6 +161,7 @@ extension CodexService {
         hasPresentedServiceTierBridgeUpdatePrompt = false
         supportsBridgeVoiceAuth = true
         supportsThreadFork = true
+        supportsTurnPagination = true
         hasPresentedThreadForkBridgeUpdatePrompt = false
         hasPresentedMinimumBridgePackageUpdatePrompt = false
         lastPresentedAvailableBridgePackageVersion = nil
@@ -210,12 +213,12 @@ extension CodexService {
             )
         } catch {
             if showFailureInUI {
-                lastErrorMessage = error.localizedDescription
+                lastErrorMessage = userFacingTurnErrorMessageForFooter(from: error)
             }
         }
     }
 
-    // Clears the remembered relay pairing when the remote Mac session is gone for good.
+    // Clears all remembered relay metadata when the pairing itself is no longer trustworthy.
     func clearSavedRelaySession() {
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
         SecureStore.deleteValue(for: CodexSecureKeys.relayUrl)
@@ -238,6 +241,26 @@ extension CodexService {
             secureConnectionState = .notPaired
             secureMacFingerprint = nil
         }
+        pendingNotificationOpenThreadID = nil
+        lastPushRegistrationSignature = nil
+        clearTransientConnectionPrompts()
+    }
+
+    // Drops only the per-launch relay session after repeated trusted reconnect failures.
+    func clearStaleSavedRelaySessionForTrustedReconnect() {
+        guard let trustedMac = preferredTrustedMacRecord else {
+            clearSavedRelaySession()
+            return
+        }
+
+        SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
+        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        relaySessionId = nil
+        lastAppliedBridgeOutboundSeq = 0
+        shouldForceQRBootstrapOnNextHandshake = false
+        trustedReconnectFailureCount = 0
+        secureConnectionState = .liveSessionUnresolved
+        secureMacFingerprint = codexSecureFingerprint(for: trustedMac.macIdentityPublicKey)
         pendingNotificationOpenThreadID = nil
         lastPushRegistrationSignature = nil
         clearTransientConnectionPrompts()
@@ -305,7 +328,13 @@ extension CodexService {
         ])
 
         do {
-            _ = try await sendRequest(method: "initialize", params: modernParams)
+            let initializeResponse = try await sendRequest(
+                method: "initialize",
+                params: modernParams,
+                timeoutNanoseconds: Self.connectionBootstrapRequestTimeoutNanoseconds,
+                timeoutMessage: "Connection timed out while reconnecting. Try again."
+            )
+            learnTurnPaginationSupportFromInitializeResponse(initializeResponse)
             // A successful modern initialize means the runtime accepted the experimental
             // capability negotiation. Keep plan-mode sends enabled unless the runtime
             // explicitly rejects `collaborationMode` on a turn request later.
@@ -332,7 +361,13 @@ extension CodexService {
                 "clientInfo": clientInfo,
             ])
             do {
-                _ = try await sendRequest(method: "initialize", params: legacyParams)
+                let initializeResponse = try await sendRequest(
+                    method: "initialize",
+                    params: legacyParams,
+                    timeoutNanoseconds: Self.connectionBootstrapRequestTimeoutNanoseconds,
+                    timeoutMessage: "Connection timed out while reconnecting. Try again."
+                )
+                learnTurnPaginationSupportFromInitializeResponse(initializeResponse)
             } catch {
                 if let incompatibleAppVersionError = incompatibleBridgeAppVersionError(from: error) {
                     throw incompatibleAppVersionError
@@ -468,8 +503,9 @@ extension CodexService {
 
     // Runs the post-connect sync work that is useful but not required to mark the socket usable.
     func performPostConnectSyncPass(preferredThreadId: String? = nil) async {
-        try? await listModels()
+        // Thread metadata drives the visible app shell, so do it before slower runtime option sync.
         try? await listThreads()
+        try? await listModels()
         if await routePendingNotificationOpenIfPossible(refreshIfNeeded: false) {
             return
         }
@@ -526,6 +562,7 @@ extension CodexService {
         hasPresentedServiceTierBridgeUpdatePrompt = false
         supportsBridgeVoiceAuth = true
         supportsThreadFork = true
+        supportsTurnPagination = true
         hasPresentedThreadForkBridgeUpdatePrompt = false
         hasPresentedMinimumBridgePackageUpdatePrompt = false
         lastPresentedAvailableBridgePackageVersion = nil
@@ -636,13 +673,14 @@ extension CodexService {
         return true
     }
 
-    // Drops only the stale saved relay session after repeated secure reconnect failures.
-    // This preserves the trusted Mac record, but stops looping on a dead session id forever.
+    // Preserves trusted Mac identity while removing only the stale per-launch relay session.
     func recoverTrustedReconnectCandidate() {
         if hasSavedRelaySession {
-            clearSavedRelaySession()
-        } else {
+            clearStaleSavedRelaySessionForTrustedReconnect()
+        } else if preferredTrustedMacRecord != nil {
             secureConnectionState = .liveSessionUnresolved
+        } else {
+            clearSavedRelaySession()
         }
         lastErrorMessage = Self.trustedReconnectRecoveryMessage
     }
@@ -654,8 +692,8 @@ extension CodexService {
     ) -> ReceiveErrorDisposition {
         let shouldClearSavedRelaySession = shouldClearSavedRelaySession(for: relayCloseCode)
         let retryableSessionUnavailableMessage = retryableSessionUnavailableMessage(for: relayCloseCode)
-        // Only relay closes that preserve the saved session should stay on the
-        // auto-reconnect path; dead sessions must fall back to QR recovery.
+        // Only relay closes that preserve the saved session should stay on this socket path;
+        // stale live sessions recover through trusted resolve instead of immediate QR.
         let permanentRelayMessage = shouldClearSavedRelaySession
             ? (permanentRelayDisconnectMessage(for: relayCloseCode)
                 ?? "This relay pairing is no longer valid. Scan a new QR code to reconnect.")
@@ -725,7 +763,9 @@ extension CodexService {
         do {
             let response = try await sendRequest(
                 method: "collaborationMode/list",
-                params: .object([:])
+                params: .object([:]),
+                timeoutNanoseconds: Self.planModeProbeTimeoutNanoseconds,
+                timeoutMessage: "collaborationMode/list timed out while checking runtime capabilities."
             )
             return responseContainsPlanCollaborationMode(response)
         } catch {

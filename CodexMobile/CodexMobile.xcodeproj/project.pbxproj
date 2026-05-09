@@ -43,6 +43,8 @@
 		C04E214B2F71D34100AA3193 /* RevenueCat in Frameworks */ = {isa = PBXBuildFile; productRef = C04E214A2F71D34100AA3193 /* RevenueCat */; };
 		C04E214D2F71D4DB00AA3193 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C04E214C2F71D4DB00AA3193 /* StoreKit.framework */; };
 		C0DED3362F5E39DC0021A8E8 /* Textual in Frameworks */ = {isa = PBXBuildFile; productRef = C0DED3352F5E39DC0021A8E8 /* Textual */; };
+		C0F0D1FF2F7210A700A17B41 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = C0F0D1FE2F7210A700A17B41 /* MarkdownView */; };
+		D0C0FFEE0000000000000001 /* TextualMarkdownRenderingRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C0FFEE0000000000000002 /* TextualMarkdownRenderingRegressionTests.swift */; };
 		D27B9CA5F0B60ECA8AF38016 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9A37794F4B32C1952A3770E0 /* Foundation.framework */; };
 		D4F56781234567890ABCDE01 /* CodexServiceIncomingRunIndicatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4F56781234567890ABCDE02 /* CodexServiceIncomingRunIndicatorTests.swift */; };
 		DAAD0C0C717F9415C3E9D21A /* RemodexMenuBarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0B9CCCCC45E47616AB452FA /* RemodexMenuBarApp.swift */; };
@@ -107,6 +109,7 @@
 		C0B9CCCCC45E47616AB452FA /* RemodexMenuBarApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemodexMenuBarApp.swift; sourceTree = "<group>"; };
 		C1D2E3F40516273849A5B6C7 /* CodexServiceIncomingCommandExecutionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CodexServiceIncomingCommandExecutionTests.swift; sourceTree = "<group>"; };
 		C9CD1EA13B728103A5654EEA /* BridgeControlModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BridgeControlModels.swift; sourceTree = "<group>"; };
+		D0C0FFEE0000000000000002 /* TextualMarkdownRenderingRegressionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TextualMarkdownRenderingRegressionTests.swift; sourceTree = "<group>"; };
 		D4F56781234567890ABCDE02 /* CodexServiceIncomingRunIndicatorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CodexServiceIncomingRunIndicatorTests.swift; sourceTree = "<group>"; };
 		D523A0A98D6540D0E2EE6131 /* CodexMobileUITests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CodexMobileUITests.swift; sourceTree = "<group>"; };
 		E1A2B3C4D5E6F708192A3B4D /* QRScannerPairingValidatorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QRScannerPairingValidatorTests.swift; sourceTree = "<group>"; };
@@ -132,6 +135,7 @@
 				C04E214D2F71D4DB00AA3193 /* StoreKit.framework in Frameworks */,
 				C04E214B2F71D34100AA3193 /* RevenueCat in Frameworks */,
 				C0DED3362F5E39DC0021A8E8 /* Textual in Frameworks */,
+				C0F0D1FF2F7210A700A17B41 /* MarkdownView in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -185,6 +189,7 @@
 				8B4A2F5E7D1C4B9AA1234568 /* TurnComposerAttachmentIntakePlanTests.swift */,
 				74BE370810CFD7A76DC2A25F /* TurnComposerSendAvailabilityTests.swift */,
 				AB1C2D3E4F5061728394A5B6 /* TurnComposerReviewModeTests.swift */,
+				D0C0FFEE0000000000000002 /* TextualMarkdownRenderingRegressionTests.swift */,
 				9D7C9A8B7E6D5C4B3A291818 /* TurnViewModelQueueTests.swift */,
 				11A2B3C4D5E6F708192A3B4D /* TurnFileAutocompleteTokenTests.swift */,
 				B0C1D2E3F40516273849A5B6 /* TurnSlashCommandTokenTests.swift */,
@@ -397,6 +402,7 @@
 			packageReferences = (
 				C0DED3342F5E39DC0021A8E8 /* XCRemoteSwiftPackageReference "textual" */,
 				C04E21492F71D34100AA3193 /* XCRemoteSwiftPackageReference "purchases-ios-spm" */,
+				C0F0D1FD2F7210A700A17B41 /* XCRemoteSwiftPackageReference "MarkdownView" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C09A76AF2F4B8D7B003B3F3A /* Products */;
@@ -495,6 +501,7 @@
 				8B4A2F5E7D1C4B9AA1234567 /* TurnComposerAttachmentIntakePlanTests.swift in Sources */,
 				4C0F0D55A5051D8301463C69 /* TurnComposerSendAvailabilityTests.swift in Sources */,
 				AB1C2D3E4F5061728394A5B7 /* TurnComposerReviewModeTests.swift in Sources */,
+				D0C0FFEE0000000000000001 /* TextualMarkdownRenderingRegressionTests.swift in Sources */,
 				9D7C9A8B7E6D5C4B3A291817 /* TurnViewModelQueueTests.swift in Sources */,
 				11A2B3C4D5E6F708192A3B4C /* TurnFileAutocompleteTokenTests.swift in Sources */,
 				B0C1D2E3F40516273849A5B7 /* TurnSlashCommandTokenTests.swift in Sources */,
@@ -945,10 +952,18 @@
 		};
 		C0DED3342F5E39DC0021A8E8 /* XCRemoteSwiftPackageReference "textual" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/gonzalezreal/textual.git";
+			repositoryURL = "https://github.com/devnoname120/textual.git";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.3.1;
+				kind = revision;
+				revision = ac751f2fcfc96309d9330ee9a7356840f964e211;
+			};
+		};
+		C0F0D1FD2F7210A700A17B41 /* XCRemoteSwiftPackageReference "MarkdownView" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/HumanInterfaceDesign/MarkdownView";
+			requirement = {
+				kind = revision;
+				revision = cfb3074d53eed1da1dc2d4c18d51d50d5f975967;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -963,6 +978,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = C0DED3342F5E39DC0021A8E8 /* XCRemoteSwiftPackageReference "textual" */;
 			productName = Textual;
+		};
+		C0F0D1FE2F7210A700A17B41 /* MarkdownView */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0F0D1FD2F7210A700A17B41 /* XCRemoteSwiftPackageReference "MarkdownView" */;
+			productName = MarkdownView;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -22,6 +22,14 @@ struct TurnConversationContainerView: View {
     let currentWorkingDirectory: String?
     let errorMessage: String?
     let composerRecoveryAccessory: AnyView?
+    let onReportError: (String) -> Void
+    let onDismissError: () -> Void
+    let hasRemoteEarlierMessages: Bool
+    let hasLocallyProjectedEarlierMessages: Bool
+    let usesPaginatedHistory: Bool
+    let initialTurnsLoaded: Bool
+    let isLoadingRemoteEarlierMessages: Bool
+    let olderHistoryLoadErrorMessage: String?
     let shouldAnchorToAssistantResponse: Binding<Bool>
     let isScrolledToBottom: Binding<Bool>
     let isComposerFocused: Bool
@@ -35,6 +43,9 @@ struct TurnConversationContainerView: View {
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
     let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
+    let onRevealEarlierMessages: (Int) -> Void
+    let onLoadRemoteEarlierMessages: () -> Void
+    let onRetryEarlierMessages: (@escaping () -> Void) -> Void
     let onTapOutsideComposer: () -> Void
 
     @State private var isShowingPinnedPlanSheet = false
@@ -101,6 +112,14 @@ struct TurnConversationContainerView: View {
                 isRetryAvailable: !isThreadRunning,
                 errorMessage: errorMessage,
                 hidesErrorMessage: composerRecoveryAccessory != nil,
+                onReportError: onReportError,
+                onDismissError: onDismissError,
+                hasRemoteEarlierMessages: hasRemoteEarlierMessages,
+                hasLocallyProjectedEarlierMessages: hasLocallyProjectedEarlierMessages,
+                usesPaginatedHistory: usesPaginatedHistory,
+                initialTurnsLoaded: initialTurnsLoaded,
+                isLoadingRemoteEarlierMessages: isLoadingRemoteEarlierMessages,
+                olderHistoryLoadErrorMessage: olderHistoryLoadErrorMessage,
                 shouldAnchorToAssistantResponse: shouldAnchorToAssistantResponse,
                 isScrolledToBottom: isScrolledToBottom,
                 isComposerFocused: isComposerFocused,
@@ -108,6 +127,9 @@ struct TurnConversationContainerView: View {
                 onRetryUserMessage: onRetryUserMessage,
                 onTapAssistantRevert: onTapAssistantRevert,
                 onTapSubagent: onTapSubagent,
+                onRevealEarlierMessages: onRevealEarlierMessages,
+                onLoadRemoteEarlierMessages: onLoadRemoteEarlierMessages,
+                onRetryEarlierMessages: onRetryEarlierMessages,
                 onTapOutsideComposer: onTapOutsideComposer
             ) {
                 timelineEmptyState
@@ -151,8 +173,8 @@ struct TurnConversationContainerView: View {
                     isShowingPinnedPlanSheet = true
                 }
                 .padding(.horizontal, 12)
-                .padding(.top, 8)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .padding(.top, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             if let composerRecoveryAccessory {
@@ -310,13 +332,25 @@ extension CodexMessage {
     }
 
     var shouldDisplayInlinePlanResult: Bool {
-        guard isPlanSystemMessage,
-              resolvedPlanPresentation?.isInlineResultVisible == true,
-              !shouldDisplayPinnedPlanAccessory else {
+        guard isPlanSystemMessage, !shouldDisplayPinnedPlanAccessory else {
+            return false
+        }
+
+        if resolvedPlanPresentation == .resultCompletedItem {
+            return hasRenderablePlanResult
+        }
+
+        guard resolvedPlanPresentation?.isInlineResultVisible == true else {
             return false
         }
 
         return proposedPlan != nil
+    }
+
+    private var hasRenderablePlanResult: Bool {
+        let placeholders: Set<String> = ["Planning..."]
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return proposedPlan != nil || (!trimmedText.isEmpty && !placeholders.contains(trimmedText))
     }
 
     var shouldDisplayComposerStructuredPrompt: Bool {

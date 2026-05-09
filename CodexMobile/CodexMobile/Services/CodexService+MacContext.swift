@@ -81,6 +81,7 @@ extension CodexService {
                     partialResult[assistantMessageId] = changeSet.id
                 }
             }
+            rehydrateLegacyFallbackChangeSetsFromPersistedMessages()
 
             if includeLegacyFallback {
                 saveLocalState(for: normalizedMacDeviceId)
@@ -177,6 +178,30 @@ extension CodexService {
             }
             latestTurnTerminalStateByThread = [:]
 
+            if let savedThreadHistoryPaginationState = defaults.data(
+                forKey: macScopedDefaultsKey(Self.threadHistoryPaginationStateDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedThreadHistoryPaginationState = try? decoder.decode(
+                   [String: CodexThreadHistoryPaginationState].self,
+                   from: savedThreadHistoryPaginationState
+               ) {
+                olderThreadHistoryCursorByThreadID = decodedThreadHistoryPaginationState.compactMapValues(\.olderCursor)
+                exhaustedOlderThreadHistoryCursorByThreadID = decodedThreadHistoryPaginationState.compactMapValues(\.exhaustedOlderCursor)
+                threadsWithAuthoritativeLocalHistoryStart = Set(
+                    decodedThreadHistoryPaginationState.compactMap { threadId, state in
+                        state.hasAuthoritativeLocalHistoryStart ? threadId : nil
+                    }
+                )
+            } else {
+                olderThreadHistoryCursorByThreadID = [:]
+                exhaustedOlderThreadHistoryCursorByThreadID = [:]
+                threadsWithAuthoritativeLocalHistoryStart = []
+            }
+            loadingOlderThreadHistoryIDs = []
+            threadTimelineProjectionLimitByThreadID = [:]
+            initialTurnsLoadedByThreadID = []
+            olderHistoryLoadErrorByThreadID = [:]
+
             if let persistedGPTAccountSnapshot = loadPersistedGPTAccountSnapshot(macDeviceId: macDeviceId) {
                 gptAccountSnapshot = persistedGPTAccountSnapshot
             } else {
@@ -235,6 +260,13 @@ extension CodexService {
             currentOutput = ""
             latestTurnTerminalStateByThread.removeAll()
             terminalStateByTurnID.removeAll()
+            olderThreadHistoryCursorByThreadID.removeAll()
+            exhaustedOlderThreadHistoryCursorByThreadID.removeAll()
+            loadingOlderThreadHistoryIDs.removeAll()
+            threadTimelineProjectionLimitByThreadID.removeAll()
+            initialTurnsLoadedByThreadID.removeAll()
+            threadsWithAuthoritativeLocalHistoryStart.removeAll()
+            olderHistoryLoadErrorByThreadID.removeAll()
             threadRuntimeOverridesByThreadID.removeAll()
             planSessionSourceByThread.removeAll()
             forkedFromThreadIDByThreadID.removeAll()
@@ -260,6 +292,7 @@ extension CodexService {
         migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadSnapshotsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.associatedManagedWorktreePathsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.turnTerminalStatesDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.threadHistoryPaginationStateDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.gptAccountSnapshotDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginStateDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginCallbackDefaultsKey)

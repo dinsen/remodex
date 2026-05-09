@@ -293,6 +293,9 @@ extension CodexService {
         case "serverRequest/resolved":
             handleServerRequestResolved(paramsObject)
 
+        case "git/stackedAction/progress":
+            handleGitStackedActionProgress(paramsObject)
+
         default:
             if method.hasPrefix("codex/event/"),
                handleLegacyCodexNamedEvent(method: method, paramsObject: paramsObject) {
@@ -551,12 +554,16 @@ extension CodexService {
                 return
             }
 
-            lastErrorMessage = turnFailureMessage
-            appendSystemMessage(
-                threadId: threadId,
-                text: "Turn error: \(turnFailureMessage)",
-                turnId: completedTurnID
-            )
+            let userFacingFailureMessage = userFacingRuntimeMessage(for: turnFailureMessage)
+                ?? turnFailureMessage
+            lastErrorMessage = shouldSuppressRuntimeMessageInChat(turnFailureMessage) ? nil : userFacingFailureMessage
+            if !shouldSuppressRuntimeMessageInChat(turnFailureMessage) {
+                appendSystemMessage(
+                    threadId: threadId,
+                    text: "Turn error: \(userFacingFailureMessage)",
+                    turnId: completedTurnID
+                )
+            }
             return
         }
 
@@ -565,7 +572,9 @@ extension CodexService {
         guard let turnFailureMessage else {
             return
         }
-        lastErrorMessage = turnFailureMessage
+        lastErrorMessage = shouldSuppressRuntimeMessageInChat(turnFailureMessage)
+            ? nil
+            : (userFacingRuntimeMessage(for: turnFailureMessage) ?? turnFailureMessage)
     }
 
     private func handleErrorNotification(_ paramsObject: IncomingParamsObject?) {
@@ -584,12 +593,16 @@ extension CodexService {
             firstStringValue(in: eventErrorObject, keys: ["message"]),
             firstStringValue(in: nestedEventObject, keys: ["message"]),
         ]) ?? "Server error"
-        lastErrorMessage = errorMessage
+        let shouldSuppressErrorMessage = shouldSuppressRuntimeMessageInChat(errorMessage)
+        let userFacingErrorMessage = userFacingRuntimeMessage(for: errorMessage) ?? errorMessage
+        lastErrorMessage = shouldSuppressErrorMessage ? nil : userFacingErrorMessage
 
         let turnId = extractTurnID(from: paramsObject)
         if let threadId = resolveThreadID(from: paramsObject, turnIdHint: turnId) {
             let resolvedTurnID = turnId ?? activeTurnIdByThread[threadId]
-            appendSystemMessage(threadId: threadId, text: "Error: \(errorMessage)", turnId: turnId)
+            if !shouldSuppressErrorMessage {
+                appendSystemMessage(threadId: threadId, text: "Error: \(userFacingErrorMessage)", turnId: turnId)
+            }
             recordTurnTerminalState(threadId: threadId, turnId: resolvedTurnID, state: .failed)
             noteTurnFinished(turnId: resolvedTurnID)
             markTurnCompleted(threadId: threadId, turnId: resolvedTurnID)
@@ -1117,7 +1130,8 @@ extension CodexService {
         )
     }
 
-    // Consumes turn-level aggregated diff updates and renders them as file-change system messages.
+    // Consumes turn-level aggregated diffs only after a real file-change item exists;
+    // repo-wide dirty snapshots must not create turn-local change UI or undo state.
     private func handleTurnDiffUpdated(_ paramsObject: IncomingParamsObject?) {
         guard let paramsObject else { return }
 
@@ -1134,27 +1148,67 @@ extension CodexService {
         }
         if let turnId {
             threadIdByTurnID[turnId] = threadId
-            recordTurnDiffChangeSet(threadId: threadId, turnId: turnId, diff: diffText)
+            if shouldRecordTurnDiffChangeSet(threadId: threadId, turnId: turnId, diff: diffText) {
+                recordTurnDiffChangeSet(threadId: threadId, turnId: turnId, diff: diffText)
+            }
+        }
+    }
+
+    private func shouldRecordTurnDiffChangeSet(threadId: String, turnId: String, diff: String) -> Bool {
+        let diffPaths = normalizedPatchPaths(from: diff)
+        guard !diffPaths.isEmpty else {
+            return false
         }
 
-        let renderedBody = decodeTurnDiffUpdatedBody(from: diffText)
-        if let turnId, !turnId.isEmpty {
-            upsertStreamingSystemTurnMessage(
-                threadId: threadId,
-                turnId: turnId,
-                kind: .fileChange,
-                text: renderedBody,
-                isStreaming: false
-            )
-            return
+        let fileChangePaths = normalizedFileChangeEvidencePaths(threadId: threadId, turnId: turnId)
+        guard !fileChangePaths.isEmpty else {
+            return false
         }
 
-        appendSystemMessage(
-            threadId: threadId,
-            text: renderedBody,
-            turnId: turnId,
-            kind: .fileChange
-        )
+        return diffPaths.isSubset(of: fileChangePaths)
+    }
+
+    private func normalizedPatchPaths(from diff: String) -> Set<String> {
+        Set(AIUnifiedPatchParser.analyze(diff).fileChanges.compactMap {
+            normalizedTurnDiffPath($0.path)
+        })
+    }
+
+    private func normalizedFileChangeEvidencePaths(threadId: String, turnId: String) -> Set<String> {
+        let fileChangeMessages = messagesByThread[threadId] ?? []
+        return fileChangeMessages.reduce(into: Set<String>()) { paths, message in
+            guard message.role == .system,
+                  message.kind == .fileChange,
+                  message.turnId == turnId else {
+                return
+            }
+
+            for line in message.text.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmedLine.lowercased().hasPrefix("path:") else { continue }
+                let rawPath = String(trimmedLine.dropFirst("Path:".count))
+                if let normalizedPath = normalizedTurnDiffPath(rawPath) {
+                    paths.insert(normalizedPath)
+                }
+            }
+        }
+    }
+
+    private func normalizedTurnDiffPath(_ rawPath: String) -> String? {
+        var normalized = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty, normalized != "/dev/null" else {
+            return nil
+        }
+
+        if normalized.hasPrefix("a/") || normalized.hasPrefix("b/") {
+            normalized = String(normalized.dropFirst(2))
+        }
+        if normalized.hasPrefix("./") {
+            normalized = String(normalized.dropFirst(2))
+        }
+
+        normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized.lowercased()
     }
 
     // Supports legacy codex/event envelopes where `msg.type == "turn_diff"` and payload uses unified_diff.
@@ -2617,10 +2671,6 @@ extension CodexService {
         return ""
     }
 
-    private func decodeTurnDiffUpdatedBody(from diff: String) -> String {
-        renderUnifiedDiffBody(diff, status: "inProgress")
-    }
-
     private func renderUnifiedDiffBody(_ diff: String, status: String) -> String {
         let perFileDiffs = splitUnifiedDiffByFile(diff)
         guard !perFileDiffs.isEmpty else {
@@ -3155,6 +3205,29 @@ extension CodexService {
         let threadId = normalizedResolvedRequestThreadID(paramsObject?["threadId"]?.stringValue)
         removeStructuredUserInputPrompt(requestID: requestID, threadIdHint: threadId)
         removePendingApproval(requestID: requestID)
+    }
+
+    // Routes phase notifications from `git/runStackedAction` to the per-call subscriber.
+    func handleGitStackedActionProgress(_ paramsObject: IncomingParamsObject?) {
+        guard let progressId = paramsObject?["progressId"]?.stringValue,
+              let phaseRaw = paramsObject?["phase"]?.stringValue,
+              let phase = TurnGitActionPhase(bridgePhase: phaseRaw),
+              let statusRaw = paramsObject?["status"]?.stringValue,
+              let status = TurnGitActionPhaseStatus(rawValue: statusRaw) else {
+            return
+        }
+        gitStackedActionProgressHandlers[progressId]?(phase, status)
+    }
+
+    func registerGitStackedActionProgressHandler(
+        progressId: String,
+        handler: @escaping (TurnGitActionPhase, TurnGitActionPhaseStatus) -> Void
+    ) {
+        gitStackedActionProgressHandlers[progressId] = handler
+    }
+
+    func unregisterGitStackedActionProgressHandler(progressId: String) {
+        gitStackedActionProgressHandlers.removeValue(forKey: progressId)
     }
 }
 

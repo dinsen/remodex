@@ -111,6 +111,9 @@ enum TurnTimelineRenderProjection {
             }
 
             let renderedMessage = previousReplacementByIndex[index] ?? fileChangePlan.replacementByIndex[index] ?? message
+            if shouldSkipVisualRow(renderedMessage) {
+                continue
+            }
             guard isToolBurstCandidate(message) else {
                 flushBufferedToolMessages()
                 items.append(.message(renderedMessage))
@@ -276,7 +279,9 @@ enum TurnTimelineRenderProjection {
                 continue
             }
 
-            let hiddenMessages = hiddenSelection.groupIndices.map { messages[$0] }
+            let hiddenMessages = hiddenSelection.groupIndices
+                .map { messages[$0] }
+                .filter { !shouldSkipVisualRow($0) }
             let replacementFinalMessage = finalMessageReplacingCollapsedArtifacts(
                 finalMessage: messages[finalIndex],
                 collapsedMessages: hiddenMessages,
@@ -399,7 +404,9 @@ enum TurnTimelineRenderProjection {
             switch message.kind {
             case .fileChange, .subagentAction, .userInputPrompt:
                 return true
-            case .thinking, .toolActivity, .commandExecution, .chat, .plan:
+            case .plan:
+                return message.shouldDisplayInlinePlanResult
+            case .thinking, .toolActivity, .commandExecution, .chat:
                 return false
             }
         }
@@ -621,6 +628,18 @@ enum TurnTimelineRenderProjection {
         case .thinking, .chat, .plan, .userInputPrompt, .fileChange, .subagentAction:
             return false
         }
+    }
+
+    // Drops placeholder-only system rows before SwiftUI can reserve timeline spacing for them.
+    private static func shouldSkipVisualRow(_ message: CodexMessage) -> Bool {
+        guard message.role == .system,
+              message.kind == .thinking else {
+            return false
+        }
+
+        return ThinkingDisclosureParser
+            .normalizedThinkingContent(from: message.text)
+            .isEmpty
     }
 
     // Late turn ids can arrive mid-stream, so only split when both rows already
