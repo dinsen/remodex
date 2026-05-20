@@ -365,10 +365,33 @@ struct MessageRow: View, Equatable {
         if message.role == .assistant, message.isStreaming {
             // Never fall back to the full live buffer before throttle/onAppear runs;
             // that one frame paints the whole response height and then collapses.
-            return throttledAssistantDisplayText ?? ""
+            if let throttledAssistantDisplayText {
+                return throttledAssistantDisplayText
+            }
+
+            // Let the first small chunk appear immediately so a fresh send does not
+            // feel stalled, while still blocking recovered/coalesced large buffers.
+            return shouldShowInitialStreamingText(window.text) ? window.text : ""
         }
 
         return window.text
+    }
+
+    private func shouldShowInitialStreamingText(_ text: String) -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return text.utf8.count <= 512
+    }
+
+    private func shouldSynchronizeAssistantDisplayImmediately() -> Bool {
+        guard message.isStreaming else { return true }
+        if showsStreamingAnimations {
+            return true
+        }
+
+        let nextText = timelineDisplayWindow(for: message, expansionLevel: textExpansionLevel).text
+        return shouldShowInitialStreamingText(nextText)
     }
 
     var body: some View {
@@ -433,9 +456,7 @@ struct MessageRow: View, Equatable {
             synchronizeAssistantDisplayText(immediate: true)
         }
         .onChange(of: message.text) { _, _ in
-            synchronizeAssistantDisplayText(
-                immediate: !message.isStreaming || showsStreamingAnimations
-            )
+            synchronizeAssistantDisplayText(immediate: shouldSynchronizeAssistantDisplayImmediately())
         }
         .onChange(of: message.isStreaming) { _, isStreaming in
             synchronizeAssistantDisplayText(immediate: !isStreaming)
@@ -686,7 +707,7 @@ struct MessageRow: View, Equatable {
                 text: visibleAssistantTextWithoutImageSyntax,
                 enablesSelection: enablesInlineMarkdownSelectionInTimeline,
                 constrainsToAvailableWidth: true,
-                animatesReveal: false
+                animatesReveal: showsStreamingAnimations
             )
         }
     }

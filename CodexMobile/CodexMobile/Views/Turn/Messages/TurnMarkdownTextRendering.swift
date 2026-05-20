@@ -302,10 +302,10 @@ struct StreamingAssistantMarkdownTextView: View {
 private enum StreamingMarkdownRevealPolicy {
     // MessageRow already coalesces assistant text, so this view only needs a light reveal.
     // Avoid long catch-up tails that repeatedly reparse Markdown and look like line rewrites.
-    static let frameIntervalNanoseconds: UInt64 = 50_000_000
-    private static let snapBacklogCharacterCount = 900
-    private static let minimumAdvanceCharacterCount = 12
-    private static let maximumAdvanceCharacterCount = 240
+    static let frameIntervalNanoseconds: UInt64 = 45_000_000
+    private static let snapBacklogCharacterCount = 1_200
+    private static let minimumAdvanceCharacterCount = 14
+    private static let maximumAdvanceCharacterCount = 96
 
     static func shouldSnap(displayedText: String, targetText: String) -> Bool {
         guard targetText.hasPrefix(displayedText) else {

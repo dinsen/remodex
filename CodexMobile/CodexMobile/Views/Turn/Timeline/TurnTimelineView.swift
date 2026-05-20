@@ -87,6 +87,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     private static var initialWarmTailCount: Int { 0 }
     private static var scrollToLatestButtonLift: CGFloat { 44 + 8 }
     private static var pendingAssistantIndicatorBottomLift: CGFloat { 4 }
+    private static var pendingAssistantIndicatorContentGap: CGFloat { 8 }
     private static var scrollGeometryCoalescingDelayNanoseconds: UInt64 { 16_000_000 }
 
     @State private var visibleTailCount: Int = initialVisibleTailCount
@@ -531,9 +532,13 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     }
 
     private func timelineRowsBottomPadding(showsStickyPendingAssistantIndicator: Bool) -> CGFloat {
-        let reservesIndicatorFootprint = showsStickyPendingAssistantIndicator
-            && pendingStreamingAssistantPlaceholderID == nil
-        return 12 + (reservesIndicatorFootprint ? pendingAssistantIndicatorReservedHeight : 0)
+        guard showsStickyPendingAssistantIndicator else {
+            return 12
+        }
+
+        return 12
+            + pendingAssistantIndicatorReservedHeight
+            + Self.pendingAssistantIndicatorContentGap
     }
 
     // Scroll geometry resumes after the optimistic send gap and assistant anchor settle.
