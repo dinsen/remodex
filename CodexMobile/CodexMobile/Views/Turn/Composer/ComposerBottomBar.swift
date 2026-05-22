@@ -12,7 +12,6 @@ struct ComposerBottomBar: View {
     @State private var showsAllModelsSheet = false
 
     // Data
-    let hasWorkingDirectory: Bool
     let orderedModelOptions: [CodexModelOption]
     let selectedModelID: String?
     let selectedModelTitle: String
@@ -52,8 +51,8 @@ struct ComposerBottomBar: View {
     private let metaLabelColor = Color(.secondaryLabel)
     private var metaTextFont: Font { AppFont.subheadline() }
     private let composerIconSide: CGFloat = 22
-    private let rootlessAccessControlSize: CGFloat = 32
-    private let rootlessAccessControlIconSize: CGFloat = 20
+    private let inlineAccessControlSize: CGFloat = 32
+    private let inlineAccessControlIconSize: CGFloat = 20
 
     private var selectedUserBubbleColor: UserBubbleColor {
         UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
@@ -82,17 +81,11 @@ struct ComposerBottomBar: View {
         HStack(spacing: 12) {
             attachmentMenu
                 .padding(.leading, 8)
-            if !hasWorkingDirectory {
-                rootlessAccessMenuLabel
-            } else {
-                runtimeMenuControl
-            }
+            inlineAccessMenuLabel
             Spacer(minLength: 0)
 
-            if !hasWorkingDirectory {
-                rootlessStatusControl
-                runtimeMenuControl
-            }
+            inlineStatusControl
+            runtimeMenuControl
 
             if isQueuePaused && queuedCount > 0 {
                 Button {
@@ -212,9 +205,9 @@ struct ComposerBottomBar: View {
 
     // MARK: - Menus
 
-    // Rootless Quick Chat has no runtime/project capsule above the input, so
-    // access and usage controls live inline with the bottom composer controls.
-    private var rootlessAccessMenuLabel: some View {
+    // Access and usage stay inline with the bottom composer controls for every
+    // thread type so rootless and project-backed chats share the same layout.
+    private var inlineAccessMenuLabel: some View {
         Menu {
             ForEach(CodexAccessMode.allCases, id: \.rawValue) { mode in
                 Button {
@@ -231,9 +224,9 @@ struct ComposerBottomBar: View {
         } label: {
             RemodexIcon.image(
                 systemName: selectedAccessMode == .fullAccess ? "hand.thumbsup" : "hand.raised",
-                size: rootlessAccessControlIconSize
+                size: inlineAccessControlIconSize
             )
-            .frame(width: rootlessAccessControlSize, height: rootlessAccessControlSize)
+            .frame(width: inlineAccessControlSize, height: inlineAccessControlSize)
             .foregroundStyle(selectedAccessMode == .fullAccess ? .orange : metaLabelColor)
             .contentShape(Circle())
         }
@@ -256,7 +249,7 @@ struct ComposerBottomBar: View {
         .equatable()
     }
 
-    private var rootlessStatusControl: some View {
+    private var inlineStatusControl: some View {
         ContextWindowProgressRing(
             usage: contextWindowUsage,
             rateLimitBuckets: rateLimitBuckets,
@@ -370,6 +363,7 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
     private let metaLabelColor = Color(.secondaryLabel)
     private var metaTextFont: Font { AppFont.callout() }
     private var leadingIconFont: Font { AppFont.subheadline() }
+    private let maxInlineRuntimeLabelWidth: CGFloat = 108
 
     static func == (lhs: ComposerRuntimeMenuControl, rhs: ComposerRuntimeMenuControl) -> Bool {
         lhs.orderedModelOptions == rhs.orderedModelOptions
@@ -411,9 +405,9 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
                 )
             )
         }
-        .fixedSize(horizontal: true, vertical: false)
-        .layoutPriority(1)
+        .layoutPriority(-1)
         .tint(metaLabelColor)
+        .accessibilityLabel(runtimeAccessibilityLabel)
     }
 
     // Split label parts so the model name and effort can carry different foreground styles.
@@ -426,18 +420,50 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
 
     private var effortLabelPart: String? {
         guard selectedModelID != nil else { return nil }
-        return runtimeState.selectedReasoningTitle
+        return compactReasoningTitle(runtimeState.selectedReasoningTitle)
     }
 
-    // Keeps the family suffix visible while shortening the common GPT prefix.
+    // Keeps inline runtime metadata short so stop + send controls do not move the composer.
     private var compactModelTitle: String {
-        let stripped: String
-        if selectedModelTitle.lowercased().hasPrefix("gpt-") {
-            stripped = String(selectedModelTitle.dropFirst("GPT-".count))
-        } else {
-            stripped = selectedModelTitle
+        let normalized = selectedModelTitle
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map(String.init)
+
+        let words = normalized.filter { word in
+            let lowercased = word.lowercased()
+            return lowercased != "gpt" && lowercased != "codex"
         }
-        return stripped.replacingOccurrences(of: "-", with: " ")
+        let compact = words.isEmpty ? selectedModelTitle : words.joined(separator: " ")
+        return compact
+    }
+
+    private var runtimeAccessibilityLabel: String {
+        if selectedModelID == nil {
+            return modelLabelPart
+        }
+        let effort = runtimeState.selectedReasoningTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !effort.isEmpty {
+            return "\(selectedModelTitle), \(effort)"
+        }
+        return selectedModelTitle
+    }
+
+    private func compactReasoningTitle(_ title: String) -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "Select reasoning" else {
+            return nil
+        }
+
+        switch trimmed.lowercased() {
+        case "extra high":
+            return "XH"
+        case "medium":
+            return "Med"
+        default:
+            return trimmed
+        }
     }
 
     // Identifiers pinned to the top of the model submenu; the rest are reachable
@@ -466,10 +492,12 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
                 .font(metaTextFont)
                 .fontWeight(.regular)
                 .lineLimit(1)
+                .truncationMode(.tail)
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 4)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: maxInlineRuntimeLabelWidth, alignment: .leading)
+        .clipped()
         .contentShape(Rectangle())
     }
 

@@ -63,7 +63,6 @@
 		C04E214D2F71D4DB00AA3193 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C04E214C2F71D4DB00AA3193 /* StoreKit.framework */; };
 		C078C1A22F79000100BEEF01 /* Citadel in Frameworks */ = {isa = PBXBuildFile; productRef = C078C1A12F79000100BEEF01 /* Citadel */; };
 		C0A34C3A2FBA9D04007294E3 /* RemodexTextKit in Frameworks */ = {isa = PBXBuildFile; productRef = C0A34C392FBA9D04007294E3 /* RemodexTextKit */; };
-		D0C0FFEE0000000000000001 /* RemodexTextKitMarkdownRenderingRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C0FFEE0000000000000002 /* RemodexTextKitMarkdownRenderingRegressionTests.swift */; };
 		D1A000000000000000000200 /* Runestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000100 /* Runestone */; };
 		D1A000000000000000000201 /* TreeSitterBashRunestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000101 /* TreeSitterBashRunestone */; };
 		D1A000000000000000000202 /* TreeSitterCRunestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000102 /* TreeSitterCRunestone */; };
@@ -85,6 +84,7 @@
 		D1A000000000000000000212 /* TreeSitterTSXRunestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000112 /* TreeSitterTSXRunestone */; };
 		D1A000000000000000000213 /* TreeSitterTypeScriptRunestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000113 /* TreeSitterTypeScriptRunestone */; };
 		D1A000000000000000000214 /* TreeSitterYAMLRunestone in Frameworks */ = {isa = PBXBuildFile; productRef = D1A000000000000000000114 /* TreeSitterYAMLRunestone */; };
+		D0C0FFEE0000000000000001 /* RemodexTextKitMarkdownRenderingRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C0FFEE0000000000000002 /* RemodexTextKitMarkdownRenderingRegressionTests.swift */; };
 		D27B9CA5F0B60ECA8AF38016 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9A37794F4B32C1952A3770E0 /* Foundation.framework */; };
 		D4F56781234567890ABCDE01 /* CodexServiceIncomingRunIndicatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4F56781234567890ABCDE02 /* CodexServiceIncomingRunIndicatorTests.swift */; };
 		DAAD0C0C717F9415C3E9D21A /* RemodexMenuBarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0B9CCCCC45E47616AB452FA /* RemodexMenuBarApp.swift */; };

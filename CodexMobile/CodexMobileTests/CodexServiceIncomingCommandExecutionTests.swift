@@ -199,6 +199,67 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(history[0].turnId, turnID)
     }
 
+    func testHistoryRawExecCommandToolCallRestoresCommandRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        let history = service.decodeMessagesFromThreadRead(
+            threadId: threadID,
+            threadObject: [
+                "createdAt": .string("2026-03-12T10:00:00Z"),
+                "turns": .array([
+                    .object([
+                        "id": .string(turnID),
+                        "items": .array([
+                            .object([
+                                "id": .string("call-command"),
+                                "type": .string("toolCall"),
+                                "name": .string("exec_command"),
+                                "arguments": .string(#"{"cmd":"git status --short --branch","workdir":"/repo"}"#),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history[0].kind, .commandExecution)
+        XCTAssertEqual(history[0].text, "completed git status --short --branch")
+        XCTAssertEqual(history[0].turnId, turnID)
+    }
+
+    func testHistoryToolCallAcceptsExpandedReadableActivityVerbs() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        let history = service.decodeMessagesFromThreadRead(
+            threadId: threadID,
+            threadObject: [
+                "createdAt": .string("2026-03-12T10:00:00Z"),
+                "turns": .array([
+                    .object([
+                        "id": .string(turnID),
+                        "items": .array([
+                            .object([
+                                "id": .string("tool-item"),
+                                "type": .string("toolCall"),
+                                "name": .string("view_image"),
+                                "message": .string("Capture screenshot\nCheck weather Rome"),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history[0].kind, .toolActivity)
+        XCTAssertEqual(history[0].text, "Capture screenshot\nCheck weather Rome")
+    }
+
     func testHistoryRestoresGeneratedImageEndAndImageViewItems() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"

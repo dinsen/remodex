@@ -2,9 +2,12 @@
 // Purpose: Shared diff sheet UI and repo-patch presentation helpers for turn-level change inspection.
 // Layer: View Component
 // Exports: TurnDiffSheet, TurnDiffPresentation, TurnDiffPresentationBuilder
-// Depends on: SwiftUI, MarkdownTextView, TurnMessageCaches, TurnFileChangeSummaryParser
+// Depends on: Foundation, Runestone, SwiftUI, UIKit, TurnMessageCaches, TurnFileChangeSummaryParser
 
+import Foundation
+import Runestone
 import SwiftUI
+import UIKit
 
 struct TurnDiffPresentation: Identifiable, Equatable {
     let id: String
@@ -56,7 +59,7 @@ enum TurnDiffPresentationBuilder {
     }
 
     private static func splitUnifiedDiffByFile(_ diff: String) -> [UnifiedDiffChunk] {
-        let lines = diff.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lines = diff.components(separatedBy: "\n")
         guard !lines.isEmpty else { return [] }
 
         var chunks: [UnifiedDiffChunk] = []
@@ -322,10 +325,10 @@ private struct TurnDiffFileCard: View {
             }
             .buttonStyle(.plain)
 
-            if isExpanded, MarkdownUnifiedDiffBlockView.canRender(diffCode: chunk.diffCode) {
+            if isExpanded, RunestoneUnifiedDiffBlockView.canRender(diffCode: chunk.diffCode) {
                 Divider()
 
-                MarkdownUnifiedDiffBlockView(diffCode: chunk.diffCode)
+                RunestoneUnifiedDiffBlockView(diffCode: chunk.diffCode)
                     .padding(.vertical, 4)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -344,29 +347,74 @@ private struct TurnDiffFileCard: View {
     }
 }
 
-private struct MarkdownUnifiedDiffBlockView: View {
+private struct RunestoneUnifiedDiffBlockView: UIViewRepresentable {
     let diffCode: String
 
-    var body: some View {
-        MarkdownTextView(
-            text: renderableDiff,
-            profile: .assistantProse,
-            enablesSelection: true,
-            constrainsToAvailableWidth: true,
-            usesCaches: false,
-            usesScrollableCodeBlocks: true
-        )
-        .padding(.vertical, 8)
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context _: Context) -> TextView {
+        let textView = TextView(frame: .zero)
+        configure(textView)
+        return textView
+    }
+
+    func updateUIView(_ uiView: TextView, context: Context) {
+        configure(uiView)
+
+        let body = Self.renderableBody(from: diffCode)
+        let signature = Coordinator.Signature(content: body)
+        guard context.coordinator.signature != signature else {
+            return
+        }
+
+        context.coordinator.signature = signature
+        uiView.setState(TextViewState(text: body, theme: TurnDiffRunestoneTheme()))
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView _: TextView,
+        context _: Context
+    ) -> CGSize? {
+        guard let width = proposal.width, width > 0 else {
+            return nil
+        }
+
+        let lineCount = max(1, Self.renderableBody(from: diffCode).components(separatedBy: "\n").count)
+        let lineHeight = AppFont.monoUIFont(size: 13, textStyle: .callout).lineHeight * 1.22
+        let verticalInset: CGFloat = 24
+        return CGSize(width: width, height: ceil(CGFloat(lineCount) * lineHeight + verticalInset))
+    }
+
+    private func configure(_ textView: TextView) {
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.showLineNumbers = true
+        textView.lineSelectionDisplayType = .line
+        textView.isLineWrappingEnabled = false
+        textView.lineHeightMultiplier = 1.22
+        textView.textContainerInset = UIEdgeInsets(top: 12, left: 10, bottom: 12, right: 18)
+        textView.backgroundColor = .clear
+        textView.selectionBarColor = .systemBlue
+        textView.selectionHighlightColor = UIColor.systemBlue.withAlphaComponent(0.18)
+        textView.autocorrectionType = .no
+        textView.autocapitalizationType = .none
+        textView.smartDashesType = .no
+        textView.smartQuotesType = .no
+        textView.smartInsertDeleteType = .no
+        textView.spellCheckingType = .no
+        textView.alwaysBounceVertical = false
+        textView.alwaysBounceHorizontal = true
+        textView.keyboardDismissMode = .interactive
+        textView.clipsToBounds = true
     }
 
     private var renderableDiff: String {
         let body = Self.renderableBody(from: diffCode)
         let fence = Self.markdownFence(for: body)
         return "\(fence)diff\n\(body)\n\(fence)"
-    }
-
-    private var renderableBody: String {
-        Self.renderableBody(from: diffCode)
     }
 
     static func canRender(diffCode: String) -> Bool {
@@ -407,6 +455,78 @@ private struct MarkdownUnifiedDiffBlockView: View {
         return String(repeating: "`", count: max(3, longestFence + 1))
     }
 
+    final class Coordinator {
+        var signature: Signature?
+
+        struct Signature: Equatable {
+            let content: String
+        }
+    }
+
+}
+
+private final class TurnDiffRunestoneTheme: Runestone.Theme {
+    var font: UIFont {
+        AppFont.monoUIFont(size: 13, textStyle: .callout)
+    }
+
+    var textColor: UIColor {
+        .label
+    }
+
+    var gutterBackgroundColor: UIColor {
+        .clear
+    }
+
+    var gutterHairlineColor: UIColor {
+        UIColor.separator.withAlphaComponent(0.26)
+    }
+
+    var lineNumberColor: UIColor {
+        UIColor.secondaryLabel.withAlphaComponent(0.72)
+    }
+
+    var lineNumberFont: UIFont {
+        AppFont.monoUIFont(size: 12, textStyle: .caption2)
+    }
+
+    var selectedLineBackgroundColor: UIColor {
+        UIColor.systemBlue.withAlphaComponent(0.10)
+    }
+
+    var selectedLinesLineNumberColor: UIColor {
+        .systemBlue
+    }
+
+    var selectedLinesGutterBackgroundColor: UIColor {
+        UIColor.systemBlue.withAlphaComponent(0.08)
+    }
+
+    var invisibleCharactersColor: UIColor {
+        .tertiaryLabel
+    }
+
+    var pageGuideHairlineColor: UIColor {
+        .clear
+    }
+
+    var pageGuideBackgroundColor: UIColor {
+        .clear
+    }
+
+    var markedTextBackgroundColor: UIColor {
+        UIColor.systemYellow.withAlphaComponent(0.25)
+    }
+
+    func textColor(for highlightName: String) -> UIColor? {
+        _ = highlightName
+        return nil
+    }
+
+    func fontTraits(for highlightName: String) -> FontTraits {
+        _ = highlightName
+        return []
+    }
 }
 
 private extension TurnDiffLineKind {

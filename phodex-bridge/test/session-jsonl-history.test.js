@@ -335,6 +335,112 @@ test("parseSessionJsonlTurns restores update_plan calls as progress plan items",
   ]);
 });
 
+test("parseSessionJsonlTurns enriches exec_command function calls for readable history", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:03.000Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-command",
+        cwd: "/Users/test/Project",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:04.000Z",
+      type: "event_msg",
+      payload: {
+        type: "task_started",
+        turn_id: "turn-command",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:05.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: "call-command",
+        arguments: JSON.stringify({
+          cmd: "git status --short --branch",
+          workdir: "/Users/test/Project",
+          yield_time_ms: 1000,
+        }),
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-command" });
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].items.length, 1);
+  assert.equal(turns[0].items[0].type, "commandExecution");
+  assert.equal(turns[0].items[0].id, "call-command");
+  assert.equal(turns[0].items[0].command, "git status --short --branch");
+  assert.equal(turns[0].items[0].cwd, "/Users/test/Project");
+  assert.equal(turns[0].items[0].status, "completed");
+});
+
+test("parseSessionJsonlTurns adds readable messages for generic tool calls", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:03.000Z",
+      type: "event_msg",
+      payload: {
+        type: "task_started",
+        turn_id: "turn-tools",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:04.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "write_stdin",
+        call_id: "call-stdin",
+        arguments: JSON.stringify({
+          session_id: 42,
+          chars: "y\n",
+        }),
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-22T14:51:05.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "view_image",
+        call_id: "call-image",
+        arguments: JSON.stringify({
+          path: "/Users/test/Project/tmp/screenshots/detail.png",
+        }),
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-tools" });
+
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].items.map((item) => ({
+    id: item.id,
+    type: item.type,
+    message: item.message,
+    toolName: item.tool_name,
+  })), [
+    {
+      id: "call-stdin",
+      type: "tool_call",
+      message: "Write to terminal",
+      toolName: "write_stdin",
+    },
+    {
+      id: "call-image",
+      type: "tool_call",
+      message: "Open image …/screenshots/detail.png",
+      toolName: "view_image",
+    },
+  ]);
+});
+
 test("parseSessionJsonlTurns restores completed desktop Plan items without duplicating proposed_plan messages", () => {
   const content = [
     JSON.stringify({

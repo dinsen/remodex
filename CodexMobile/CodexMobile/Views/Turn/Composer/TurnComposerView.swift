@@ -105,8 +105,8 @@ struct TurnComposerView: View {
     let onSteerQueuedDraft: (String) -> Void
     let onRemoveQueuedDraft: (String) -> Void
     let onSend: () -> Void
-    // Call sites can hide the lower runtime/git/access row for constrained
-    // surfaces, but project-backed new-chat drafts keep it visible.
+    // Call sites can hide the project git/runtime row above the input for
+    // constrained surfaces; access and usage always live in the bottom bar.
     var showsSecondaryBar: Bool = true
 
     @State private var composerInputHeight: CGFloat = 32
@@ -134,12 +134,6 @@ struct TurnComposerView: View {
                         isEmptyThread: isEmptyThread,
                         hasWorkingDirectory: hasWorkingDirectory,
                         isWorktreeProject: isWorktreeProject,
-                        selectedAccessMode: selectedAccessMode,
-                        contextWindowUsage: contextWindowUsage,
-                        rateLimitBuckets: rateLimitBuckets,
-                        isLoadingRateLimits: isLoadingRateLimits,
-                        rateLimitsErrorMessage: rateLimitsErrorMessage,
-                        shouldAutoRefreshUsageStatus: shouldAutoRefreshUsageStatus,
                         showsGitBranchSelector: showsGitBranchSelector,
                         isGitBranchSelectorEnabled: isGitBranchSelectorEnabled,
                         availableGitBranchTargets: availableGitBranchTargets,
@@ -155,8 +149,6 @@ struct TurnComposerView: View {
                         onCreateGitBranch: onCreateGitBranch,
                         onSelectGitBaseBranch: onSelectGitBaseBranch,
                         onRefreshGitBranches: onRefreshGitBranches,
-                        onRefreshUsageStatus: onRefreshUsageStatus,
-                        onSelectAccessMode: onSelectAccessMode,
                         canHandOffToWorktree: canHandOffToWorktree,
                         onTapCreateWorktree: onTapCreateWorktree
                     )
@@ -224,7 +216,6 @@ struct TurnComposerView: View {
                     }
 
                     ComposerBottomBar(
-                        hasWorkingDirectory: hasWorkingDirectory,
                         orderedModelOptions: orderedModelOptions,
                         selectedModelID: selectedModelID,
                         selectedModelTitle: selectedModelTitle,

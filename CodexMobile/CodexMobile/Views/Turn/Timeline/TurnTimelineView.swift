@@ -99,6 +99,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     @State private var initialRecoverySnapPendingThreadID: String?
     @State private var initialRecoverySnapTask: Task<Void, Never>?
     @State private var followBottomScrollTask: Task<Void, Never>?
+    @State private var pendingAssistantBottomSnapTask: Task<Void, Never>?
     @State private var progressiveTailRevealTask: Task<Void, Never>?
     @State private var isProgressivelyRevealingRecentTail = false
     @State private var isUserDraggingScroll = false
@@ -617,6 +618,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         initialRecoverySnapPendingThreadID = nil
         isUserDraggingScroll = false
         userScrollCooldownUntil = nil
+        pendingAssistantBottomSnapTask?.cancel()
+        pendingAssistantBottomSnapTask = nil
         scrollToBottom(using: proxy, animated: true)
     }
 
@@ -649,6 +652,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         initialRecoverySnapTask = nil
         followBottomScrollTask?.cancel()
         followBottomScrollTask = nil
+        pendingAssistantBottomSnapTask?.cancel()
+        pendingAssistantBottomSnapTask = nil
         progressiveTailRevealTask?.cancel()
         progressiveTailRevealTask = nil
         isProgressivelyRevealingRecentTail = false
@@ -987,6 +992,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         initialRecoverySnapTask = nil
         followBottomScrollTask?.cancel()
         followBottomScrollTask = nil
+        pendingAssistantBottomSnapTask?.cancel()
+        pendingAssistantBottomSnapTask = nil
         progressiveTailRevealTask?.cancel()
         progressiveTailRevealTask = nil
         isProgressivelyRevealingRecentTail = false
@@ -1092,6 +1099,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         }
         autoScrollMode = .followBottom
         initialRecoverySnapPendingThreadID = nil
+        pendingAssistantBottomSnapTask?.cancel()
+        pendingAssistantBottomSnapTask = nil
         return true
     }
 
@@ -1105,7 +1114,35 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                shouldShowPendingAssistantResponse {
                 // The assistant row does not exist yet; keep the optimistic user
                 // bubble and pending thinking indicator anchored at the bottom.
-                scrollToBottom(using: proxy, animated: true)
+                schedulePendingAssistantBottomSnap(using: proxy)
+            }
+        }
+    }
+
+    // The user row and sticky thinking indicator can appear one layout pass before the
+    // assistant row exists; defer the bottom snap until that provisional stack is measurable.
+    private func schedulePendingAssistantBottomSnap(using proxy: ScrollViewProxy) {
+        guard pendingAssistantBottomSnapTask == nil else { return }
+        let expectedThreadID = threadID
+        let snapDelays: [UInt64] = [0, 16_000_000, 50_000_000]
+        pendingAssistantBottomSnapTask = Task { @MainActor in
+            defer { pendingAssistantBottomSnapTask = nil }
+            for delay in snapDelays {
+                if delay == 0 {
+                    await Task.yield()
+                } else {
+                    try? await Task.sleep(nanoseconds: delay)
+                }
+
+                guard !Task.isCancelled,
+                      scrollSessionThreadID == expectedThreadID,
+                      autoScrollMode == .anchorAssistantResponse,
+                      shouldShowPendingAssistantResponse,
+                      !shouldPauseAutomaticScrolling else {
+                    return
+                }
+
+                scrollToBottom(using: proxy, animated: delay != 0)
             }
         }
     }

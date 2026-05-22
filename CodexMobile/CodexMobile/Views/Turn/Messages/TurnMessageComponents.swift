@@ -331,6 +331,8 @@ struct MessageRow: View, Equatable {
     var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
+    // True while the sticky "Remodex is thinking" row is visible at the bottom of the timeline.
+    var protectsPendingIndicatorAnchor: Bool = false
     // Passed as init params so .equatable() can invalidate only for row-visible action state.
     var inlineCommitAndPushAction: (() -> Void)? = nil
     var inlineCommitAndPushPhase: InlineCommitAndPushPhase? = nil
@@ -352,6 +354,7 @@ struct MessageRow: View, Equatable {
             && lhs.currentWorkingDirectory == rhs.currentWorkingDirectory
             && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
+            && lhs.protectsPendingIndicatorAnchor == rhs.protectsPendingIndicatorAnchor
             && (lhs.inlineCommitAndPushAction != nil) == (rhs.inlineCommitAndPushAction != nil)
             && lhs.inlineCommitAndPushPhase == rhs.inlineCommitAndPushPhase
     }
@@ -706,7 +709,8 @@ struct MessageRow: View, Equatable {
                 text: visibleAssistantTextWithoutImageSyntax,
                 enablesSelection: enablesInlineMarkdownSelectionInTimeline,
                 constrainsToAvailableWidth: true,
-                animatesReveal: showsStreamingAnimations
+                animatesReveal: showsStreamingAnimations,
+                protectsPendingIndicatorAnchor: protectsPendingIndicatorAnchor
             )
         }
     }

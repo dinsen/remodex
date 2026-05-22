@@ -2232,8 +2232,12 @@ extension CodexService {
         return sections.joined(separator: "\n\n")
     }
 
-    // Splits history tool items into dedicated file-change rows or compact generic activity rows.
+    // Splits history tool items into dedicated command, file-change, or compact generic activity rows.
     func decodeHistoryToolCallItem(from itemObject: [String: JSONValue]) -> (kind: CodexMessageKind, text: String)? {
+        if isHistoryCommandToolCall(itemObject),
+           let commandText = decodeHistoryCommandToolCallText(from: itemObject) {
+            return (.commandExecution, commandText)
+        }
         if let fileChangeText = decodeHistoryToolCallFileChangeText(from: itemObject) {
             return (.fileChange, fileChangeText)
         }
@@ -2322,8 +2326,20 @@ extension CodexService {
                 "opened ",
                 "find ",
                 "finding ",
+                "capture ",
+                "captured ",
+                "check ",
+                "checked ",
+                "create ",
+                "created ",
                 "edit ",
                 "edited ",
+                "request ",
+                "requested ",
+                "run ",
+                "ran ",
+                "update ",
+                "updated ",
                 "write ",
                 "wrote ",
                 "apply ",
@@ -2362,6 +2378,50 @@ extension CodexService {
             isCompleted: true
         )
         return summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : summary
+    }
+
+    func isHistoryCommandToolCall(_ itemObject: [String: JSONValue]) -> Bool {
+        let rawTool = firstNonEmptyString([
+            itemObject["name"]?.stringValue,
+            itemObject["tool_name"]?.stringValue,
+            itemObject["toolName"]?.stringValue,
+            itemObject["tool"]?.stringValue,
+        ])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return rawTool == "exec_command" || rawTool == "shell_command"
+    }
+
+    func decodeHistoryCommandToolCallText(from itemObject: [String: JSONValue]) -> String? {
+        let argumentsObject = decodeHistoryToolArgumentsObject(from: itemObject)
+        let status = decodeHistoryNestedStatus(from: itemObject) ?? "completed"
+        let phase = normalizedHistoryCommandPhase(status)
+        let command = firstNonEmptyString([
+            decodeHistoryFirstString(
+                forAnyKey: ["command", "cmd", "raw_command", "rawCommand", "input", "invocation"],
+                in: .object(itemObject)
+            ),
+            decodeHistoryFirstString(
+                forAnyKey: ["command", "cmd", "raw_command", "rawCommand", "input", "invocation"],
+                in: .object(argumentsObject)
+            ),
+        ])
+        guard let command else { return nil }
+        return "\(phase) \(shortHistoryCommand(command))"
+    }
+
+    func decodeHistoryToolArgumentsObject(from itemObject: [String: JSONValue]) -> [String: JSONValue] {
+        guard let argumentsValue = itemObject["arguments"] ?? itemObject["input"] else {
+            return [:]
+        }
+        if let object = argumentsValue.objectValue {
+            return object
+        }
+        guard let text = argumentsValue.stringValue,
+              let data = text.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let object = decoded.objectValue else {
+            return [:]
+        }
+        return object
     }
 
     func decodeHistoryFileChangeEntries(

@@ -278,6 +278,11 @@ function normalizeResponseItemForHistory(payload, lineNumber, { cwd = "" } = {})
     return applyPatchItem;
   }
 
+  const readableToolItem = normalizeReadableToolItemForHistory(payload, lineNumber, { cwd });
+  if (readableToolItem) {
+    return readableToolItem;
+  }
+
   const item = {
     ...payload,
     id: normalizeString(payload.id)
@@ -292,6 +297,60 @@ function normalizeResponseItemForHistory(payload, lineNumber, { cwd = "" } = {})
   }
 
   return item;
+}
+
+// Enriches raw tool-call JSONL records so mobile history can render useful rows.
+function normalizeReadableToolItemForHistory(payload, lineNumber, { cwd = "" } = {}) {
+  const type = normalizeHistoryItemType(payload.type);
+  const typeToken = normalizeHistoryToken(type);
+  if (typeToken !== "toolcall" && typeToken !== "customtoolcall") {
+    return null;
+  }
+
+  const toolName = normalizeString(payload.name)
+    || normalizeString(payload.tool_name)
+    || normalizeString(payload.toolName);
+  if (!toolName) {
+    return null;
+  }
+
+  const callId = normalizeString(payload.call_id)
+    || normalizeString(payload.callId)
+    || normalizeString(payload.id);
+  const argumentsObject = parseToolArguments(
+    payload.arguments !== undefined ? payload.arguments : payload.input
+  );
+  const id = callId || normalizeString(payload.id) || `tool-call-line-${lineNumber}`;
+  const status = normalizeString(payload.status) || "completed";
+
+  if (isCommandToolName(toolName)) {
+    return {
+      ...payload,
+      id,
+      type: "commandExecution",
+      status,
+      command: resolveToolCommand(toolName, argumentsObject),
+      cwd: resolveToolWorkingDirectory(argumentsObject, { cwd }),
+      call_id: callId || undefined,
+      tool_name: toolName,
+      arguments: payload.arguments,
+    };
+  }
+
+  const message = readableToolActivityMessage(toolName, argumentsObject, payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    ...payload,
+    id,
+    type: "tool_call",
+    status,
+    message,
+    call_id: callId || undefined,
+    tool_name: toolName,
+  };
 }
 
 function normalizeApplyPatchItemForHistory(payload, lineNumber, { cwd = "" } = {}) {
@@ -370,6 +429,182 @@ function parseToolArguments(rawArguments) {
     ? safeParseJSON(normalizeString(rawArguments))
     : rawArguments;
   return objectValue(parsed) || {};
+}
+
+function resolveToolCommand(toolName, argumentsObject) {
+  if (!isCommandToolName(toolName)) {
+    return toolName;
+  }
+
+  return firstNonEmptyString([
+    normalizeString(argumentsObject.cmd),
+    normalizeString(argumentsObject.command),
+    normalizeString(argumentsObject.raw_command),
+    normalizeString(argumentsObject.rawCommand),
+    normalizeString(argumentsObject.input),
+  ]) || toolName;
+}
+
+function resolveToolWorkingDirectory(argumentsObject, { cwd = "" } = {}) {
+  return firstNonEmptyString([
+    normalizeString(argumentsObject.workdir),
+    normalizeString(argumentsObject.cwd),
+    normalizeString(argumentsObject.working_directory),
+    normalizeString(argumentsObject.workingDirectory),
+    normalizeString(cwd),
+  ]) || "";
+}
+
+function isCommandToolName(toolName) {
+  const normalized = normalizeString(toolName).toLowerCase();
+  return normalized === "exec_command" || normalized === "shell_command";
+}
+
+function readableToolActivityMessage(toolName, argumentsObject, payload) {
+  const normalized = normalizeString(toolName).toLowerCase();
+  switch (normalized) {
+    case "write_stdin":
+      return "Write to terminal";
+    case "read_thread_terminal":
+      return "Read terminal output";
+    case "view_image": {
+      const imagePath = firstNonEmptyString([
+        normalizeString(argumentsObject.path),
+        normalizeString(payload.path),
+      ]);
+      return imagePath ? `Open image ${compactHistoryPath(imagePath)}` : "Open image";
+    }
+    case "open":
+    case "browser.open":
+      return readableTargetMessage("Open", argumentsObject, payload);
+    case "click":
+    case "browser.click":
+      return readableTargetMessage("Click", argumentsObject, payload);
+    case "find":
+    case "browser.find":
+      return readableTargetMessage("Find", argumentsObject, payload);
+    case "screenshot":
+    case "browser.screenshot":
+      return "Capture screenshot";
+    case "web.run":
+    case "search_query":
+    case "image_query":
+      return readableSearchMessage(argumentsObject, payload);
+    case "weather":
+      return readableLocationMessage("Check weather", argumentsObject, payload);
+    case "finance":
+      return readableSymbolMessage("Check market data", argumentsObject, payload);
+    case "sports":
+      return readableLocationMessage("Check sports", argumentsObject, payload);
+    case "automation_update":
+      return "Update automation";
+    case "update_goal":
+      return "Update goal";
+    case "create_goal":
+      return "Create goal";
+    case "get_goal":
+      return "Read goal";
+    case "request_user_input":
+      return "Request input";
+    default:
+      return `Run ${humanizeToolName(toolName)}`;
+  }
+}
+
+function readableTargetMessage(verb, argumentsObject, payload) {
+  const target = firstNonEmptyString([
+    normalizeString(argumentsObject.ref_id),
+    normalizeString(argumentsObject.refId),
+    normalizeString(argumentsObject.url),
+    normalizeString(argumentsObject.pattern),
+    normalizeString(argumentsObject.query),
+    normalizeString(payload.ref_id),
+    normalizeString(payload.url),
+  ]);
+  return target ? `${verb} ${compactHistoryPath(target)}` : verb;
+}
+
+function readableSearchMessage(argumentsObject, payload) {
+  const query = firstSearchQuery(argumentsObject) || firstSearchQuery(payload);
+  return query ? `Search ${query}` : "Search web";
+}
+
+function firstSearchQuery(object) {
+  const direct = normalizeString(object.q)
+    || normalizeString(object.query)
+    || normalizeString(object.search_query);
+  if (direct) {
+    return direct;
+  }
+
+  let searchArray = null;
+  if (Array.isArray(object.search_query)) {
+    searchArray = object.search_query;
+  } else if (Array.isArray(object.image_query)) {
+    searchArray = object.image_query;
+  }
+  if (!searchArray) {
+    return "";
+  }
+  for (const item of searchArray) {
+    const query = normalizeString(objectValue(item)?.q)
+      || normalizeString(objectValue(item)?.query);
+    if (query) {
+      return query;
+    }
+  }
+  return "";
+}
+
+function readableLocationMessage(verb, argumentsObject, payload) {
+  const target = firstNonEmptyString([
+    normalizeString(argumentsObject.location),
+    normalizeString(argumentsObject.team),
+    normalizeString(argumentsObject.league),
+    normalizeString(payload.location),
+  ]);
+  return target ? `${verb} ${target}` : verb;
+}
+
+function readableSymbolMessage(verb, argumentsObject, payload) {
+  const target = firstNonEmptyString([
+    normalizeString(argumentsObject.ticker),
+    normalizeString(argumentsObject.symbol),
+    normalizeString(payload.ticker),
+  ]);
+  return target ? `${verb} ${target}` : verb;
+}
+
+function humanizeToolName(toolName) {
+  return normalizeString(toolName)
+    .replace(/^[^.]+\./, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "tool";
+}
+
+function compactHistoryPath(path) {
+  const text = normalizeString(path);
+  if (!text) {
+    return "";
+  }
+  const normalized = text.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 2) {
+    return text;
+  }
+  const prefix = normalized.startsWith("/") ? "…/" : "";
+  return `${prefix}${parts.slice(-2).join("/")}`;
+}
+
+function firstNonEmptyString(values) {
+  for (const value of values) {
+    const normalized = normalizeString(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
 }
 
 function safeParseJSON(rawValue) {
