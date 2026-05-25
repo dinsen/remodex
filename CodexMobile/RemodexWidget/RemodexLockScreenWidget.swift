@@ -131,6 +131,7 @@ struct RemodexDisplayIslandLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     RemodexDisplayIslandExpandedList(state: context.state)
+                        .padding(.horizontal, 8)
                 }
             } compactLeading: {
                 RemodexDisplayIslandMark()
@@ -230,7 +231,7 @@ private struct RemodexDisplayIslandRow: View {
     let conversation: RemodexDisplayIslandConversation
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 7) {
             Circle()
                 .fill(tint)
                 .frame(width: 7, height: 7)
@@ -245,13 +246,23 @@ private struct RemodexDisplayIslandRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer(minLength: 0)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(conversation.state)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(tint)
+                    .lineLimit(1)
 
-            Text(conversation.state)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(tint)
-                .frame(minWidth: 58, alignment: .trailing)
+                if let runningStartedAt = conversation.runningStartedAt {
+                    Text(runningStartedAt, style: .timer)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+            .frame(width: 62, alignment: .trailing)
         }
     }
 

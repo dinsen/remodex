@@ -39,6 +39,7 @@ struct RemodexDisplayIslandConversation: Codable, Hashable, Identifiable, Sendab
     let title: String
     let detail: String
     let state: String
+    var runningStartedAt: Date?
 
     var threadURL: URL? {
         var components = URLComponents()

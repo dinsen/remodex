@@ -76,6 +76,7 @@ struct ContentView: View {
     @State private var sidebarSelectionSuppressedUntil: Date?
     @State private var activeNewChatDraftRoute: NewChatDraftRoute?
     @State private var isOpeningNewChatFromSidebar = false
+    @State private var pendingQuickAction: RemodexQuickAction?
     @State private var threadIDsPendingInitialAssistantAnchor: Set<String> = []
     // Settings is presented as a `fullScreenCover` instead of being pushed
     // onto `navigationPath` so the gear button works even when the sidebar
@@ -89,6 +90,7 @@ struct ContentView: View {
     @State private var displayIslandFailedBanners: [CodexThreadCompletionBanner] = []
     @State private var displayIslandLastRunningThreadIDs: Set<String> = []
     @State private var displayIslandLastTerminalStatesByThread: [String: CodexTurnTerminalState] = [:]
+    @State private var displayIslandRunningStartedAtByThread: [String: Date] = [:]
     @AppStorage("codex.hasSeenOnboarding") private var hasSeenOnboarding = false
     @AppStorage("codex.whatsNew.lastPresentedVersion") private var lastPresentedWhatsNewVersion = ""
 
@@ -111,6 +113,10 @@ struct ContentView: View {
     // Splits lifecycle wiring from presentation modifiers so SwiftUI does not have to type-check one giant body chain.
     private var rootContentWithLifecycleObservers: some View {
         rootContent
+            .task {
+                RemodexQuickActionCenter.updateShortcutItems(for: codex.threads)
+                routePendingQuickActionIfNeeded()
+            }
             // Only resume saved-pairing recovery after onboarding is done and the manual scanner is not in control.
             .task {
                 guard hasSeenOnboarding, !isShowingManualScanner else {
@@ -172,8 +178,10 @@ struct ContentView: View {
             }
             .onChange(of: codex.threads) { _, threads in
                 debugSidebarLog("threads changed count=\(threads.count) sidebarOpen=\(isSidebarOpen) prewarmed=\(isSidebarPrewarmed)")
+                RemodexQuickActionCenter.updateShortcutItems(for: threads)
                 syncSelectedThread(with: threads)
                 routeExternalThreadOpenIfNeeded()
+                routePendingQuickActionIfNeeded()
                 scheduleSidebarPrewarmIfNeeded()
                 syncDisplayIsland()
             }
@@ -182,6 +190,8 @@ struct ContentView: View {
                 codex.setForegroundState(phase != .background)
                 syncDisplayIsland()
                 if phase == .active {
+                    RemodexQuickActionCenter.updateShortcutItems(for: codex.threads)
+                    routePendingQuickActionIfNeeded()
                     Task {
                         async let subscriptionRefresh: Void = subscriptions.refreshCustomerInfoSilently()
 
@@ -199,6 +209,9 @@ struct ContentView: View {
                     resetSavedMacWakeRecoveryState()
                     teardownSidebarPrewarm()
                 }
+            }
+            .onChange(of: horizontalSizeClass) { _, _ in
+                routePendingQuickActionIfNeeded()
             }
             .onChange(of: codex.shouldAutoReconnectOnForeground) { _, shouldReconnect in
                 guard shouldReconnect else {
@@ -237,6 +250,14 @@ struct ContentView: View {
             }
             .onChange(of: codex.latestTurnTerminalStateByThread) { _, _ in
                 syncDisplayIsland()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: RemodexQuickActionCenter.didReceiveQuickAction)) { notification in
+                _ = RemodexQuickActionCenter.consumePendingAction()
+                guard let action = notification.userInfo?["action"] as? RemodexQuickAction else {
+                    return
+                }
+                pendingQuickAction = action
+                routePendingQuickActionIfNeeded()
             }
     }
 
@@ -1209,6 +1230,52 @@ struct ContentView: View {
         codex.externalThreadOpenRequest = nil
     }
 
+    private func routePendingQuickActionIfNeeded() {
+        if pendingQuickAction == nil {
+            pendingQuickAction = RemodexQuickActionCenter.consumePendingAction()
+        }
+
+        guard let action = pendingQuickAction else {
+            return
+        }
+
+        // Shortcut callbacks can arrive before SwiftUI has resolved the size class.
+        // Routing too early chooses drawer mode on iPhone and leaves the user at the sidebar root.
+        guard horizontalSizeClass != nil else {
+            return
+        }
+
+        pendingQuickAction = nil
+        handleQuickAction(action)
+    }
+
+    private func handleQuickAction(_ action: RemodexQuickAction) {
+        switch action {
+        case .newChat:
+            openNewChatDraftFromSidebar(source: .generalChat, preferredProjectPath: nil)
+        case .thread(let threadId):
+            if let thread = codex.threads.first(where: { $0.id == threadId && $0.syncState == .live }) {
+                sidebarSelectionSuppressedUntil = nil
+                openThreadFromSidebar(thread)
+            } else {
+                routeQuickActionThreadPlaceholder(threadId: threadId)
+            }
+        }
+    }
+
+    private func routeQuickActionThreadPlaceholder(threadId: String) {
+        let normalizedThreadId = threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadId.isEmpty else {
+            return
+        }
+
+        let thread = codex.threads.first(where: { $0.id == normalizedThreadId })
+            ?? CodexThread(id: normalizedThreadId, title: CodexThread.defaultDisplayTitle)
+        codex.upsertThread(thread)
+        sidebarSelectionSuppressedUntil = nil
+        openThreadFromSidebar(thread)
+    }
+
     // Keeps sidebar chat creation compose-first while preserving which affordance
     // opened it, so the draft UI can distinguish general Chat from folder Chat.
     private func openNewChatDraftFromSidebar(
@@ -2022,6 +2089,16 @@ struct ContentView: View {
             .intersection(visibleThreadIDs)
             .subtracting(currentRunningIDs)
         let terminalStates = codex.latestTurnTerminalStateByThread
+        let now = Date()
+
+        for threadId in currentRunningIDs {
+            if displayIslandRunningStartedAtByThread[threadId] == nil {
+                displayIslandRunningStartedAtByThread[threadId] = now
+            }
+        }
+        displayIslandRunningStartedAtByThread = displayIslandRunningStartedAtByThread.filter { threadId, _ in
+            currentRunningIDs.contains(threadId) && visibleThreadIDs.contains(threadId)
+        }
 
         displayIslandCompletedBanners.removeAll { banner in
             !visibleThreadIDs.contains(banner.threadId)
@@ -2075,7 +2152,13 @@ struct ContentView: View {
     private func displayIslandSnapshot() -> RemodexDisplayIslandSnapshot {
         let runningIDs = displayIslandCurrentRunningThreadIDs()
         let runningConversations = runningIDs
-            .compactMap { displayIslandConversation(threadId: $0, state: displayIslandRunningState(for: $0)) }
+            .compactMap { threadId in
+                displayIslandConversation(
+                    threadId: threadId,
+                    state: displayIslandRunningState(for: threadId),
+                    runningStartedAt: displayIslandRunningStartedAtByThread[threadId]
+                )
+            }
             .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
 
         let completedConversations = displayIslandCompletedBanners.compactMap { banner in
@@ -2127,7 +2210,8 @@ struct ContentView: View {
     private func displayIslandConversation(
         threadId: String,
         fallbackTitle: String? = nil,
-        state: String
+        state: String,
+        runningStartedAt: Date? = nil
     ) -> RemodexDisplayIslandConversation? {
         let thread = codex.threads.first { $0.id == threadId }
         let rawTitle = thread?.displayTitle ?? fallbackTitle ?? CodexThread.defaultDisplayTitle
@@ -2138,7 +2222,8 @@ struct ContentView: View {
             id: threadId,
             title: title.isEmpty ? CodexThread.defaultDisplayTitle : title,
             detail: detail,
-            state: state
+            state: state,
+            runningStartedAt: runningStartedAt
         )
     }
 
