@@ -356,7 +356,7 @@ private struct UIKitGitActionsMenuButton: UIViewRepresentable {
             // presentation. NOT related to totals loading.
             let action = UIAction(
                 title: plainChangesTitle(totals: totals),
-                image: RemodexIcon.menuUIImage(systemName: "doc.text.magnifyingglass"),
+                image: RemodexIcon.menuUIImage(systemName: "remodex.changes"),
                 attributes: snapshot.isLoadingRepoDiff ? .disabled : []
             ) { _ in
                 HapticFeedback.shared.triggerImpactFeedback(style: .light)

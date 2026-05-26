@@ -274,7 +274,19 @@ final class TurnViewModel {
         if gitRepoSync?.hasPushRemote != true || !(gitRepoSync?.isDirty == true || gitRepoSync?.canPush == true) {
             disabledActions.insert(.commitAndPush)
         }
+        if !canUpdateRepositoryFromRemote {
+            disabledActions.insert(.syncNow)
+        }
         return disabledActions
+    }
+    var canUpdateRepositoryFromRemote: Bool {
+        guard let repoSync = gitRepoSync, repoSync.isGitRepository else {
+            return false
+        }
+
+        // Normal Update is only for fast-forwardable remote work. Diverged branches
+        // stay disabled here so the user must choose an explicit rebase/merge path.
+        return ["behind_only", "dirty_and_behind"].contains(repoSync.state)
     }
     // Keeps PR creation tied to live Git state instead of chat-local remembered branch state.
     var createPullRequestValidationMessage: String? {
@@ -339,15 +351,17 @@ final class TurnViewModel {
         return dangerousStates.contains(sync.state) || (sync.isDirty && sync.state == "no_upstream")
     }
 
-    // Keeps git mutations scoped to an idle, explicitly bound local repo.
+    // Keeps git mutations scoped to an explicitly bound local repo. Repo-level
+    // write actions can opt out of the idle-turn gate; branch/worktree routing keeps it.
     func canRunGitAction(
         isConnected: Bool,
         isThreadRunning: Bool,
-        hasGitWorkingDirectory: Bool
+        hasGitWorkingDirectory: Bool,
+        requiresIdleThread: Bool = true
     ) -> Bool {
         isConnected
             && hasGitWorkingDirectory
-            && !isThreadRunning
+            && (!requiresIdleThread || !isThreadRunning)
             && !isRunningGitAction
             && !isSwitchingGitBranch
             && !isCreatingGitWorktree
@@ -366,6 +380,7 @@ final class TurnViewModel {
     @ObservationIgnored var pendingGitWorktreeOpenHandler: ((GitCreateWorktreeResult) -> Void)?
     @ObservationIgnored var pendingManagedGitWorktreeOpenHandler: ((GitCreateManagedWorktreeResult) -> Void)?
     @ObservationIgnored private var cachedSkillSearchIndexByRoot: [String: [TurnSkillSearchIndexEntry]] = [:]
+    @ObservationIgnored private var forceRefreshedSkillMissKeys: Set<String> = []
     @ObservationIgnored private var cachedPluginSearchIndexByRoot: [String: [TurnPluginSearchIndexEntry]] = [:]
     @ObservationIgnored var unsupportedSkillsAutocompleteRoots: Set<String> = []
     @ObservationIgnored var unsupportedPluginsAutocompleteRoots: Set<String> = []
@@ -829,7 +844,13 @@ final class TurnViewModel {
         isSkillAutocompleteLoading = !hasCachedSkillIndex && !rootIsUnsupported
         if let cachedIndex = cachedSkillSearchIndexByRoot[cacheKey] {
             skillAutocompleteItems = filteredSkillAutocompleteItems(for: query, indexedSkills: cachedIndex)
-            isSkillAutocompleteVisible = !skillAutocompleteItems.isEmpty
+            let shouldRefreshCachedMiss = shouldRefreshSkillAutocompleteMiss(
+                query: query,
+                cachedItems: skillAutocompleteItems,
+                cacheKey: cacheKey
+            )
+            isSkillAutocompleteLoading = shouldRefreshCachedMiss
+            isSkillAutocompleteVisible = !skillAutocompleteItems.isEmpty || shouldRefreshCachedMiss
         } else {
             skillAutocompleteItems = []
             isSkillAutocompleteVisible = isSkillAutocompleteLoading
@@ -861,7 +882,32 @@ final class TurnViewModel {
 
                 let indexedSkills: [TurnSkillSearchIndexEntry]
                 if let cachedIndex = self.cachedSkillSearchIndexByRoot[cacheKey] {
-                    indexedSkills = cachedIndex
+                    let cachedItems = self.filteredSkillAutocompleteItems(
+                        for: expectedQuery,
+                        indexedSkills: cachedIndex
+                    )
+                    if self.shouldRefreshSkillAutocompleteMiss(
+                        query: expectedQuery,
+                        cachedItems: cachedItems,
+                        cacheKey: cacheKey
+                    ) {
+                        let listedSkills = try await codex.listSkills(
+                            cwds: normalizedRoot.map { [$0] },
+                            forceReload: true
+                        )
+                        guard !Task.isCancelled else { return }
+                        indexedSkills = listedSkills
+                            .filter { $0.enabled }
+                            .map(TurnSkillSearchIndexEntry.init(skill:))
+                        self.cachedSkillSearchIndexByRoot[cacheKey] = indexedSkills
+                        self.rememberSkillAutocompleteMissRefresh(
+                            query: expectedQuery,
+                            cacheKey: cacheKey,
+                            indexedSkills: indexedSkills
+                        )
+                    } else {
+                        indexedSkills = cachedIndex
+                    }
                 } else {
                     let listedSkills = try await codex.listSkills(
                         cwds: normalizedRoot.map { [$0] },
@@ -872,6 +918,7 @@ final class TurnViewModel {
                         .filter { $0.enabled }
                         .map(TurnSkillSearchIndexEntry.init(skill:))
                     self.cachedSkillSearchIndexByRoot[cacheKey] = indexedSkills
+                    self.clearSkillAutocompleteMissRefreshes(cacheKey: cacheKey)
                 }
 
                 guard !Task.isCancelled else { return }
@@ -2366,16 +2413,70 @@ final class TurnViewModel {
             || message.contains("code -32601")
     }
 
-    // Filters pre-indexed skills using a single normalized search blob to reduce per-keystroke work.
+    // Filters pre-indexed skills while ranking name matches above description-only matches.
     private func filteredSkillAutocompleteItems(
         for query: String,
         indexedSkills: [TurnSkillSearchIndexEntry]
     ) -> [CodexSkillMetadata] {
-        let needle = query.lowercased()
-        let filtered = indexedSkills.lazy
-            .filter { needle.isEmpty || $0.searchBlob.contains(needle) }
-            .map(\.skill)
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            return Array(indexedSkills.lazy.map(\.skill).prefix(maxSkillAutocompleteItems))
+        }
+
+        let filtered = indexedSkills.enumerated().compactMap { offset, entry -> (Int, Int, CodexSkillMetadata)? in
+            guard let score = entry.matchScore(for: needle) else {
+                return nil
+            }
+            return (score, offset, entry.skill)
+        }
+            .sorted { lhs, rhs in
+                if lhs.0 != rhs.0 {
+                    return lhs.0 < rhs.0
+                }
+                return lhs.1 < rhs.1
+            }
+            .map { $0.2 }
         return Array(filtered.prefix(maxSkillAutocompleteItems))
+    }
+
+    private func shouldRefreshSkillAutocompleteMiss(
+        query: String,
+        cachedItems: [CodexSkillMetadata],
+        cacheKey: String
+    ) -> Bool {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty,
+              cachedItems.isEmpty,
+              !unsupportedSkillsAutocompleteRoots.contains(cacheKey),
+              !forceRefreshedSkillMissKeys.contains(skillAutocompleteMissRefreshKey(query: trimmedQuery, cacheKey: cacheKey)) else {
+            return false
+        }
+
+        return true
+    }
+
+    private func rememberSkillAutocompleteMissRefresh(
+        query: String,
+        cacheKey: String,
+        indexedSkills: [TurnSkillSearchIndexEntry]
+    ) {
+        let refreshedItems = filteredSkillAutocompleteItems(for: query, indexedSkills: indexedSkills)
+        let refreshKey = skillAutocompleteMissRefreshKey(query: query, cacheKey: cacheKey)
+        if refreshedItems.isEmpty {
+            forceRefreshedSkillMissKeys.insert(refreshKey)
+        } else {
+            forceRefreshedSkillMissKeys.remove(refreshKey)
+        }
+    }
+
+    private func clearSkillAutocompleteMissRefreshes(cacheKey: String) {
+        let prefix = "\(cacheKey)\u{0}"
+        forceRefreshedSkillMissKeys = Set(forceRefreshedSkillMissKeys.filter { !$0.hasPrefix(prefix) })
+    }
+
+    private func skillAutocompleteMissRefreshKey(query: String, cacheKey: String) -> String {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(cacheKey)\u{0}\(normalizedQuery)"
     }
 
     private func filteredPluginAutocompleteItems(
@@ -2814,12 +2915,10 @@ final class TurnViewModel {
                         if let status = pullResult.status {
                             applyGitRepoSync(status)
                         }
-                    } else if result.state == "diverged" || result.state == "dirty_and_behind" {
+                    } else if result.state == "dirty_and_behind" {
                         gitSyncAlert = TurnGitSyncAlert(
-                            title: result.state == "diverged" ? "Branch diverged from remote" : "Local changes need attention",
-                            message: result.state == "diverged"
-                                ? "Local and remote history both moved. Pull with rebase to reconcile them?"
-                                : "You have local changes and the remote branch moved ahead. Pull with rebase only if you're ready to reconcile those changes.",
+                            title: "Local changes need attention",
+                            message: "You have local changes and the remote branch moved ahead. Pull with rebase only if you're ready to reconcile those changes.",
                             action: .pullRebase
                         )
                     }
@@ -3224,18 +3323,34 @@ private struct TurnTrailingToken: Equatable {
 
 private struct TurnSkillSearchIndexEntry: Equatable {
     let skill: CodexSkillMetadata
-    let searchBlob: String
+    let name: String
+    let displayName: String
+    let description: String
 
     init(skill: CodexSkillMetadata) {
         self.skill = skill
-        let name = skill.name.lowercased()
-        let displayName = SkillDisplayNameFormatter.displayName(for: skill.name).lowercased()
-        let description = skill.description?.lowercased() ?? ""
-        if description.isEmpty {
-            self.searchBlob = "\(name)\n\(displayName)"
-        } else {
-            self.searchBlob = "\(name)\n\(displayName)\n\(description)"
+        self.name = skill.name.lowercased()
+        self.displayName = SkillDisplayNameFormatter.displayName(for: skill.name).lowercased()
+        self.description = skill.description?.lowercased() ?? ""
+    }
+
+    func matchScore(for needle: String) -> Int? {
+        if name == needle || displayName == needle {
+            return 0
         }
+        if name.hasPrefix(needle) || displayName.hasPrefix(needle) {
+            return 1
+        }
+        if name.contains(needle) || displayName.contains(needle) {
+            return 2
+        }
+        if description.hasPrefix(needle) {
+            return 3
+        }
+        if description.contains(needle) {
+            return 4
+        }
+        return nil
     }
 }
 

@@ -1,5 +1,5 @@
 // FILE: TerminalOptionsMenu.swift
-// Purpose: Encapsulates terminal status, session, font-size, and connection actions.
+// Purpose: Encapsulates terminal status, clipboard, session, font-size, and connection actions.
 // Layer: View Component
 // Exports: TerminalOptionsMenu
 // Depends on: SwiftUI, TerminalUIModels
@@ -16,12 +16,14 @@ struct TerminalOptionsMenu: View {
     let activeTerminalId: String
     let isRunning: Bool
     let hasConnectionConfiguration: Bool
+    let canPaste: Bool
     let canClear: Bool
     let canResetKnownHost: Bool
     let onSelectSession: (String) -> Void
     let onOpenNewTerminal: () -> Void
     let onToggleConnection: () -> Void
     let onOpenConnectionEditor: () -> Void
+    let onPaste: () -> Void
     let onClear: () -> Void
     let onResetKnownHost: () -> Void
     let onAdjustFontSize: (Double) -> Void
@@ -31,6 +33,7 @@ struct TerminalOptionsMenu: View {
             statusSection
             textSizeSection
             sessionSection
+            clipboardSection
             connectionSection
         } label: {
             // No fixed frame / background — the icon sits in the toolbar like
@@ -93,6 +96,15 @@ struct TerminalOptionsMenu: View {
             Button(action: onOpenNewTerminal) {
                 Label("Open new terminal", systemImage: "plus")
             }
+        }
+    }
+
+    private var clipboardSection: some View {
+        Section {
+            Button(action: onPaste) {
+                RemodexIcon.menuLabel("Paste", systemName: "doc.on.clipboard")
+            }
+            .disabled(!canPaste)
         }
     }
 

@@ -18,7 +18,7 @@ struct TurnComposerInputTextView: UIViewRepresentable {
     let onPasteImageData: ([Data]) -> Void
 
     private let minVisibleLines: CGFloat = 1
-    private let maxVisibleLines: CGFloat = 5
+    private let maxVisibleLines: CGFloat = 8
     func makeUIView(context: Context) -> TurnComposerPasteInterceptingTextView {
         let textView = TurnComposerPasteInterceptingTextView(frame: .zero, textContainer: nil)
         textView.delegate = context.coordinator
@@ -183,15 +183,19 @@ struct TurnComposerInputTextView: UIViewRepresentable {
         // Prevents SwiftUI re-renders from writing an older binding value over
         // fresh UIKit edits while the deferred binding update is still queued.
         fileprivate func shouldApplyBindingText(_ bindingText: String, to textView: UITextView) -> Bool {
+            if hasActiveMarkedText(in: textView) {
+                return shouldApplyBindingTextDuringPendingEdit(bindingText, textViewText: textView.text ?? "")
+            }
+
             guard
                 textView.isFirstResponder,
                 let pendingUIKitText,
-                textView.text == pendingUIKitText,
-                bindingText == staleBindingTextDuringPendingEdit
+                textView.text == pendingUIKitText
             else {
                 return true
             }
-            return false
+
+            return shouldApplyBindingTextDuringPendingEdit(bindingText, textViewText: pendingUIKitText)
         }
 
         fileprivate func noteAppliedBindingText(_ bindingText: String) {
@@ -200,6 +204,34 @@ struct TurnComposerInputTextView: UIViewRepresentable {
                 pendingUIKitText = nil
                 staleBindingTextDuringPendingEdit = nil
             }
+        }
+
+        // Allows explicit external updates, such as Send clearing the composer,
+        // while still ignoring SwiftUI's stale echo of the previous binding.
+        private func shouldApplyBindingTextDuringPendingEdit(_ bindingText: String, textViewText: String) -> Bool {
+            guard let pendingUIKitText else {
+                return bindingText == textViewText
+            }
+
+            if bindingText == pendingUIKitText {
+                return true
+            }
+            if bindingText == staleBindingTextDuringPendingEdit {
+                return false
+            }
+
+            self.pendingUIKitText = nil
+            self.staleBindingTextDuringPendingEdit = nil
+            return true
+        }
+
+        // iOS keeps predictive/autocorrect composition in marked text; external
+        // writes during that window can duplicate characters or move the caret.
+        private func hasActiveMarkedText(in textView: UITextView) -> Bool {
+            guard let markedRange = textView.markedTextRange else {
+                return false
+            }
+            return !markedRange.isEmpty
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {

@@ -120,12 +120,10 @@ private struct SettingsCommandReferenceRow: View {
                 copyCommand()
             } label: {
                 RemodexIcon.image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                    .font(AppFont.caption(weight: .semibold))
-                    .frame(width: 32, height: 32)
-                    .background(
-                        Circle()
-                            .fill(Color.primary.opacity(0.07))
-                    )
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(didCopy ? Color.green : Color.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(didCopy ? "Copied \(command.command)" : "Copy \(command.command)")

@@ -76,6 +76,10 @@ struct TurnView: View {
         let isRootlessChat = SidebarThreadGrouping.isRootlessChatThread(resolvedThread)
         let gitWorkingDirectory = isRootlessChat ? nil : resolvedThread.gitWorkingDirectory
         let isThreadRunning = renderSnapshot.isThreadRunning
+        let showsGitControls = repoGitControlsVisible(
+            for: resolvedThread,
+            gitWorkingDirectory: gitWorkingDirectory
+        )
         let isEmptyThread = renderSnapshot.messages.isEmpty
         let threadDisplayPhase = codex.threadDisplayPhase(
             threadId: thread.id,
@@ -85,7 +89,6 @@ struct TurnView: View {
         // Keep the service-owned loading vs empty-state decision intact while
         // history hydration catches up for previously active conversations.
         let resolvedEmptyConversationState = resolvedEmptyState(for: threadDisplayPhase)
-        let showsGitControls = codex.isConnected && gitWorkingDirectory != nil
         let isWorktreeProject = resolvedThread.isManagedWorktreeProject
         let isComposerAutocompletePresented = viewModel.isFileAutocompleteVisible
             || viewModel.isSkillAutocompleteVisible
@@ -108,7 +111,8 @@ struct TurnView: View {
         let toolbarWorktreeHandoffTitle = isWorktreeProject ? "Hand off to Local" : "Hand off to Worktree"
         let isGitActionEnabled = viewModel.gitRepoSync != nil && canRunGitAction(
             isThreadRunning: isThreadRunning,
-            gitWorkingDirectory: gitWorkingDirectory
+            gitWorkingDirectory: gitWorkingDirectory,
+            requiresIdleThread: false
         )
         let disabledGitActions: Set<TurnGitActionKind> = viewModel.disabledGitActions
         let onTapMacHandoff: (() -> Void)? = codex.isConnected && codex.supportsDesktopAppHandoff ? {
@@ -348,7 +352,10 @@ struct TurnView: View {
             approvalRequestChangeToken: approvalRequestChangeToken,
             photoPickerItems: viewModel.photoPickerItems,
             onTask: {
-                await prepareThreadIfReady(gitWorkingDirectory: gitWorkingDirectory)
+                await prepareThreadIfReady(
+                    gitWorkingDirectory: gitWorkingDirectory,
+                    showsGitControls: showsGitControls
+                )
             },
             onInitialAppear: {
                 handleInitialAppear(activeTurnID: activeTurnID)
@@ -428,6 +435,17 @@ struct TurnView: View {
             // to avoid AttributeGraph cycles during send.
             DispatchQueue.main.async {
                 viewModel.clearComposerAutocomplete()
+            }
+        }
+        .onChange(of: showsGitControls) { _, isVisible in
+            guard isVisible else { return }
+            // A repo-bound thread can become actionable after connection/project metadata settles.
+            DispatchQueue.main.async { [viewModel] in
+                viewModel.refreshGitBranchTargets(
+                    codex: codex,
+                    workingDirectory: gitWorkingDirectory,
+                    threadID: thread.id
+                )
             }
         }
         .onChange(of: renderSnapshot.repoRefreshSignal) { _, newValue in
@@ -781,6 +799,12 @@ struct TurnView: View {
             activeTurnID: activeTurnID,
             isThreadRunning: renderSnapshot.isThreadRunning
         )
+        let currentThread = currentResolvedThread
+        let gitWorkingDirectory = currentThread.gitWorkingDirectory
+        let showsGitControls = repoGitControlsVisible(
+            for: currentThread,
+            gitWorkingDirectory: gitWorkingDirectory
+        )
 
         if let request = message.structuredUserInputRequest {
             let isDismissed = viewModel.isStructuredPlanPromptDismissed(request.requestID, codex: codex)
@@ -801,26 +825,26 @@ struct TurnView: View {
                 .padding(.top, 4)
             } else {
                 composerWithSubagentAccessory(
-                    currentThread: currentResolvedThread,
+                    currentThread: currentThread,
                     activeTurnID: activeTurnID,
                     isThreadRunning: renderSnapshot.isThreadRunning,
                     isEmptyThread: renderSnapshot.messages.isEmpty,
-                    isWorktreeProject: currentResolvedThread.isManagedWorktreeProject,
+                    isWorktreeProject: currentThread.isManagedWorktreeProject,
                     activeFileChangeStatus: activeFileChangeStatus,
-                    showsGitControls: codex.isConnected && currentResolvedThread.gitWorkingDirectory != nil,
-                    gitWorkingDirectory: currentResolvedThread.gitWorkingDirectory
+                    showsGitControls: showsGitControls,
+                    gitWorkingDirectory: gitWorkingDirectory
                 )
             }
         } else {
             composerWithSubagentAccessory(
-                currentThread: currentResolvedThread,
+                currentThread: currentThread,
                 activeTurnID: activeTurnID,
                 isThreadRunning: renderSnapshot.isThreadRunning,
                 isEmptyThread: renderSnapshot.messages.isEmpty,
-                isWorktreeProject: currentResolvedThread.isManagedWorktreeProject,
+                isWorktreeProject: currentThread.isManagedWorktreeProject,
                 activeFileChangeStatus: activeFileChangeStatus,
-                showsGitControls: codex.isConnected && currentResolvedThread.gitWorkingDirectory != nil,
-                gitWorkingDirectory: currentResolvedThread.gitWorkingDirectory
+                showsGitControls: showsGitControls,
+                gitWorkingDirectory: gitWorkingDirectory
             )
         }
     }
@@ -830,7 +854,11 @@ struct TurnView: View {
         isThreadRunning: Bool,
         gitWorkingDirectory: String?
     ) {
-        guard canRunGitAction(isThreadRunning: isThreadRunning, gitWorkingDirectory: gitWorkingDirectory) else { return }
+        guard canRunGitAction(
+            isThreadRunning: isThreadRunning,
+            gitWorkingDirectory: gitWorkingDirectory,
+            requiresIdleThread: false
+        ) else { return }
         viewModel.triggerGitAction(
             action,
             codex: codex,
@@ -840,17 +868,34 @@ struct TurnView: View {
         )
     }
 
-    private func canRunGitAction(isThreadRunning: Bool, gitWorkingDirectory: String?) -> Bool {
+    private func canRunGitAction(
+        isThreadRunning: Bool,
+        gitWorkingDirectory: String?,
+        requiresIdleThread: Bool = true
+    ) -> Bool {
         viewModel.canRunGitAction(
             isConnected: codex.isConnected,
             isThreadRunning: isThreadRunning,
-            hasGitWorkingDirectory: gitWorkingDirectory != nil
+            hasGitWorkingDirectory: gitWorkingDirectory != nil,
+            requiresIdleThread: requiresIdleThread
         )
     }
 
     // Re-resolves the active thread so handoff/reconnect UI always uses the freshest cwd + title.
     private var currentResolvedThread: CodexThread {
         codex.thread(for: thread.id) ?? thread
+    }
+
+    // Keep top-bar Git visibility tied to the active repo, not to background thread-list refreshes.
+    private func repoGitControlsVisible(
+        for resolvedThread: CodexThread,
+        gitWorkingDirectory: String?
+    ) -> Bool {
+        CodexThread.gitControlsVisible(
+            for: resolvedThread,
+            workingDirectory: gitWorkingDirectory,
+            isConnected: codex.isConnected
+        )
     }
 
     // Reuses the same running-thread gate as Stop/Git actions so worktree handoff never races a live run.
@@ -1053,14 +1098,17 @@ struct TurnView: View {
         }
     }
 
-    private func prepareThreadIfReady(gitWorkingDirectory: String?) async {
+    private func prepareThreadIfReady(
+        gitWorkingDirectory: String?,
+        showsGitControls: Bool
+    ) async {
         let didPrepare = await codex.prepareThreadForDisplay(threadId: thread.id)
         guard didPrepare, !Task.isCancelled, codex.activeThreadId == thread.id else { return }
         await codex.refreshContextWindowUsage(threadId: thread.id)
         guard !Task.isCancelled, codex.activeThreadId == thread.id else { return }
         viewModel.flushQueueIfPossible(codex: codex, threadID: thread.id)
         guard !Task.isCancelled, codex.activeThreadId == thread.id else { return }
-        guard gitWorkingDirectory != nil else { return }
+        guard showsGitControls else { return }
         viewModel.refreshGitBranchTargets(
             codex: codex,
             workingDirectory: gitWorkingDirectory,
@@ -1378,7 +1426,7 @@ struct TurnView: View {
                 isEmptyThread: isEmptyThread,
                 isWorktreeProject: isWorktreeProject,
                 activeFileChangeStatus: activeFileChangeStatus,
-                canForkLocally: gitWorkingDirectory != nil && WorktreeFlowCoordinator.localForkProjectPath(
+                canForkLocally: showsGitControls && gitWorkingDirectory != nil && WorktreeFlowCoordinator.localForkProjectPath(
                     for: currentThread,
                     localCheckoutPath: viewModel.gitLocalCheckoutPath
                 ) != nil,

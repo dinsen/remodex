@@ -732,7 +732,21 @@ extension CodexService {
             throw CodexServiceError.invalidResponse("skills/list response missing result.data[].skills")
         }
 
-        let dedupedByName = Dictionary(grouping: decodedSkills) { $0.normalizedName }
+        var allSkills = decodedSkills
+        if !normalizedCwds.isEmpty {
+            var globalParams: RPCObject = [:]
+            if forceReload {
+                globalParams["forceReload"] = .bool(true)
+            }
+            // Some runtimes return only cwd-scoped skills when `cwds` is present; merge the
+            // global list so personal skills remain discoverable from project threads.
+            if let globalResponse = try? await sendRequest(method: "skills/list", params: .object(globalParams)),
+               let globalSkills = decodeSkillMetadata(from: globalResponse.result) {
+                allSkills.append(contentsOf: globalSkills)
+            }
+        }
+
+        let dedupedByName = Dictionary(grouping: allSkills) { $0.normalizedName }
             .compactMap { _, bucket -> CodexSkillMetadata? in
                 bucket.first(where: { $0.enabled }) ?? bucket.first
             }
