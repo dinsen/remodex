@@ -661,6 +661,39 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(completedSnapshot.completedConversations.map(\.id), [threadID])
     }
 
+    func testDisplayIslandDoesNotMarkActiveRunReadyAfterCompletion() {
+        let service = makeService()
+        let coordinator = RemodexDisplayIslandCoordinator()
+        let threadID = "thread-\(UUID().uuidString)"
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        service.threads = [
+            CodexThread(id: threadID, title: "Active chat", cwd: "/tmp/remodex"),
+        ]
+        service.activeThreadId = threadID
+        service.runningThreadIDs.insert(threadID)
+
+        let runningSnapshot = coordinator.makeReconciledSnapshot(codex: service, now: startedAt)
+        XCTAssertEqual(runningSnapshot.runningConversations.map(\.id), [threadID])
+
+        service.runningThreadIDs.remove(threadID)
+        service.latestTurnTerminalStateByThread[threadID] = .completed
+        let activeCompletedSnapshot = coordinator.makeReconciledSnapshot(
+            codex: service,
+            now: startedAt.addingTimeInterval(1)
+        )
+
+        XCTAssertTrue(activeCompletedSnapshot.runningConversations.isEmpty)
+        XCTAssertTrue(activeCompletedSnapshot.completedConversations.isEmpty)
+        XCTAssertTrue(activeCompletedSnapshot.failedConversations.isEmpty)
+
+        service.activeThreadId = nil
+        let laterInactiveSnapshot = coordinator.makeReconciledSnapshot(
+            codex: service,
+            now: startedAt.addingTimeInterval(2)
+        )
+        XCTAssertTrue(laterInactiveSnapshot.completedConversations.isEmpty)
+    }
+
     func testThreadHasActiveOrRunningTurnUsesRunningFallback() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"

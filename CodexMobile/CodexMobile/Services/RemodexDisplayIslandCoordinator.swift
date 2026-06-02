@@ -108,9 +108,13 @@ final class RemodexDisplayIslandCoordinator {
 
         let currentRunningIDs = currentRunningThreadIDs(codex: codex)
         let visibleThreadIDs = visibleThreadIDs(codex: codex)
-        let completedIDs = lastRunningThreadIDs
-            .intersection(visibleThreadIDs)
+        let activeThreadIDs = currentActiveThreadIDs(codex: codex)
+        // The active chat is already visible in-app, so only off-screen outcomes should become Island badges.
+        let outcomeEligibleThreadIDs = visibleThreadIDs
             .subtracting(currentRunningIDs)
+            .subtracting(activeThreadIDs)
+        let completedIDs = lastRunningThreadIDs
+            .intersection(outcomeEligibleThreadIDs)
         let terminalStates = codex.latestTurnTerminalStateByThread
 
         for threadId in currentRunningIDs where runningStartedAtByThread[threadId] == nil {
@@ -126,7 +130,13 @@ final class RemodexDisplayIslandCoordinator {
             now: now
         )
 
-        pruneOutcomes(codex: codex, currentRunningIDs: currentRunningIDs, visibleThreadIDs: visibleThreadIDs, now: now)
+        pruneOutcomes(
+            codex: codex,
+            currentRunningIDs: currentRunningIDs,
+            activeThreadIDs: activeThreadIDs,
+            visibleThreadIDs: visibleThreadIDs,
+            now: now
+        )
 
         for threadId in completedIDs {
             let terminalState = codex.latestTurnTerminalState(for: threadId)
@@ -141,7 +151,7 @@ final class RemodexDisplayIslandCoordinator {
         }
 
         let visibleTerminalStates = terminalStates.filter { threadId, _ in
-            visibleThreadIDs.contains(threadId) && !currentRunningIDs.contains(threadId)
+            outcomeEligibleThreadIDs.contains(threadId)
         }
         for (threadId, terminalState) in visibleTerminalStates {
             guard lastTerminalStatesByThread[threadId] != terminalState else {
@@ -167,12 +177,14 @@ final class RemodexDisplayIslandCoordinator {
     private func pruneOutcomes(
         codex: CodexService,
         currentRunningIDs: Set<String>,
+        activeThreadIDs: Set<String>,
         visibleThreadIDs: Set<String>,
         now: Date
     ) {
         completedOutcomes.removeAll { outcome in
             !visibleThreadIDs.contains(outcome.threadId)
                 || currentRunningIDs.contains(outcome.threadId)
+                || activeThreadIDs.contains(outcome.threadId)
                 || codex.latestTurnTerminalState(for: outcome.threadId) == .failed
                 || codex.latestTurnTerminalState(for: outcome.threadId) == .stopped
                 || now.timeIntervalSince(outcome.createdAt) >= Self.completedLifetime
@@ -180,6 +192,7 @@ final class RemodexDisplayIslandCoordinator {
         failedOutcomes.removeAll { outcome in
             !visibleThreadIDs.contains(outcome.threadId)
                 || currentRunningIDs.contains(outcome.threadId)
+                || activeThreadIDs.contains(outcome.threadId)
                 || codex.latestTurnTerminalState(for: outcome.threadId) == .completed
                 || codex.latestTurnTerminalState(for: outcome.threadId) == .stopped
                 || now.timeIntervalSince(outcome.createdAt) >= Self.failedLifetime
@@ -289,6 +302,15 @@ final class RemodexDisplayIslandCoordinator {
 
     private func visibleThreadIDs(codex: CodexService) -> Set<String> {
         Set(codex.threads.map(\.id))
+    }
+
+    private func currentActiveThreadIDs(codex: CodexService) -> Set<String> {
+        guard let activeThreadId = codex.activeThreadId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !activeThreadId.isEmpty else {
+            return []
+        }
+
+        return [activeThreadId]
     }
 
     private func runningState(for threadId: String, codex: CodexService) -> String {
