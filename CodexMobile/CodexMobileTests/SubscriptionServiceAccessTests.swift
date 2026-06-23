@@ -9,26 +9,27 @@ import XCTest
 
 @MainActor
 final class SubscriptionServiceAccessTests: XCTestCase {
-    func testFreshFreeUserStartsWithFiveAttempts() {
+    func testFreshInstallStartsWithLocalProAccess() {
         let service = makeService()
 
+        XCTAssertTrue(service.hasProAccess)
+        XCTAssertTrue(service.hasAppAccess)
         XCTAssertEqual(service.freeSendCount, 0)
         XCTAssertEqual(service.remainingFreeSendAttempts, 5)
         XCTAssertTrue(service.hasFreeSendAccess)
-        XCTAssertTrue(service.hasAppAccess)
     }
 
-    func testFreeSendAttemptsStopAtLimit() {
+    func testFreeSendAttemptsAreNotConsumedWhenLocalProAccessIsGranted() {
         let service = makeService()
 
         for _ in 0..<7 {
             service.consumeFreeSendAttemptIfNeeded()
         }
 
-        XCTAssertEqual(service.freeSendCount, 5)
-        XCTAssertEqual(service.remainingFreeSendAttempts, 0)
-        XCTAssertFalse(service.hasFreeSendAccess)
-        XCTAssertFalse(service.hasAppAccess)
+        XCTAssertEqual(service.freeSendCount, 0)
+        XCTAssertEqual(service.remainingFreeSendAttempts, 5)
+        XCTAssertTrue(service.hasFreeSendAccess)
+        XCTAssertTrue(service.hasAppAccess)
     }
 
     private func makeService() -> SubscriptionService {

@@ -80,17 +80,18 @@ final class SubscriptionService {
     private static let cachedStateDefaultsKey = "codex.subscription.cachedState"
     private static let freeSendCountDefaultsKey = "codex.subscription.freeSendCount"
     private static let freeSendLimit = 5
+    private static let grantsLocalProAccess = true
 
     private let defaults: UserDefaults
     @ObservationIgnored private let customerInfoUpdatesTaskStore = CustomerInfoUpdatesTaskStore()
     private var isBootstrapping = false
-    private var hasCachedOptimisticAccess = false
+    private var hasCachedOptimisticAccess = grantsLocalProAccess
 
     private(set) var bootstrapState: SubscriptionBootstrapState = .idle
     private(set) var customerInfo: CustomerInfo?
     private(set) var currentOffering: Offering?
     private(set) var packageOptions: [SubscriptionPackageOption] = []
-    private(set) var hasProAccess = false
+    private(set) var hasProAccess = grantsLocalProAccess
     private(set) var freeSendCount = 0
     private(set) var latestPurchaseDate: Date?
     private(set) var willRenew = false
@@ -328,7 +329,7 @@ private extension SubscriptionService {
     func applyCustomerInfo(_ info: CustomerInfo) {
         customerInfo = info
         let entitlement = info.entitlements.all[AppEnvironment.revenueCatEntitlementName]
-        hasProAccess = entitlement?.isActive == true
+        hasProAccess = Self.grantsLocalProAccess || entitlement?.isActive == true
         hasCachedOptimisticAccess = hasProAccess
         latestPurchaseDate = entitlement?.latestPurchaseDate
         willRenew = entitlement?.willRenew == true
@@ -345,12 +346,12 @@ private extension SubscriptionService {
             return
         }
 
-        hasProAccess = cachedState.hasProAccess
-        hasCachedOptimisticAccess = cachedState.hasProAccess
+        hasProAccess = Self.grantsLocalProAccess || cachedState.hasProAccess
+        hasCachedOptimisticAccess = hasProAccess
         latestPurchaseDate = cachedState.latestPurchaseDate
         willRenew = cachedState.willRenew
         managementURL = cachedState.managementURLString.flatMap(URL.init(string:))
-        bootstrapState = cachedState.hasProAccess ? .ready : .idle
+        bootstrapState = hasProAccess ? .ready : .idle
     }
 
     func persistCachedState() {
