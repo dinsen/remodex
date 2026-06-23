@@ -49,6 +49,9 @@ struct SettingsSubscriptionCard: View {
             }
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             guard subscriptions.bootstrapState == .idle else {
                 return
             }

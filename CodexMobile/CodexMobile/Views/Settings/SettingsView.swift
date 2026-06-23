@@ -43,6 +43,19 @@ private enum SettingsActivePresentation: Equatable {
     case offerCodeRedemption
 }
 
+enum SettingsPresentationRefreshPolicy {
+    static let automaticRefreshDelay: Duration = .milliseconds(350)
+
+    static func waitForInitialPresentationSettle() async -> Bool {
+        do {
+            try await Task.sleep(for: automaticRefreshDelay)
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
+}
+
 struct SettingsView: View {
     @Environment(CodexService.self) private var codex
     @Environment(SubscriptionService.self) private var subscriptions
@@ -245,6 +258,9 @@ private struct SettingsUsageCard: View {
             )
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await refreshStatusIfNeeded()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -593,6 +609,9 @@ private struct SettingsPetCompanionSection: View {
             guard codex.isConnected, petStore.isEnabled else {
                 return
             }
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await petStore.loadPetsIfNeeded(codex: codex)
             await petStore.loadSelectedPet(codex: codex)
         }
@@ -657,6 +676,9 @@ private struct SettingsNotificationsCard: View {
             }
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await codex.refreshManagedNotificationRegistrationState()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -762,6 +784,9 @@ private struct SettingsBridgeVersionCard: View {
             }
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await codex.refreshBridgeVersionState()
         }
         .onChange(of: scenePhase) { _, phase in
