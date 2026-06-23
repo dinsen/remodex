@@ -15,6 +15,7 @@ const DEFAULT_DIRECTORY_SEARCH_MAX_DEPTH = 8;
 const DEFAULT_DIRECTORY_SEARCH_MAX_VISITED = 5000;
 const DEFAULT_HIDDEN_DIRECTORY_NAMES = new Set(["Library"]);
 const CONFIG_TOML_FILE = "config.toml";
+const CODEX_GLOBAL_STATE_FILE = ".codex-global-state.json";
 
 // Rootless chat slug rules mirror Codex Desktop's `~/Documents/Codex/<DATE>/<slug>`
 // convention so iOS-created Quick Chats land in the same bucket Desktop classifies
@@ -129,7 +130,11 @@ async function projectConfiguredProjects(options = {}) {
   }
 
   const configuredPaths = parseTrustedProjectPathsFromConfig(configBody);
-  const projects = await configuredProjectEntries(configuredPaths, options);
+  const desktopWorkspaceRootOrder = await readDesktopWorkspaceRootOrder(codexHome, options);
+  const projects = orderConfiguredProjectEntries(
+    await configuredProjectEntries(configuredPaths, options),
+    desktopWorkspaceRootOrder
+  );
   return {
     configPath,
     projects,
@@ -188,6 +193,63 @@ async function configuredProjectEntries(configuredPaths, options = {}) {
   }
 
   return projects;
+}
+
+async function readDesktopWorkspaceRootOrder(codexHome, options = {}) {
+  const globalStatePath = path.resolve(
+    readString(options.globalStatePath) || path.join(codexHome, CODEX_GLOBAL_STATE_FILE)
+  );
+  let parsed;
+  try {
+    parsed = JSON.parse(await fs.promises.readFile(globalStatePath, "utf8"));
+  } catch {
+    return [];
+  }
+
+  const roots = Array.isArray(parsed?.["electron-saved-workspace-roots"])
+    ? parsed["electron-saved-workspace-roots"]
+    : [];
+  return roots
+    .map((rootPath) => canonicalProjectOrderPath(rootPath))
+    .filter(Boolean);
+}
+
+function orderConfiguredProjectEntries(projects, desktopWorkspaceRootOrder) {
+  if (!Array.isArray(desktopWorkspaceRootOrder) || desktopWorkspaceRootOrder.length === 0) {
+    return projects;
+  }
+
+  const rankByPath = new Map();
+  for (const [index, rootPath] of desktopWorkspaceRootOrder.entries()) {
+    if (!rankByPath.has(rootPath)) {
+      rankByPath.set(rootPath, index);
+    }
+  }
+
+  return projects
+    .map((project, configIndex) => ({ project, configIndex, rank: rankByPath.get(project.path) }))
+    .sort((left, right) => {
+      const leftHasRank = Number.isInteger(left.rank);
+      const rightHasRank = Number.isInteger(right.rank);
+      if (leftHasRank && rightHasRank && left.rank !== right.rank) {
+        return left.rank - right.rank;
+      }
+      if (leftHasRank !== rightHasRank) {
+        return leftHasRank ? -1 : 1;
+      }
+      return left.configIndex - right.configIndex;
+    })
+    .map((entry) => entry.project);
+}
+
+function canonicalProjectOrderPath(projectPath) {
+  const normalizedPath = readString(projectPath);
+  if (!normalizedPath) {
+    return "";
+  }
+
+  const resolvedPath = path.resolve(normalizedPath);
+  return realpathSyncIfAvailable(resolvedPath) || resolvedPath;
 }
 
 function parseTrustedProjectPathsFromConfig(configBody) {

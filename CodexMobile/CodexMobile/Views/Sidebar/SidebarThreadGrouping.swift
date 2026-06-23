@@ -72,6 +72,7 @@ struct SidebarThreadGroup: Identifiable {
     let sortDate: Date
     let projectPath: String?
     let threads: [CodexThread]
+    var includesDescendantProjectPaths = false
 
     var iconSystemName: String {
         switch kind {
@@ -208,7 +209,7 @@ enum SidebarThreadGrouping {
 
         return sortThreadsByRecentActivity(
             threads.filter { thread in
-                thread.syncState != .archivedLocal && projectGroupID(for: thread) == group.id
+                thread.syncState != .archivedLocal && threadBelongsToProjectGroup(thread, group)
             }
         ).map(\.id)
     }
@@ -221,7 +222,7 @@ enum SidebarThreadGrouping {
 
         return sortThreadsByRecentActivity(
             threads.filter { thread in
-                projectGroupID(for: thread) == group.id
+                threadBelongsToProjectGroup(thread, group)
             }
         ).map(\.id)
     }
@@ -237,6 +238,25 @@ enum SidebarThreadGrouping {
             sortDate: sortDate,
             projectPath: representativeThread?.normalizedProjectPath,
             threads: sortedThreads
+        )
+    }
+
+    private static func makeConfiguredProjectGroup(
+        projectPath: String,
+        label: String,
+        sortDate: Date,
+        threads: [CodexThread]
+    ) -> SidebarThreadGroup {
+        let sortedThreads = sortThreadsByRecentActivity(threads)
+        let latestThread = sortedThreads.first
+        return SidebarThreadGroup(
+            id: projectGroupID(forProjectPath: projectPath),
+            label: configuredProjectLabel(label, projectPath: projectPath),
+            kind: .project,
+            sortDate: latestThread?.updatedAt ?? latestThread?.createdAt ?? sortDate,
+            projectPath: projectPath,
+            threads: sortedThreads,
+            includesDescendantProjectPaths: true
         )
     }
 
@@ -360,22 +380,45 @@ enum SidebarThreadGrouping {
         configuredProjectChoices: [SidebarProjectChoice] = []
     ) -> [SidebarThreadGroup] {
         var liveThreadsByProject: [String: [CodexThread]] = [:]
-        let configuredProjectPaths = normalizedConfiguredProjectPaths(configuredProjectChoices)
+        let configuredProjectScopes = normalizedConfiguredProjectScopes(configuredProjectChoices)
 
         for thread in threads where thread.syncState != .archivedLocal {
             guard !pinnedThreadIDs.contains(thread.id) else {
                 continue
             }
-            if projectSource == .configuredProjects && !configuredProjectPaths.contains(thread.projectKey) {
-                continue
+            if projectSource == .configuredProjects {
+                guard let configuredProjectScope = configuredProjectScope(
+                    containing: thread.projectKey,
+                    scopes: configuredProjectScopes
+                ) else {
+                    continue
+                }
+                liveThreadsByProject[configuredProjectScope.projectPath, default: []].append(thread)
+            } else {
+                liveThreadsByProject[thread.projectKey, default: []].append(thread)
             }
-            liveThreadsByProject[thread.projectKey, default: []].append(thread)
         }
 
-        var groupsByID = Dictionary(uniqueKeysWithValues: liveThreadsByProject.map { projectKey, projectThreads in
-            let group = makeProjectGroup(projectKey: projectKey, threads: projectThreads)
-            return (group.id, group)
-        })
+        var groupsByID: [String: SidebarThreadGroup]
+        if projectSource == .configuredProjects {
+            groupsByID = Dictionary(uniqueKeysWithValues: configuredProjectScopes.compactMap { scope in
+                guard let projectThreads = liveThreadsByProject[scope.projectPath] else {
+                    return nil
+                }
+                let group = makeConfiguredProjectGroup(
+                    projectPath: scope.projectPath,
+                    label: scope.choice.label,
+                    sortDate: scope.choice.sortDate,
+                    threads: projectThreads
+                )
+                return (group.id, group)
+            })
+        } else {
+            groupsByID = Dictionary(uniqueKeysWithValues: liveThreadsByProject.map { projectKey, projectThreads in
+                let group = makeProjectGroup(projectKey: projectKey, threads: projectThreads)
+                return (group.id, group)
+            })
+        }
 
         if projectSource == .configuredProjects {
             for choice in configuredProjectChoices {
@@ -393,26 +436,116 @@ enum SidebarThreadGrouping {
                     kind: .project,
                     sortDate: choice.sortDate,
                     projectPath: projectPath,
-                    threads: []
+                    threads: [],
+                    includesDescendantProjectPaths: true
                 )
             }
         }
 
+        if projectSource == .configuredProjects {
+            let configuredOrderByGroupID = Dictionary(uniqueKeysWithValues: configuredProjectScopes.map {
+                (projectGroupID(forProjectPath: $0.projectPath), $0.order)
+            })
+            return groupsByID.values.sorted { lhs, rhs in
+                let lhsOrder = configuredOrderByGroupID[lhs.id] ?? Int.max
+                let rhsOrder = configuredOrderByGroupID[rhs.id] ?? Int.max
+                if lhsOrder != rhsOrder {
+                    return lhsOrder < rhsOrder
+                }
+
+                return compareProjectGroupsByRecentActivity(lhs, rhs)
+            }
+        }
+
         return groupsByID.values.sorted { lhs, rhs in
-            if lhs.sortDate != rhs.sortDate {
-                return lhs.sortDate > rhs.sortDate
-            }
-
-            if lhs.label != rhs.label {
-                return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-            }
-
-            return lhs.id < rhs.id
+            compareProjectGroupsByRecentActivity(lhs, rhs)
         }
     }
 
-    private static func normalizedConfiguredProjectPaths(_ choices: [SidebarProjectChoice]) -> Set<String> {
-        Set(choices.compactMap { CodexThread.normalizedFilesystemProjectPath($0.projectPath) })
+    private struct ConfiguredProjectScope {
+        let choice: SidebarProjectChoice
+        let order: Int
+        let projectPath: String
+        let pathComponents: [String]
+    }
+
+    private static func normalizedConfiguredProjectScopes(_ choices: [SidebarProjectChoice]) -> [ConfiguredProjectScope] {
+        var seenProjectPaths: Set<String> = []
+        return choices.enumerated().compactMap { order, choice in
+            guard let projectPath = CodexThread.normalizedFilesystemProjectPath(choice.projectPath),
+                  seenProjectPaths.insert(projectPath).inserted else {
+                return nil
+            }
+
+            return ConfiguredProjectScope(
+                choice: choice,
+                order: order,
+                projectPath: projectPath,
+                pathComponents: projectPathComponents(projectPath)
+            )
+        }
+    }
+
+    private static func configuredProjectScope(
+        containing rawProjectPath: String,
+        scopes: [ConfiguredProjectScope]
+    ) -> ConfiguredProjectScope? {
+        guard let normalizedProjectPath = CodexThread.normalizedFilesystemProjectPath(rawProjectPath) else {
+            return nil
+        }
+        let pathComponents = projectPathComponents(normalizedProjectPath)
+
+        return scopes
+            .filter { isPathComponents(pathComponents, sameOrDescendantOf: $0.pathComponents) }
+            .sorted { lhs, rhs in
+                if lhs.pathComponents.count != rhs.pathComponents.count {
+                    return lhs.pathComponents.count > rhs.pathComponents.count
+                }
+                return lhs.order < rhs.order
+            }
+            .first
+    }
+
+    private static func isPathComponents(
+        _ pathComponents: [String],
+        sameOrDescendantOf rootComponents: [String]
+    ) -> Bool {
+        guard !rootComponents.isEmpty, pathComponents.count >= rootComponents.count else {
+            return false
+        }
+
+        return pathComponents.prefix(rootComponents.count).elementsEqual(rootComponents) {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedSame
+        }
+    }
+
+    private static func compareProjectGroupsByRecentActivity(_ lhs: SidebarThreadGroup, _ rhs: SidebarThreadGroup) -> Bool {
+        if lhs.sortDate != rhs.sortDate {
+            return lhs.sortDate > rhs.sortDate
+        }
+
+        if lhs.label != rhs.label {
+            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        }
+
+        return lhs.id < rhs.id
+    }
+
+    private static func threadBelongsToProjectGroup(_ thread: CodexThread, _ group: SidebarThreadGroup) -> Bool {
+        guard group.kind == .project else {
+            return false
+        }
+        guard group.includesDescendantProjectPaths,
+              let projectPath = group.projectPath,
+              let normalizedProjectPath = CodexThread.normalizedFilesystemProjectPath(projectPath),
+              let normalizedThreadPath = CodexThread.normalizedFilesystemProjectPath(thread.projectKey) else {
+            return projectGroupID(for: thread) == group.id
+        }
+
+        return isPathComponents(
+            projectPathComponents(normalizedThreadPath),
+            sameOrDescendantOf: projectPathComponents(normalizedProjectPath)
+        )
     }
 
     private static func configuredProjectLabel(_ rawLabel: String, projectPath: String) -> String {

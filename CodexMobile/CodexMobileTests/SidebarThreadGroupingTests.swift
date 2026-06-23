@@ -355,12 +355,14 @@ final class SidebarThreadGroupingTests: XCTestCase {
             makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
         ]
         let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/app"),
             makeProjectChoice(path: "/Users/me/work/helper"),
         ]
 
         let groups = SidebarThreadGrouping.makeGroups(
             from: threads,
             scope: .projects,
+            projectSource: .configuredProjects,
             configuredProjectChoices: configuredProjects,
             now: now
         )
@@ -386,12 +388,68 @@ final class SidebarThreadGroupingTests: XCTestCase {
         let groups = SidebarThreadGrouping.makeGroups(
             from: threads,
             scope: .projects,
+            projectSource: .configuredProjects,
             configuredProjectChoices: configuredProjects,
             now: now
         )
 
         XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/helper"])
         XCTAssertEqual(groups[0].threads.map(\.id), ["helper-thread"])
+    }
+
+    func testConfiguredProjectSourceUsesConfiguredProjectOrder() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(id: "helper-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/helper"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/empty"),
+            makeProjectChoice(path: "/Users/me/work/app"),
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/empty",
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/helper",
+        ])
+    }
+
+    func testConfiguredProjectSourceMergesDescendantThreadsIntoMostSpecificConfiguredProject() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "work-child-thread", updatedAt: now, cwd: "/Users/me/work/tools"),
+            makeThread(id: "helper-child-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/helper/ios"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work"),
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work",
+            "project:/Users/me/work/helper",
+        ])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["work-child-thread"])
+        XCTAssertEqual(groups[1].projectPath, "/Users/me/work/helper")
+        XCTAssertEqual(groups[1].threads.map(\.id), ["helper-child-thread"])
     }
 
     func testConfiguredProjectSourceExcludesRecentThreadProjectsOutsideConfig() {
@@ -425,6 +483,31 @@ final class SidebarThreadGroupingTests: XCTestCase {
             "project:/Users/me/work/recent-only",
             "project:/Users/me/work/helper",
         ])
+    }
+
+    func testLiveThreadIDsForConfiguredProjectGroupIncludesDescendantThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "root-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+            makeThread(id: "child-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/helper/ios"),
+            makeThread(id: "sibling-thread", updatedAt: now.addingTimeInterval(-120), cwd: "/Users/me/work/other"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[0], in: threads),
+            ["root-thread", "child-thread"]
+        )
     }
 
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {

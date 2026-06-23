@@ -85,6 +85,46 @@ trust_level = "trusted"
   ]);
 });
 
+test("project/configuredProjects follows Codex desktop saved workspace order", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const alphaProject = path.join(projectsRoot, "alpha");
+  const betaProject = path.join(projectsRoot, "beta");
+  const gammaProject = path.join(projectsRoot, "gamma");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(gammaProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${alphaProject}"]
+trust_level = "trusted"
+
+[projects."${betaProject}"]
+trust_level = "trusted"
+
+[projects."${gammaProject}"]
+trust_level = "trusted"
+`);
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "electron-saved-workspace-roots": [
+      gammaProject,
+      alphaProject,
+    ],
+  }));
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.deepEqual(
+    result.projects.map((project) => project.path),
+    [
+      fs.realpathSync(gammaProject),
+      fs.realpathSync(alphaProject),
+      fs.realpathSync(betaProject),
+    ]
+  );
+});
+
 test("project/listDirectory returns sorted child folders and skips files or hidden folders by default", async () => {
   const homeDir = makeTempHome();
   fs.mkdirSync(path.join(homeDir, "Zoo"));
