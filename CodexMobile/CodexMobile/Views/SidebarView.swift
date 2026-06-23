@@ -597,6 +597,18 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                             loadAutomations: { try await codex.fetchAutomations() },
                             setAutomationEnabled: { id, enabled in
                                 try await codex.setAutomationEnabled(id: id, enabled: enabled)
+                            },
+                            loadAutomation: { id in
+                                try await codex.fetchAutomation(id: id)
+                            },
+                            createAutomation: { draft in
+                                try await codex.createAutomation(draft)
+                            },
+                            updateAutomation: { draft in
+                                try await codex.updateAutomation(draft)
+                            },
+                            deleteAutomation: { id in
+                                try await codex.deleteAutomation(id: id)
                             }
                         )
                     } else {

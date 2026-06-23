@@ -140,6 +140,147 @@ test("automation/setEnabled toggles the saved automation status", async () => {
   assert.match(saved, /status = "PAUSED"/);
 });
 
+test("automation/read returns full editable automation details", async () => {
+  const codexHome = makeTempCodexHome();
+  writeAutomation(codexHome, "daily-report", [
+    "version = 1",
+    'id = "daily-report"',
+    'name = "Daily Report"',
+    'prompt = "Summarize yesterday."',
+    'status = "ACTIVE"',
+    'rrule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"',
+    'execution_environment = "local"',
+    'model = "gpt-5.4"',
+    'reasoning_effort = "high"',
+    'cwds = ["/Users/me/app"]',
+    "created_at = 1000",
+    "updated_at = 2000",
+    "",
+  ].join("\n"));
+
+  const result = await handleAutomationMethod(
+    "automation/read",
+    { id: "daily-report" },
+    { codexHome }
+  );
+
+  assert.equal(result.automation.id, "daily-report");
+  assert.equal(result.automation.prompt, "Summarize yesterday.");
+  assert.equal(result.automation.executionEnvironment, "local");
+  assert.equal(result.automation.model, "gpt-5.4");
+  assert.equal(result.automation.reasoningEffort, "high");
+  assert.deepEqual(result.automation.cwds, ["/Users/me/app"]);
+});
+
+test("automation/create writes a new automation toml file", async () => {
+  const codexHome = makeTempCodexHome();
+
+  const result = await handleAutomationMethod(
+    "automation/create",
+    {
+      name: "Daily Report",
+      prompt: "Summarize yesterday.",
+      status: "ACTIVE",
+      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      executionEnvironment: "local",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      cwds: ["/Users/me/app"],
+    },
+    { codexHome, now: () => 1234567890 }
+  );
+
+  assert.equal(result.automation.id, "daily-report");
+  assert.equal(result.automation.status, "ACTIVE");
+  assert.equal(result.automation.prompt, "Summarize yesterday.");
+  assert.equal(result.automation.createdAt, 1234567890);
+  assert.equal(result.automation.updatedAt, 1234567890);
+
+  const saved = fs.readFileSync(
+    path.join(codexHome, "automations", "daily-report", "automation.toml"),
+    "utf8"
+  );
+  assert.match(saved, /id = "daily-report"/);
+  assert.match(saved, /name = "Daily Report"/);
+  assert.match(saved, /prompt = "Summarize yesterday\."/);
+  assert.match(saved, /execution_environment = "local"/);
+  assert.ok(saved.includes('cwds = ["/Users/me/app"]'));
+});
+
+test("automation/update rewrites editable fields and preserves created time", async () => {
+  const codexHome = makeTempCodexHome();
+  writeAutomation(codexHome, "daily-report", [
+    "version = 1",
+    'id = "daily-report"',
+    'name = "Daily Report"',
+    'prompt = "Old prompt."',
+    'status = "ACTIVE"',
+    'rrule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"',
+    'execution_environment = "worktree"',
+    'cwds = ["/Users/me/app"]',
+    "created_at = 1000",
+    "updated_at = 2000",
+    "",
+  ].join("\n"));
+
+  const result = await handleAutomationMethod(
+    "automation/update",
+    {
+      id: "daily-report",
+      name: "Daily Report Updated",
+      prompt: "New prompt.",
+      status: "PAUSED",
+      rrule: "FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=30",
+      executionEnvironment: "local",
+      model: "gpt-5.4",
+      reasoningEffort: "medium",
+      cwds: ["/Users/me/new-app"],
+    },
+    { codexHome, now: () => 9000 }
+  );
+
+  assert.equal(result.automation.id, "daily-report");
+  assert.equal(result.automation.name, "Daily Report Updated");
+  assert.equal(result.automation.status, "PAUSED");
+  assert.equal(result.automation.createdAt, 1000);
+  assert.equal(result.automation.updatedAt, 9000);
+  assert.deepEqual(result.automation.cwds, ["/Users/me/new-app"]);
+
+  const saved = fs.readFileSync(
+    path.join(codexHome, "automations", "daily-report", "automation.toml"),
+    "utf8"
+  );
+  assert.match(saved, /name = "Daily Report Updated"/);
+  assert.match(saved, /prompt = "New prompt\."/);
+  assert.match(saved, /status = "PAUSED"/);
+  assert.match(saved, /created_at = 1000/);
+  assert.match(saved, /updated_at = 9000/);
+});
+
+test("automation/delete removes the automation directory", async () => {
+  const codexHome = makeTempCodexHome();
+  writeAutomation(codexHome, "daily-report", [
+    'id = "daily-report"',
+    'name = "Daily Report"',
+    'prompt = "Summarize yesterday."',
+    'status = "ACTIVE"',
+    "",
+  ].join("\n"));
+
+  const result = await handleAutomationMethod(
+    "automation/delete",
+    { id: "daily-report" },
+    { codexHome }
+  );
+
+  assert.equal(result.deleted, true);
+  assert.equal(
+    fs.existsSync(path.join(codexHome, "automations", "daily-report")),
+    false
+  );
+  assert.deepEqual((await listAutomations({ codexHome })).automations, []);
+});
+
 test("handleAutomationRequest responds to automation JSON-RPC requests", async () => {
   const codexHome = makeTempCodexHome();
   writeAutomation(codexHome, "demo", [

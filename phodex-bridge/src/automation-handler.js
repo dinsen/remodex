@@ -9,8 +9,15 @@ const path = require("path");
 const { resolveCodexHome } = require("./codex-home");
 
 const AUTOMATION_TOML_FILE = "automation.toml";
+const AUTOMATION_TOML_VERSION = 1;
 const ACTIVE_STATUS = "ACTIVE";
 const PAUSED_STATUS = "PAUSED";
+const DELETED_STATUS = "DELETED";
+const DEFAULT_RRULE = "FREQ=HOURLY;INTERVAL=24;BYMINUTE=0";
+const DEFAULT_EXECUTION_ENVIRONMENT = "worktree";
+const VALID_STATUSES = new Set([ACTIVE_STATUS, PAUSED_STATUS, DELETED_STATUS]);
+const VALID_EXECUTION_ENVIRONMENTS = new Set(["worktree", "local"]);
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 
 function handleAutomationRequest(rawMessage, sendResponse, options = {}) {
   let parsed;
@@ -53,6 +60,14 @@ async function handleAutomationMethod(method, params = {}, options = {}) {
   switch (method) {
     case "automation/list":
       return listAutomations(options);
+    case "automation/read":
+      return readAutomation(params, options);
+    case "automation/create":
+      return createAutomation(params, options);
+    case "automation/update":
+      return updateAutomation(params, options);
+    case "automation/delete":
+      return deleteAutomation(params, options);
     case "automation/setEnabled":
       return setAutomationEnabled(params, options);
     default:
@@ -122,6 +137,90 @@ async function setAutomationEnabled(params = {}, options = {}) {
   };
 }
 
+async function readAutomation(params = {}, options = {}) {
+  const id = readString(params.id);
+  if (!id) {
+    throw automationError("invalid_id", "Automation id is required.");
+  }
+
+  const automationDirectory = resolveAutomationDirectory(options);
+  const match = findAutomationFile(automationDirectory, id);
+  if (!match) {
+    throw automationError("not_found", "Automation could not be found.");
+  }
+
+  return {
+    automation: automationFromTomlFile(match.filePath, match.folderName, { includePrompt: true }),
+  };
+}
+
+async function createAutomation(params = {}, options = {}) {
+  const automationDirectory = resolveAutomationDirectory(options);
+  const now = readNow(options);
+  const editable = normalizeAutomationEditableFields(params, {});
+  const id = createUniqueAutomationId(automationDirectory, editable.name);
+  const automation = {
+    id,
+    ...editable,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const filePath = path.join(automationDirectory, id, AUTOMATION_TOML_FILE);
+  writeAutomationTomlFile(filePath, automation);
+
+  return {
+    automation: automationFromTomlFile(filePath, id, { includePrompt: true }),
+  };
+}
+
+async function updateAutomation(params = {}, options = {}) {
+  const id = readString(params.id);
+  if (!id) {
+    throw automationError("invalid_id", "Automation id is required.");
+  }
+
+  const automationDirectory = resolveAutomationDirectory(options);
+  const match = findAutomationFile(automationDirectory, id);
+  if (!match) {
+    throw automationError("not_found", "Automation could not be found.");
+  }
+
+  const existing = automationFromTomlFile(match.filePath, match.folderName, { includePrompt: true });
+  const editable = normalizeAutomationEditableFields(params, existing);
+  const automation = {
+    id: existing.id,
+    ...editable,
+    createdAt: existing.createdAt ?? readNow(options),
+    updatedAt: readNow(options),
+  };
+  writeAutomationTomlFile(match.filePath, automation);
+
+  return {
+    automation: automationFromTomlFile(match.filePath, match.folderName, { includePrompt: true }),
+  };
+}
+
+async function deleteAutomation(params = {}, options = {}) {
+  const id = readString(params.id);
+  if (!id) {
+    throw automationError("invalid_id", "Automation id is required.");
+  }
+
+  const automationDirectory = resolveAutomationDirectory(options);
+  const match = findAutomationFile(automationDirectory, id);
+  if (!match) {
+    throw automationError("not_found", "Automation could not be found.");
+  }
+
+  fs.rmSync(path.dirname(match.filePath), { force: true, recursive: true });
+  return { deleted: true };
+}
+
+function resolveAutomationDirectory(options = {}) {
+  const codexHome = path.resolve(readString(options.codexHome) || resolveCodexHome());
+  return path.join(codexHome, "automations");
+}
+
 function findAutomationFile(automationDirectory, id) {
   if (!fs.existsSync(automationDirectory)) {
     return null;
@@ -189,7 +288,7 @@ function setTomlTopLevelString(raw, key, value) {
   return lines.join(newline);
 }
 
-function automationFromTomlFile(filePath, folderName) {
+function automationFromTomlFile(filePath, folderName, { includePrompt = false } = {}) {
   const raw = fs.readFileSync(filePath, "utf8");
   const parsed = parseTopLevelToml(raw);
   const id = readString(parsed.id) || folderName;
@@ -198,7 +297,7 @@ function automationFromTomlFile(filePath, folderName) {
     ? parsed.cwds.map(readString).filter(Boolean)
     : [];
 
-  return {
+  const automation = {
     id,
     name,
     kind: readString(parsed.kind),
@@ -212,6 +311,12 @@ function automationFromTomlFile(filePath, folderName) {
     createdAt: readNumber(parsed.created_at),
     updatedAt: readNumber(parsed.updated_at),
   };
+
+  if (includePrompt) {
+    automation.prompt = readString(parsed.prompt) || "";
+  }
+
+  return automation;
 }
 
 function parseTopLevelToml(raw) {
@@ -358,8 +463,154 @@ function readNumber(value) {
   return Number.isFinite(value) ? value : null;
 }
 
+function readNow(options = {}) {
+  return typeof options.now === "function" ? options.now() : Date.now();
+}
+
+function normalizeAutomationEditableFields(params = {}, existing = {}) {
+  const name = readRequiredEditableString(params.name ?? existing.name, "name");
+  const prompt = readRequiredEditableString(params.prompt ?? existing.prompt, "prompt");
+  const status = normalizeStatus(params.status ?? existing.status ?? ACTIVE_STATUS);
+  const rrule = readString(params.rrule ?? existing.rrule) || DEFAULT_RRULE;
+  const executionEnvironment = normalizeExecutionEnvironment(
+    params.executionEnvironment ?? existing.executionEnvironment
+  );
+  const model = readOptionalEditableString(params.model ?? existing.model);
+  const reasoningEffort = normalizeReasoningEffort(
+    params.reasoningEffort ?? existing.reasoningEffort
+  );
+  const cwds = normalizeCwds(params.cwds ?? existing.cwds ?? []);
+
+  return {
+    name,
+    prompt,
+    status,
+    rrule,
+    executionEnvironment,
+    model,
+    reasoningEffort,
+    cwds,
+    cwdCount: cwds.length,
+  };
+}
+
+function readRequiredEditableString(value, fieldName) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw automationError("invalid_field", `Automation ${fieldName} is required.`);
+  }
+  return value.trim();
+}
+
+function readOptionalEditableString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeStatus(value) {
+  const status = readRequiredEditableString(value, "status").toUpperCase();
+  if (!VALID_STATUSES.has(status)) {
+    throw automationError("invalid_status", "Automation status must be ACTIVE, PAUSED, or DELETED.");
+  }
+  return status;
+}
+
+function normalizeExecutionEnvironment(value) {
+  const executionEnvironment = readOptionalEditableString(value) || DEFAULT_EXECUTION_ENVIRONMENT;
+  if (!VALID_EXECUTION_ENVIRONMENTS.has(executionEnvironment)) {
+    throw automationError("invalid_execution_environment", "Automation execution environment must be worktree or local.");
+  }
+  return executionEnvironment;
+}
+
+function normalizeReasoningEffort(value) {
+  const reasoningEffort = readOptionalEditableString(value);
+  if (!reasoningEffort) {
+    return null;
+  }
+  if (!VALID_REASONING_EFFORTS.has(reasoningEffort)) {
+    throw automationError("invalid_reasoning_effort", "Automation reasoning effort is not supported.");
+  }
+  return reasoningEffort;
+}
+
+function normalizeCwds(value) {
+  let rawValues = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    if (trimmed.startsWith("[")) {
+      try {
+        rawValues = JSON.parse(trimmed);
+      } catch {
+        throw automationError("invalid_cwds", "Automation workspaces must be a string array.");
+      }
+    } else {
+      rawValues = trimmed.split(",");
+    }
+  }
+
+  if (!Array.isArray(rawValues)) {
+    throw automationError("invalid_cwds", "Automation workspaces must be a string array.");
+  }
+  return rawValues.map(readString).filter(Boolean);
+}
+
+function createUniqueAutomationId(automationDirectory, name) {
+  const base = slugifyAutomationName(name) || "automation";
+  for (let attempt = 1; attempt <= 100; attempt += 1) {
+    const id = attempt === 1 ? base : `${base}-${attempt}`;
+    const filePath = path.join(automationDirectory, id, AUTOMATION_TOML_FILE);
+    if (!fs.existsSync(filePath)) {
+      return id;
+    }
+  }
+  throw automationError("id_collision", "Unable to create a unique automation id.");
+}
+
+function slugifyAutomationName(name) {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "");
+}
+
+function writeAutomationTomlFile(filePath, automation) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, formatAutomationToml(automation), "utf8");
+}
+
+function formatAutomationToml(automation) {
+  const lines = [
+    `version = ${AUTOMATION_TOML_VERSION}`,
+    `id = ${formatTomlString(automation.id)}`,
+    `name = ${formatTomlString(automation.name)}`,
+    `prompt = ${formatTomlString(automation.prompt)}`,
+    `status = ${formatTomlString(automation.status)}`,
+    `rrule = ${formatTomlString(automation.rrule || DEFAULT_RRULE)}`,
+    `execution_environment = ${formatTomlString(automation.executionEnvironment || DEFAULT_EXECUTION_ENVIRONMENT)}`,
+  ];
+  if (automation.model) {
+    lines.push(`model = ${formatTomlString(automation.model)}`);
+  }
+  if (automation.reasoningEffort) {
+    lines.push(`reasoning_effort = ${formatTomlString(automation.reasoningEffort)}`);
+  }
+  lines.push(`cwds = ${formatTomlArray(automation.cwds || [])}`);
+  lines.push(`created_at = ${automation.createdAt}`);
+  lines.push(`updated_at = ${automation.updatedAt}`);
+  return `${lines.join("\n")}\n`;
+}
+
 function formatTomlString(value) {
   return JSON.stringify(String(value));
+}
+
+function formatTomlArray(values) {
+  return `[${values.map(formatTomlString).join(", ")}]`;
 }
 
 function escapeRegExp(value) {
@@ -377,5 +628,9 @@ module.exports = {
   handleAutomationMethod,
   handleAutomationRequest,
   listAutomations,
+  readAutomation,
+  createAutomation,
+  updateAutomation,
+  deleteAutomation,
   setAutomationEnabled,
 };

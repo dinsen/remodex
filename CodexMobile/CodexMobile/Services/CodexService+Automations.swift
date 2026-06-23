@@ -9,6 +9,7 @@ import Foundation
 struct CodexAutomation: Identifiable, Equatable, Sendable {
     let id: String
     let name: String
+    let prompt: String?
     let kind: String?
     let status: String?
     let rrule: String?
@@ -52,6 +53,7 @@ struct CodexAutomation: Identifiable, Equatable, Sendable {
         CodexAutomation(
             id: id,
             name: name,
+            prompt: prompt,
             kind: kind,
             status: status,
             rrule: rrule,
@@ -76,6 +78,75 @@ struct CodexAutomation: Identifiable, Equatable, Sendable {
     private static func date(milliseconds: Int?) -> Date? {
         guard let milliseconds else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
+    }
+}
+
+struct CodexAutomationDraft: Equatable, Sendable {
+    var id: String?
+    var name: String
+    var prompt: String
+    var status: String
+    var rrule: String
+    var executionEnvironment: String
+    var model: String?
+    var reasoningEffort: String?
+    var cwds: [String]
+
+    init(
+        id: String? = nil,
+        name: String = "",
+        prompt: String = "",
+        status: String = "ACTIVE",
+        rrule: String = "FREQ=HOURLY;INTERVAL=24;BYMINUTE=0",
+        executionEnvironment: String = "worktree",
+        model: String? = nil,
+        reasoningEffort: String? = nil,
+        cwds: [String] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.prompt = prompt
+        self.status = status
+        self.rrule = rrule
+        self.executionEnvironment = executionEnvironment
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.cwds = cwds
+    }
+
+    init(automation: CodexAutomation) {
+        self.init(
+            id: automation.id,
+            name: automation.name,
+            prompt: automation.prompt ?? "",
+            status: automation.status ?? "ACTIVE",
+            rrule: automation.rrule ?? "FREQ=HOURLY;INTERVAL=24;BYMINUTE=0",
+            executionEnvironment: automation.executionEnvironment ?? "worktree",
+            model: automation.model,
+            reasoningEffort: automation.reasoningEffort,
+            cwds: automation.cwds
+        )
+    }
+
+    var rpcParams: [String: JSONValue] {
+        var params: [String: JSONValue] = [
+            "name": .string(name),
+            "prompt": .string(prompt),
+            "status": .string(status),
+            "rrule": .string(rrule),
+            "executionEnvironment": .string(executionEnvironment),
+            "cwds": .array(cwds.map(JSONValue.string)),
+        ]
+        if let id {
+            params["id"] = .string(id)
+        }
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["model"] = .string(model)
+        }
+        if let reasoningEffort, !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["reasoningEffort"] = .string(reasoningEffort)
+        }
+        return params
     }
 }
 
@@ -124,6 +195,50 @@ extension CodexService {
         return automation
     }
 
+    func fetchAutomation(id: String) async throws -> CodexAutomation {
+        let response = try await sendRequest(
+            method: "automation/read",
+            params: .object(["id": .string(id)])
+        )
+        return try Self.decodeAutomationResponse(response, method: "automation/read")
+    }
+
+    func createAutomation(_ draft: CodexAutomationDraft) async throws -> CodexAutomation {
+        let response = try await sendRequest(
+            method: "automation/create",
+            params: .object(draft.rpcParams)
+        )
+        return try Self.decodeAutomationResponse(response, method: "automation/create")
+    }
+
+    func updateAutomation(_ draft: CodexAutomationDraft) async throws -> CodexAutomation {
+        let response = try await sendRequest(
+            method: "automation/update",
+            params: .object(draft.rpcParams)
+        )
+        return try Self.decodeAutomationResponse(response, method: "automation/update")
+    }
+
+    func deleteAutomation(id: String) async throws {
+        let response = try await sendRequest(
+            method: "automation/delete",
+            params: .object(["id": .string(id)])
+        )
+        guard response.error == nil else {
+            throw CodexServiceError.invalidResponse("automation/delete failed")
+        }
+    }
+
+    private static func decodeAutomationResponse(_ response: RPCMessage, method: String) throws -> CodexAutomation {
+        guard let object = response.result?.objectValue,
+              let rawAutomation = object["automation"],
+              let automation = Self.decodeAutomation(rawAutomation) else {
+            throw CodexServiceError.invalidResponse("\(method) response missing automation")
+        }
+
+        return automation
+    }
+
     private static func decodeAutomation(_ value: JSONValue) -> CodexAutomation? {
         guard let object = value.objectValue,
               let id = object["id"]?.stringValue,
@@ -134,6 +249,7 @@ extension CodexService {
         return CodexAutomation(
             id: id,
             name: name,
+            prompt: object["prompt"]?.stringValue,
             kind: object["kind"]?.stringValue,
             status: object["status"]?.stringValue,
             rrule: object["rrule"]?.stringValue,

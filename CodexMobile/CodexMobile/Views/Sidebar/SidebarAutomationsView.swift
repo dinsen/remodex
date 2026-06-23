@@ -12,10 +12,15 @@ struct SidebarAutomationsView: View {
     let isConnected: Bool
     let loadAutomations: () async throws -> CodexAutomationList
     let setAutomationEnabled: (String, Bool) async throws -> CodexAutomation
+    let loadAutomation: (String) async throws -> CodexAutomation
+    let createAutomation: (CodexAutomationDraft) async throws -> CodexAutomation
+    let updateAutomation: (CodexAutomationDraft) async throws -> CodexAutomation
+    let deleteAutomation: (String) async throws -> Void
 
     @State private var state: LoadState = .idle
     @State private var pendingToggleIDs: Set<String> = []
     @State private var actionErrorMessage: String?
+    @State private var activeSheet: AutomationSheet?
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 10) {
@@ -25,6 +30,26 @@ struct SidebarAutomationsView: View {
         .padding(.top, 8)
         .task(id: isConnected) {
             await loadIfNeeded(force: false)
+        }
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .create:
+                SidebarAutomationEditorSheet(
+                    title: "New Automation",
+                    initialDraft: CodexAutomationDraft(),
+                    save: createAutomation,
+                    onSaved: upsertLoadedAutomation
+                )
+            case .detail(let id):
+                SidebarAutomationDetailSheet(
+                    automationID: id,
+                    loadAutomation: loadAutomation,
+                    updateAutomation: updateAutomation,
+                    deleteAutomation: deleteAutomation,
+                    onUpdated: upsertLoadedAutomation,
+                    onDeleted: removeLoadedAutomation
+                )
+            }
         }
     }
 
@@ -48,6 +73,8 @@ struct SidebarAutomationsView: View {
     private func loadedContent(_ list: CodexAutomationList) -> some View {
         let filtered = filteredAutomations(list.automations)
         if filtered.isEmpty {
+            newAutomationButton
+
             messageView(
                 title: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "No automations"
@@ -55,12 +82,17 @@ struct SidebarAutomationsView: View {
                 systemName: "calendar.badge.clock"
             )
         } else {
+            newAutomationButton
+
             ForEach(filtered) { automation in
                 SidebarAutomationRow(
                     automation: automation,
                     isTogglePending: pendingToggleIDs.contains(automation.id),
                     setEnabled: { enabled in
-                        Task { await updateAutomation(automation, enabled: enabled) }
+                        Task { await setAutomationRowEnabled(automation, enabled: enabled) }
+                    },
+                    openAutomation: {
+                        activeSheet = .detail(automation.id)
                     }
                 )
             }
@@ -79,6 +111,18 @@ struct SidebarAutomationsView: View {
                     .padding(.top, 4)
             }
         }
+    }
+
+    private var newAutomationButton: some View {
+        Button {
+            activeSheet = .create
+        } label: {
+            Label("New Automation", systemImage: "plus")
+                .font(AppFont.subheadline(weight: .medium))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .padding(.bottom, 2)
     }
 
     private var loadingRows: some View {
@@ -150,33 +194,41 @@ struct SidebarAutomationsView: View {
         }
     }
 
-    private func updateAutomation(_ automation: CodexAutomation, enabled: Bool) async {
+    private func setAutomationRowEnabled(_ automation: CodexAutomation, enabled: Bool) async {
         guard !pendingToggleIDs.contains(automation.id) else {
             return
         }
 
         pendingToggleIDs.insert(automation.id)
         actionErrorMessage = nil
-        replaceLoadedAutomation(automation.replacingStatus(enabled ? "ACTIVE" : "PAUSED"))
+        upsertLoadedAutomation(automation.replacingStatus(enabled ? "ACTIVE" : "PAUSED"))
         defer { pendingToggleIDs.remove(automation.id) }
 
         do {
             let updatedAutomation = try await setAutomationEnabled(automation.id, enabled)
-            replaceLoadedAutomation(updatedAutomation)
+            upsertLoadedAutomation(updatedAutomation)
         } catch is CancellationError {
-            replaceLoadedAutomation(automation)
+            upsertLoadedAutomation(automation)
         } catch {
-            replaceLoadedAutomation(automation)
+            upsertLoadedAutomation(automation)
             actionErrorMessage = "Unable to update automation"
         }
     }
 
-    private func replaceLoadedAutomation(_ automation: CodexAutomation) {
+    private func upsertLoadedAutomation(_ automation: CodexAutomation) {
         guard case .loaded(let list) = state else {
             return
         }
 
-        state = .loaded(list.replacingAutomation(automation))
+        state = .loaded(list.upsertingAutomation(automation))
+    }
+
+    private func removeLoadedAutomation(id: String) {
+        guard case .loaded(let list) = state else {
+            return
+        }
+
+        state = .loaded(list.removingAutomation(id: id))
     }
 }
 
@@ -187,18 +239,42 @@ private extension SidebarAutomationsView {
         case loaded(CodexAutomationList)
         case failed(String)
     }
+
+    enum AutomationSheet: Identifiable {
+        case create
+        case detail(String)
+
+        var id: String {
+            switch self {
+            case .create:
+                return "create"
+            case .detail(let id):
+                return "detail-\(id)"
+            }
+        }
+    }
 }
 
 private extension CodexAutomationList {
-    func replacingAutomation(_ automation: CodexAutomation) -> CodexAutomationList {
+    func upsertingAutomation(_ automation: CodexAutomation) -> CodexAutomationList {
         var updatedAutomations = automations
         if let index = updatedAutomations.firstIndex(where: { $0.id == automation.id }) {
             updatedAutomations[index] = automation
+        } else {
+            updatedAutomations.insert(automation, at: 0)
         }
 
         return CodexAutomationList(
             automationDirectory: automationDirectory,
             automations: updatedAutomations,
+            errors: errors
+        )
+    }
+
+    func removingAutomation(id: String) -> CodexAutomationList {
+        CodexAutomationList(
+            automationDirectory: automationDirectory,
+            automations: automations.filter { $0.id != id },
             errors: errors
         )
     }
@@ -208,6 +284,7 @@ private struct SidebarAutomationRow: View {
     let automation: CodexAutomation
     let isTogglePending: Bool
     let setEnabled: (Bool) -> Void
+    let openAutomation: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -242,6 +319,8 @@ private struct SidebarAutomationRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture(perform: openAutomation)
     }
 
     private var statusCapsule: some View {
@@ -464,6 +543,7 @@ nonisolated enum CodexAutomationScheduleFormatter {
                         CodexAutomation(
                             id: "weekly-review",
                             name: "Weekly Review",
+                            prompt: "Summarize the week and prepare follow-up tasks.",
                             kind: "cron",
                             status: "PAUSED",
                             rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30",
@@ -483,6 +563,7 @@ nonisolated enum CodexAutomationScheduleFormatter {
                 CodexAutomation(
                     id: id,
                     name: "Weekly Review",
+                    prompt: "Summarize the week and prepare follow-up tasks.",
                     kind: "cron",
                     status: enabled ? "ACTIVE" : "PAUSED",
                     rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30",
@@ -494,7 +575,59 @@ nonisolated enum CodexAutomationScheduleFormatter {
                     createdAtMilliseconds: nil,
                     updatedAtMilliseconds: nil
                 )
-            }
+            },
+            loadAutomation: { id in
+                CodexAutomation(
+                    id: id,
+                    name: "Weekly Review",
+                    prompt: "Summarize the week and prepare follow-up tasks.",
+                    kind: "cron",
+                    status: "PAUSED",
+                    rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30",
+                    model: "gpt-5.3-codex",
+                    reasoningEffort: "medium",
+                    executionEnvironment: "worktree",
+                    cwds: ["/Users/me/projects/app"],
+                    cwdCount: 1,
+                    createdAtMilliseconds: nil,
+                    updatedAtMilliseconds: nil
+                )
+            },
+            createAutomation: { draft in
+                CodexAutomation(
+                    id: "new-automation",
+                    name: draft.name,
+                    prompt: draft.prompt,
+                    kind: "cron",
+                    status: draft.status,
+                    rrule: draft.rrule,
+                    model: draft.model,
+                    reasoningEffort: draft.reasoningEffort,
+                    executionEnvironment: draft.executionEnvironment,
+                    cwds: draft.cwds,
+                    cwdCount: draft.cwds.count,
+                    createdAtMilliseconds: nil,
+                    updatedAtMilliseconds: nil
+                )
+            },
+            updateAutomation: { draft in
+                CodexAutomation(
+                    id: draft.id ?? "weekly-review",
+                    name: draft.name,
+                    prompt: draft.prompt,
+                    kind: "cron",
+                    status: draft.status,
+                    rrule: draft.rrule,
+                    model: draft.model,
+                    reasoningEffort: draft.reasoningEffort,
+                    executionEnvironment: draft.executionEnvironment,
+                    cwds: draft.cwds,
+                    cwdCount: draft.cwds.count,
+                    createdAtMilliseconds: nil,
+                    updatedAtMilliseconds: nil
+                )
+            },
+            deleteAutomation: { _ in }
         )
     }
 }
