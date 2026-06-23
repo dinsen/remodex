@@ -1825,6 +1825,28 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
     }
 
+    func testMergeAssistantDeltaKeepsLargeReplayOverlapWithoutDuplication() {
+        let service = makeService()
+        let overlap = String(repeating: "a", count: 20_000)
+        let existing = "prefix-" + overlap
+        let incoming = overlap + "-suffix"
+
+        let merged = service.mergeAssistantDelta(existingText: existing, incomingDelta: incoming)
+
+        XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
+    }
+
+    func testMergeAssistantDeltaPreservesUnicodeBoundaryWhenOverlappingReplay() {
+        let service = makeService()
+        let overlap = String(repeating: "å", count: 256)
+        let existing = "prefix-" + overlap
+        let incoming = overlap + "-suffix"
+
+        let merged = service.mergeAssistantDelta(existingText: existing, incomingDelta: incoming)
+
+        XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
+    }
+
     func testMarkTurnCompletedFinalizesAllAssistantItemsForTurn() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"

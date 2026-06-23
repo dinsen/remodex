@@ -25,6 +25,7 @@ private enum StreamingDeltaCoalescingPolicy {
     static let assistantLargeStreamingFlushDelayNanoseconds: UInt64 = 100_000_000
     static let assistantLargePendingDeltaByteCount = 12_000
     static let assistantLargeVisibleTextByteCount = 32_000
+    static let assistantReplayOverlapSearchByteLimit = 32_768
 }
 
 private enum MessageTextProcessingPolicy {
@@ -5470,25 +5471,105 @@ extension CodexService {
             return existingText
         }
 
-        if incomingDelta.count > existingText.count, incomingDelta.hasPrefix(existingText) {
+        let existingByteCount = existingText.utf8.count
+        let incomingByteCount = incomingDelta.utf8.count
+
+        if incomingByteCount > existingByteCount, incomingDelta.hasPrefix(existingText) {
             return incomingDelta
         }
 
-        if existingText.count > incomingDelta.count, existingText.hasPrefix(incomingDelta) {
+        if existingByteCount > incomingByteCount, existingText.hasPrefix(incomingDelta) {
             return existingText
         }
 
-        // Preserve reconnect/replay correctness by checking the full overlap window.
-        let maxOverlap = min(existingText.count, incomingDelta.count)
-        if maxOverlap > 0 {
-            for overlap in stride(from: maxOverlap, through: 1, by: -1) {
-                if existingText.suffix(overlap) == incomingDelta.prefix(overlap) {
-                    return existingText + incomingDelta.dropFirst(overlap)
+        // Preserve reconnect/replay correctness without doing an unbounded
+        // character-by-character overlap scan on MainActor while deltas stream.
+        if let overlap = assistantDeltaUTF8Overlap(
+            existingText: existingText,
+            existingByteCount: existingByteCount,
+            incomingDelta: incomingDelta,
+            incomingByteCount: incomingByteCount
+        ),
+        overlap > 0,
+        let incomingRemainderIndex = stringIndex(in: incomingDelta, utf8Offset: overlap) {
+            return existingText + String(incomingDelta[incomingRemainderIndex...])
+        }
+
+        return existingText + incomingDelta
+    }
+
+    private func assistantDeltaUTF8Overlap(
+        existingText: String,
+        existingByteCount: Int,
+        incomingDelta: String,
+        incomingByteCount: Int
+    ) -> Int? {
+        let maxOverlap = min(
+            existingByteCount,
+            incomingByteCount,
+            StreamingDeltaCoalescingPolicy.assistantReplayOverlapSearchByteLimit
+        )
+        guard maxOverlap > 0 else {
+            return nil
+        }
+
+        let incomingPrefixBytes = Array(incomingDelta.utf8.prefix(maxOverlap))
+        guard !incomingPrefixBytes.isEmpty else {
+            return nil
+        }
+        let existingSuffixBytes = Array(existingText.utf8.suffix(maxOverlap))
+        let prefixTable = utf8PrefixTable(for: incomingPrefixBytes)
+
+        var matched = 0
+        for (offset, byte) in existingSuffixBytes.enumerated() {
+            while matched > 0, byte != incomingPrefixBytes[matched] {
+                matched = prefixTable[matched - 1]
+            }
+            if byte == incomingPrefixBytes[matched] {
+                matched += 1
+                if matched == incomingPrefixBytes.count, offset < existingSuffixBytes.count - 1 {
+                    matched = prefixTable[matched - 1]
                 }
             }
         }
 
-        return existingText + incomingDelta
+        var candidate = matched
+        while candidate > 0 {
+            if stringIndex(in: incomingDelta, utf8Offset: candidate) != nil,
+               stringIndex(in: existingText, utf8Offset: existingByteCount - candidate) != nil {
+                return candidate
+            }
+            candidate = prefixTable[candidate - 1]
+        }
+
+        return nil
+    }
+
+    private func utf8PrefixTable(for bytes: [UInt8]) -> [Int] {
+        guard bytes.count > 1 else {
+            return Array(repeating: 0, count: bytes.count)
+        }
+
+        var table = Array(repeating: 0, count: bytes.count)
+        var length = 0
+        for index in 1..<bytes.count {
+            while length > 0, bytes[index] != bytes[length] {
+                length = table[length - 1]
+            }
+            if bytes[index] == bytes[length] {
+                length += 1
+                table[index] = length
+            }
+        }
+        return table
+    }
+
+    private func stringIndex(in text: String, utf8Offset: Int) -> String.Index? {
+        guard utf8Offset >= 0, utf8Offset <= text.utf8.count else {
+            return nil
+        }
+        let utf8Index = text.utf8.index(text.utf8.startIndex, offsetBy: utf8Offset)
+        return utf8Index.samePosition(in: text)
     }
 
 }
