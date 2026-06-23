@@ -130,11 +130,11 @@ async function projectConfiguredProjects(options = {}) {
   }
 
   const configuredPaths = parseTrustedProjectPathsFromConfig(configBody);
-  const desktopWorkspaceRootOrder = await readDesktopWorkspaceRootOrder(codexHome, options);
-  const projects = orderConfiguredProjectEntries(
-    await configuredProjectEntries(configuredPaths, options),
-    desktopWorkspaceRootOrder
-  );
+  const desktopProjectRootOrder = await readDesktopProjectRootOrder(codexHome, options);
+  const projectPaths = desktopProjectRootOrder.length > 0
+    ? desktopProjectRootOrder
+    : configuredPaths;
+  const projects = await configuredProjectEntries(projectPaths, options);
   return {
     configPath,
     projects,
@@ -195,7 +195,7 @@ async function configuredProjectEntries(configuredPaths, options = {}) {
   return projects;
 }
 
-async function readDesktopWorkspaceRootOrder(codexHome, options = {}) {
+async function readDesktopProjectRootOrder(codexHome, options = {}) {
   const globalStatePath = path.resolve(
     readString(options.globalStatePath) || path.join(codexHome, CODEX_GLOBAL_STATE_FILE)
   );
@@ -206,40 +206,14 @@ async function readDesktopWorkspaceRootOrder(codexHome, options = {}) {
     return [];
   }
 
-  const roots = Array.isArray(parsed?.["electron-saved-workspace-roots"])
-    ? parsed["electron-saved-workspace-roots"]
-    : [];
+  const roots = Array.isArray(parsed?.["project-order"]) && parsed["project-order"].length > 0
+    ? parsed["project-order"]
+    : Array.isArray(parsed?.["electron-saved-workspace-roots"])
+      ? parsed["electron-saved-workspace-roots"]
+      : [];
   return roots
     .map((rootPath) => canonicalProjectOrderPath(rootPath))
     .filter(Boolean);
-}
-
-function orderConfiguredProjectEntries(projects, desktopWorkspaceRootOrder) {
-  if (!Array.isArray(desktopWorkspaceRootOrder) || desktopWorkspaceRootOrder.length === 0) {
-    return projects;
-  }
-
-  const rankByPath = new Map();
-  for (const [index, rootPath] of desktopWorkspaceRootOrder.entries()) {
-    if (!rankByPath.has(rootPath)) {
-      rankByPath.set(rootPath, index);
-    }
-  }
-
-  return projects
-    .map((project, configIndex) => ({ project, configIndex, rank: rankByPath.get(project.path) }))
-    .sort((left, right) => {
-      const leftHasRank = Number.isInteger(left.rank);
-      const rightHasRank = Number.isInteger(right.rank);
-      if (leftHasRank && rightHasRank && left.rank !== right.rank) {
-        return left.rank - right.rank;
-      }
-      if (leftHasRank !== rightHasRank) {
-        return leftHasRank ? -1 : 1;
-      }
-      return left.configIndex - right.configIndex;
-    })
-    .map((entry) => entry.project);
 }
 
 function canonicalProjectOrderPath(projectPath) {

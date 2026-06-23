@@ -85,7 +85,54 @@ trust_level = "trusted"
   ]);
 });
 
-test("project/configuredProjects follows Codex desktop saved workspace order", async () => {
+test("project/configuredProjects follows Codex desktop project order and hides stale config entries", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const alphaProject = path.join(projectsRoot, "alpha");
+  const betaProject = path.join(projectsRoot, "beta");
+  const gammaProject = path.join(projectsRoot, "gamma");
+  const desktopOnlyProject = path.join(projectsRoot, "desktop-only");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(gammaProject, { recursive: true });
+  fs.mkdirSync(desktopOnlyProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${alphaProject}"]
+trust_level = "trusted"
+
+[projects."${betaProject}"]
+trust_level = "trusted"
+
+[projects."${gammaProject}"]
+trust_level = "trusted"
+`);
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "project-order": [
+      gammaProject,
+      desktopOnlyProject,
+      alphaProject,
+    ],
+    "electron-saved-workspace-roots": [
+      alphaProject,
+      betaProject,
+    ],
+  }));
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.deepEqual(
+    result.projects.map((project) => project.path),
+    [
+      fs.realpathSync(gammaProject),
+      fs.realpathSync(desktopOnlyProject),
+      fs.realpathSync(alphaProject),
+    ]
+  );
+});
+
+test("project/configuredProjects falls back to saved workspace roots when project order is missing", async () => {
   const homeDir = makeTempHome();
   const codexHome = path.join(homeDir, ".codex");
   const projectsRoot = path.join(homeDir, "projects");
@@ -120,7 +167,6 @@ trust_level = "trusted"
     [
       fs.realpathSync(gammaProject),
       fs.realpathSync(alphaProject),
-      fs.realpathSync(betaProject),
     ]
   );
 });

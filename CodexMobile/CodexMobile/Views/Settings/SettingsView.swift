@@ -421,7 +421,7 @@ private struct SettingsProjectsCard: View {
     var body: some View {
         SettingsCard(
             title: "Projects",
-            footer: "Configured projects come from the paired Mac's Codex config."
+            footer: "Configured projects mirror the paired Mac's Codex project list."
         ) {
             Picker("Source", selection: projectSourceBinding) {
                 ForEach(SidebarProjectSource.allCases) { source in
