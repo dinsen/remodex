@@ -16,6 +16,7 @@ enum SidebarThreadGroupKind: Equatable {
 enum SidebarContentScope: String, CaseIterable, Hashable, Identifiable {
     case projects
     case chats
+    case automations
 
     var id: String { rawValue }
 
@@ -25,6 +26,8 @@ enum SidebarContentScope: String, CaseIterable, Hashable, Identifiable {
             return "Projects"
         case .chats:
             return "Chats"
+        case .automations:
+            return "Automations"
         }
     }
 }

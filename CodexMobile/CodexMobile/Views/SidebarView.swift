@@ -263,7 +263,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         switch selectedContentScope {
         case .projects:
             handleNewChatButtonTap()
-        case .chats:
+        case .chats, .automations:
             handleRootlessChatDraftTap()
         }
     }
@@ -501,6 +501,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             return .projects
         case .chats:
             return .chats
+        case .automations:
+            return .all
         }
     }
 
@@ -539,6 +541,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             return "No project chats"
         case .chats:
             return "No chats"
+        case .automations:
+            return "No automations"
         }
     }
 
@@ -548,6 +552,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             return "No matching projects"
         case .chats:
             return "No matching chats"
+        case .automations:
+            return "No matching automations"
         }
     }
 
@@ -584,7 +590,15 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                         .padding(.horizontal, 16)
                         .padding(.bottom, 8)
 
-                    threadList
+                    if selectedContentScope == .automations {
+                        SidebarAutomationsView(
+                            query: searchText,
+                            isConnected: codex.isConnected,
+                            loadAutomations: { try await codex.fetchAutomations() }
+                        )
+                    } else {
+                        threadList
+                    }
                 }
             }
             .scrollDismissesKeyboard(.interactively)

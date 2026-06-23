@@ -35,6 +35,8 @@ const { handleThreadContextRequest } = require("./thread-context-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
 const { handleProjectRequest } = require("./project-handler");
 const { handlePetRequest } = require("./pet-handler");
+const { handleAutomationRequest } = require("./automation-handler");
+const { handleRuntimeDefaultsRequest } = require("./runtime-defaults-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
 const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
 const {
@@ -595,6 +597,12 @@ function startBridge({
       return;
     }
     if (handleProjectRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
+    if (handleAutomationRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
+    if (handleRuntimeDefaultsRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
     if (handlePetRequest(rawMessage, sendApplicationResponse)) {

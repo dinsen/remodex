@@ -30,7 +30,74 @@ private enum RuntimeSelectionDefaults {
     }
 }
 
+struct CodexRuntimeDefaultsPayload: Equatable, Sendable {
+    let model: String?
+    let reasoningEffort: String?
+    let accessMode: CodexAccessMode?
+    let includesServiceTier: Bool
+    let serviceTier: CodexServiceTier?
+
+    init(object: RPCObject) {
+        model = Self.cleanedString(object["model"]?.stringValue)
+        reasoningEffort = Self.cleanedString(object["reasoningEffort"]?.stringValue)
+        accessMode = Self.cleanedString(object["accessMode"]?.stringValue)
+            .flatMap(CodexAccessMode.init(rawValue:))
+        includesServiceTier = object.keys.contains("serviceTier")
+        serviceTier = Self.serviceTier(from: object["serviceTier"]?.stringValue)
+    }
+
+    private static func cleanedString(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    private static func serviceTier(from rawValue: String?) -> CodexServiceTier? {
+        switch cleanedString(rawValue)?.lowercased() {
+        case "fast", "priority":
+            return .fast
+        default:
+            return nil
+        }
+    }
+}
+
 extension CodexService {
+    func syncRuntimeDefaultsFromBridge() async throws {
+        let response = try await sendRequest(
+            method: "runtime/defaults",
+            params: .object([:]),
+            timeoutNanoseconds: RuntimeConfigLoadingPolicy.modelListTimeoutNanoseconds,
+            timeoutMessage: "runtime/defaults timed out while syncing runtime options."
+        )
+
+        guard let resultObject = response.result?.objectValue else {
+            throw CodexServiceError.invalidResponse("runtime/defaults response missing payload")
+        }
+
+        applyRuntimeDefaultsFromBridge(CodexRuntimeDefaultsPayload(object: resultObject))
+    }
+
+    func applyRuntimeDefaultsFromBridge(_ payload: CodexRuntimeDefaultsPayload) {
+        if let model = payload.model {
+            selectedModelId = model
+            hasPersistedSelectedModelId = true
+        }
+
+        if let reasoningEffort = payload.reasoningEffort {
+            selectedReasoningEffort = reasoningEffort
+        }
+
+        if let accessMode = payload.accessMode {
+            selectedAccessMode = accessMode
+        }
+
+        if payload.includesServiceTier {
+            selectedServiceTier = payload.serviceTier
+        }
+
+        normalizeRuntimeSelectionsAfterModelsUpdate()
+    }
+
     // Resolves the effective per-chat override record after normalizing the thread id.
     func threadRuntimeOverride(for threadId: String?) -> CodexThreadRuntimeOverride? {
         guard let normalizedThreadID = normalizedInterruptIdentifier(threadId) else {

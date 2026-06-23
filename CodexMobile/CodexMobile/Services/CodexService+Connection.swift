@@ -631,6 +631,7 @@ extension CodexService {
                 self.pendingRuntimeOptionRefresh = true
                 return
             }
+            try? await self.syncRuntimeDefaultsFromBridge()
             try? await self.listModels()
             if self.runtimeOptionRefreshToken == refreshToken {
                 self.pendingRuntimeOptionRefresh = false

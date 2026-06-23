@@ -13,18 +13,18 @@ enum CodexAccessMode: String, Codable, CaseIterable, Hashable, Sendable {
     var displayName: String {
         switch self {
         case .onRequest:
-            return "Ask"
+            return "Approve for me"
         case .fullAccess:
-            return "Full"
+            return "Full access"
         }
     }
 
     var menuTitle: String {
         switch self {
         case .onRequest:
-            return "On-Request"
+            return "Approve for me"
         case .fullAccess:
-            return "Full Access"
+            return "Full access"
         }
     }
 

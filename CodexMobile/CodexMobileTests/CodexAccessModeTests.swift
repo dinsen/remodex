@@ -12,4 +12,11 @@ final class CodexAccessModeTests: XCTestCase {
         XCTAssertEqual(CodexAccessMode.onRequest.sandboxLegacyValue, "workspace-write")
         XCTAssertEqual(CodexAccessMode.fullAccess.sandboxLegacyValue, "danger-full-access")
     }
+
+    func testDisplayNamesMatchCodexAppWording() {
+        XCTAssertEqual(CodexAccessMode.onRequest.displayName, "Approve for me")
+        XCTAssertEqual(CodexAccessMode.onRequest.menuTitle, "Approve for me")
+        XCTAssertEqual(CodexAccessMode.fullAccess.displayName, "Full access")
+        XCTAssertEqual(CodexAccessMode.fullAccess.menuTitle, "Full access")
+    }
 }
