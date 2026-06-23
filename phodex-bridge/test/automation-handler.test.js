@@ -100,6 +100,46 @@ test("automation/list skips malformed automation files and reports non-fatal err
   assert.equal(result.errors[0].id, "broken");
 });
 
+test("automation/setEnabled toggles the saved automation status", async () => {
+  const codexHome = makeTempCodexHome();
+  writeAutomation(codexHome, "demo", [
+    "version = 1",
+    'id = "demo"',
+    'name = "Demo Automation"',
+    'status = "PAUSED"',
+    'prompt = "Keep this prompt intact."',
+    "",
+  ].join("\n"));
+
+  const enabled = await handleAutomationMethod(
+    "automation/setEnabled",
+    { id: "demo", enabled: true },
+    { codexHome }
+  );
+
+  assert.equal(enabled.automation.id, "demo");
+  assert.equal(enabled.automation.status, "ACTIVE");
+  let saved = fs.readFileSync(
+    path.join(codexHome, "automations", "demo", "automation.toml"),
+    "utf8"
+  );
+  assert.match(saved, /status = "ACTIVE"/);
+  assert.match(saved, /prompt = "Keep this prompt intact."/);
+
+  const disabled = await handleAutomationMethod(
+    "automation/setEnabled",
+    { id: "demo", enabled: false },
+    { codexHome }
+  );
+
+  assert.equal(disabled.automation.status, "PAUSED");
+  saved = fs.readFileSync(
+    path.join(codexHome, "automations", "demo", "automation.toml"),
+    "utf8"
+  );
+  assert.match(saved, /status = "PAUSED"/);
+});
+
 test("handleAutomationRequest responds to automation JSON-RPC requests", async () => {
   const codexHome = makeTempCodexHome();
   writeAutomation(codexHome, "demo", [

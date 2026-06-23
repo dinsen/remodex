@@ -594,7 +594,10 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                         SidebarAutomationsView(
                             query: searchText,
                             isConnected: codex.isConnected,
-                            loadAutomations: { try await codex.fetchAutomations() }
+                            loadAutomations: { try await codex.fetchAutomations() },
+                            setAutomationEnabled: { id, enabled in
+                                try await codex.setAutomationEnabled(id: id, enabled: enabled)
+                            }
                         )
                     } else {
                         threadList

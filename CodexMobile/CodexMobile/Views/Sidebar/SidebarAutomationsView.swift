@@ -11,8 +11,11 @@ struct SidebarAutomationsView: View {
     let query: String
     let isConnected: Bool
     let loadAutomations: () async throws -> CodexAutomationList
+    let setAutomationEnabled: (String, Bool) async throws -> CodexAutomation
 
     @State private var state: LoadState = .idle
+    @State private var pendingToggleIDs: Set<String> = []
+    @State private var actionErrorMessage: String?
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 10) {
@@ -53,13 +56,26 @@ struct SidebarAutomationsView: View {
             )
         } else {
             ForEach(filtered) { automation in
-                SidebarAutomationRow(automation: automation)
+                SidebarAutomationRow(
+                    automation: automation,
+                    isTogglePending: pendingToggleIDs.contains(automation.id),
+                    setEnabled: { enabled in
+                        Task { await updateAutomation(automation, enabled: enabled) }
+                    }
+                )
             }
 
             if !list.errors.isEmpty {
                 Text("\(list.errors.count) automation file could not be read.")
                     .font(AppFont.caption(weight: .regular))
                     .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+            }
+
+            if let actionErrorMessage {
+                Text(actionErrorMessage)
+                    .font(AppFont.caption(weight: .regular))
+                    .foregroundStyle(.red)
                     .padding(.top, 4)
             }
         }
@@ -133,6 +149,35 @@ struct SidebarAutomationsView: View {
             state = .failed("Unable to load automations")
         }
     }
+
+    private func updateAutomation(_ automation: CodexAutomation, enabled: Bool) async {
+        guard !pendingToggleIDs.contains(automation.id) else {
+            return
+        }
+
+        pendingToggleIDs.insert(automation.id)
+        actionErrorMessage = nil
+        replaceLoadedAutomation(automation.replacingStatus(enabled ? "ACTIVE" : "PAUSED"))
+        defer { pendingToggleIDs.remove(automation.id) }
+
+        do {
+            let updatedAutomation = try await setAutomationEnabled(automation.id, enabled)
+            replaceLoadedAutomation(updatedAutomation)
+        } catch is CancellationError {
+            replaceLoadedAutomation(automation)
+        } catch {
+            replaceLoadedAutomation(automation)
+            actionErrorMessage = "Unable to update automation"
+        }
+    }
+
+    private func replaceLoadedAutomation(_ automation: CodexAutomation) {
+        guard case .loaded(let list) = state else {
+            return
+        }
+
+        state = .loaded(list.replacingAutomation(automation))
+    }
 }
 
 private extension SidebarAutomationsView {
@@ -144,8 +189,25 @@ private extension SidebarAutomationsView {
     }
 }
 
+private extension CodexAutomationList {
+    func replacingAutomation(_ automation: CodexAutomation) -> CodexAutomationList {
+        var updatedAutomations = automations
+        if let index = updatedAutomations.firstIndex(where: { $0.id == automation.id }) {
+            updatedAutomations[index] = automation
+        }
+
+        return CodexAutomationList(
+            automationDirectory: automationDirectory,
+            automations: updatedAutomations,
+            errors: errors
+        )
+    }
+}
+
 private struct SidebarAutomationRow: View {
     let automation: CodexAutomation
+    let isTogglePending: Bool
+    let setEnabled: (Bool) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -171,6 +233,8 @@ private struct SidebarAutomationRow: View {
                 }
 
                 Spacer(minLength: 0)
+
+                automationToggle
             }
 
             metadataLine
@@ -188,6 +252,28 @@ private struct SidebarAutomationRow: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(statusColor.opacity(0.12), in: Capsule())
+    }
+
+    private var automationToggle: some View {
+        HStack(spacing: 6) {
+            if isTogglePending {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Toggle(isOn: Binding(
+                get: { automation.isEnabled },
+                set: { enabled in setEnabled(enabled) }
+            )) {
+                EmptyView()
+            }
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(.green)
+            .frame(width: 52)
+            .disabled(isTogglePending)
+            .accessibilityLabel(automation.isEnabled ? "Disable automation" : "Enable automation")
+        }
     }
 
     private var metadataLine: some View {
@@ -391,6 +477,22 @@ nonisolated enum CodexAutomationScheduleFormatter {
                         ),
                     ],
                     errors: []
+                )
+            },
+            setAutomationEnabled: { id, enabled in
+                CodexAutomation(
+                    id: id,
+                    name: "Weekly Review",
+                    kind: "cron",
+                    status: enabled ? "ACTIVE" : "PAUSED",
+                    rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30",
+                    model: "gpt-5.3-codex",
+                    reasoningEffort: "medium",
+                    executionEnvironment: "worktree",
+                    cwds: ["/Users/me/projects/app"],
+                    cwdCount: 1,
+                    createdAtMilliseconds: nil,
+                    updatedAtMilliseconds: nil
                 )
             }
         )

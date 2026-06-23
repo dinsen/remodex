@@ -1,5 +1,5 @@
 // FILE: CodexService+Automations.swift
-// Purpose: Read-only Codex automation metadata surfaced through the local bridge.
+// Purpose: Codex automation metadata and status updates surfaced through the local bridge.
 // Layer: Service Extension
 // Exports: CodexAutomation, CodexAutomationList, CodexService automation APIs
 // Depends on: Foundation, JSONValue, RPC transport
@@ -35,8 +35,34 @@ struct CodexAutomation: Identifiable, Equatable, Sendable {
             .joined(separator: " ")
     }
 
+    var isEnabled: Bool {
+        switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "active", "enabled", "running":
+            return true
+        default:
+            return false
+        }
+    }
+
     var primaryFolderLabel: String? {
         cwds.first?.pathDisplayName
+    }
+
+    func replacingStatus(_ status: String) -> CodexAutomation {
+        CodexAutomation(
+            id: id,
+            name: name,
+            kind: kind,
+            status: status,
+            rrule: rrule,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            executionEnvironment: executionEnvironment,
+            cwds: cwds,
+            cwdCount: cwdCount,
+            createdAtMilliseconds: createdAtMilliseconds,
+            updatedAtMilliseconds: updatedAtMilliseconds
+        )
     }
 
     var updatedAt: Date? {
@@ -79,6 +105,23 @@ extension CodexService {
             automations: automations,
             errors: errors
         )
+    }
+
+    func setAutomationEnabled(id: String, enabled: Bool) async throws -> CodexAutomation {
+        let response = try await sendRequest(
+            method: "automation/setEnabled",
+            params: .object([
+                "id": .string(id),
+                "enabled": .bool(enabled),
+            ])
+        )
+        guard let object = response.result?.objectValue,
+              let rawAutomation = object["automation"],
+              let automation = Self.decodeAutomation(rawAutomation) else {
+            throw CodexServiceError.invalidResponse("automation/setEnabled response missing automation")
+        }
+
+        return automation
     }
 
     private static func decodeAutomation(_ value: JSONValue) -> CodexAutomation? {
