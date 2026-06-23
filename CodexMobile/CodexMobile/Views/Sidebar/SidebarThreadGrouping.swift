@@ -32,6 +32,25 @@ enum SidebarContentScope: String, CaseIterable, Hashable, Identifiable {
     }
 }
 
+enum SidebarProjectSource: String, CaseIterable, Hashable, Identifiable {
+    case configuredProjects
+    case recentThreadProjects
+
+    static let storageKey = "sidebar.projectSource"
+    static let defaultSource: SidebarProjectSource = .configuredProjects
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .configuredProjects:
+            return "Configured Projects"
+        case .recentThreadProjects:
+            return "Recent Thread Projects"
+        }
+    }
+}
+
 enum SidebarThreadGroupingScope {
     case all
     case projects
@@ -76,6 +95,7 @@ enum SidebarThreadGrouping {
         pinnedThreadIDs: [String] = [],
         scope: SidebarThreadGroupingScope = .all,
         projectlessRootPaths: [String] = [],
+        configuredProjectChoices: [SidebarProjectChoice] = [],
         now _: Date = Date(),
         calendar _: Calendar = .current
     ) -> [SidebarThreadGroup] {
@@ -101,12 +121,20 @@ enum SidebarThreadGrouping {
         case .all:
             let projectThreads = threadsForScope(.projects, from: scopedThreads, projectlessRootPaths: projectlessRootPaths)
             let chatThreads = threadsForScope(.chats, from: scopedThreads, projectlessRootPaths: projectlessRootPaths)
-            groups.append(contentsOf: makeProjectGroups(from: projectThreads, excludingPinnedThreadIDs: pinnedThreadIDSet))
+            groups.append(contentsOf: makeProjectGroups(
+                from: projectThreads,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                configuredProjectChoices: configuredProjectChoices
+            ))
             if let chatGroup = makeRootlessChatGroup(from: chatThreads, excludingPinnedThreadIDs: pinnedThreadIDSet) {
                 groups.append(chatGroup)
             }
         case .projects:
-            groups.append(contentsOf: makeProjectGroups(from: scopedThreads, excludingPinnedThreadIDs: pinnedThreadIDSet))
+            groups.append(contentsOf: makeProjectGroups(
+                from: scopedThreads,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                configuredProjectChoices: configuredProjectChoices
+            ))
         case .chats:
             if let chatGroup = makeRootlessChatGroup(from: scopedThreads, excludingPinnedThreadIDs: pinnedThreadIDSet) {
                 groups.append(chatGroup)
@@ -146,13 +174,14 @@ enum SidebarThreadGrouping {
     // Reuses the sidebar project grouping rules for places like the New Chat chooser.
     static func makeProjectChoices(
         from threads: [CodexThread],
-        projectlessRootPaths: [String] = []
+        projectlessRootPaths: [String] = [],
+        configuredProjectChoices: [SidebarProjectChoice] = []
     ) -> [SidebarProjectChoice] {
         makeProjectGroups(from: threadsForScope(
             .projects,
             from: threads,
             projectlessRootPaths: projectlessRootPaths
-        )).compactMap { group in
+        ), configuredProjectChoices: configuredProjectChoices).compactMap { group in
             guard let projectPath = group.projectPath else {
                 return nil
             }
@@ -322,7 +351,8 @@ enum SidebarThreadGrouping {
     // Keeps project-derived UI consistent by centralizing the live-thread → project bucket mapping.
     private static func makeProjectGroups(
         from threads: [CodexThread],
-        excludingPinnedThreadIDs pinnedThreadIDs: Set<String> = []
+        excludingPinnedThreadIDs pinnedThreadIDs: Set<String> = [],
+        configuredProjectChoices: [SidebarProjectChoice] = []
     ) -> [SidebarThreadGroup] {
         var liveThreadsByProject: [String: [CodexThread]] = [:]
 
@@ -333,10 +363,31 @@ enum SidebarThreadGrouping {
             liveThreadsByProject[thread.projectKey, default: []].append(thread)
         }
 
-        return liveThreadsByProject.map { projectKey, projectThreads in
-            makeProjectGroup(projectKey: projectKey, threads: projectThreads)
+        var groupsByID = Dictionary(uniqueKeysWithValues: liveThreadsByProject.map { projectKey, projectThreads in
+            let group = makeProjectGroup(projectKey: projectKey, threads: projectThreads)
+            return (group.id, group)
+        })
+
+        for choice in configuredProjectChoices {
+            guard let projectPath = CodexThread.normalizedFilesystemProjectPath(choice.projectPath) else {
+                continue
+            }
+            let groupID = projectGroupID(forProjectPath: projectPath)
+            guard groupsByID[groupID] == nil else {
+                continue
+            }
+
+            groupsByID[groupID] = SidebarThreadGroup(
+                id: groupID,
+                label: configuredProjectLabel(choice.label, projectPath: projectPath),
+                kind: .project,
+                sortDate: choice.sortDate,
+                projectPath: projectPath,
+                threads: []
+            )
         }
-        .sorted { lhs, rhs in
+
+        return groupsByID.values.sorted { lhs, rhs in
             if lhs.sortDate != rhs.sortDate {
                 return lhs.sortDate > rhs.sortDate
             }
@@ -347,6 +398,23 @@ enum SidebarThreadGrouping {
 
             return lhs.id < rhs.id
         }
+    }
+
+    private static func configuredProjectLabel(_ rawLabel: String, projectPath: String) -> String {
+        let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !label.isEmpty {
+            return label
+        }
+
+        return CodexThread.projectDisplayLabel(for: projectPath)
+    }
+
+    private static func projectGroupID(forProjectPath projectPath: String) -> String {
+        "project:\(projectPath)"
+    }
+
+    private static func projectGroupID(for thread: CodexThread) -> String {
+        projectGroupID(forProjectPath: thread.projectKey)
     }
 
     // Keeps pinned roots and their descendants together so sidebar trees do not split across sections.
@@ -414,7 +482,4 @@ enum SidebarThreadGrouping {
         }
     }
 
-    private static func projectGroupID(for thread: CodexThread) -> String {
-        "project:\(thread.projectKey)"
-    }
 }

@@ -63,6 +63,9 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var lastGroupedThreadsFingerprint: Int = 0
     @State private var lastBadgeFingerprint: Int = 0
     @State private var projectlessChatRootPaths: [String] = []
+    @State private var configuredProjectChoices: [SidebarProjectChoice] = []
+    @AppStorage(SidebarProjectSource.storageKey)
+    private var projectSourceRawValue = SidebarProjectSource.defaultSource.rawValue
     @AppStorage(SidebarProjectExpansionState.collapsedProjectGroupIDsStorageKey)
     private var collapsedProjectGroupIDsStorage = ""
 
@@ -90,6 +93,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 rebuildGroupedThreads()
                 rebuildCachedSidebarState()
                 await refreshProjectlessChatRoots()
+                await refreshConfiguredProjects()
                 if codex.isConnected, codex.threads.isEmpty {
                     await refreshThreads()
                 }
@@ -110,13 +114,22 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 debugSidebarLog("content scope changed scope=\(scope.rawValue)")
                 rebuildGroupedThreads()
             }
+            .onChange(of: projectSourceRawValue) { _, rawValue in
+                debugSidebarLog("project source changed source=\(rawValue)")
+                rebuildGroupedThreads()
+                guard codex.isConnected, selectedProjectSource == .configuredProjects else { return }
+                Task { @MainActor in await refreshConfiguredProjects() }
+            }
             .onChange(of: codex.pinnedThreadIDs) { _, _ in
                 debugSidebarLog("pinned threads changed count=\(codex.pinnedThreadIDs.count)")
                 rebuildGroupedThreads()
             }
             .onChange(of: codex.isConnected) { _, isConnected in
                 guard isConnected else { return }
-                Task { @MainActor in await refreshProjectlessChatRoots() }
+                Task { @MainActor in
+                    await refreshProjectlessChatRoots()
+                    await refreshConfiguredProjects()
+                }
             }
             // Deferred to the next runloop tick so rebuilding the cache `@State`
             // does not trigger another body re-evaluation inside the same frame
@@ -237,6 +250,20 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         } catch {
             // Path-pattern fallbacks still classify current Desktop defaults if the bridge is older.
             debugSidebarLog("projectless roots unavailable error=\(error.localizedDescription)")
+        }
+    }
+
+    private func refreshConfiguredProjects() async {
+        guard codex.isConnected else { return }
+
+        do {
+            let choices = Self.sidebarProjectChoices(from: try await codex.fetchConfiguredProjects())
+            guard choices != configuredProjectChoices else { return }
+            configuredProjectChoices = choices
+            rebuildGroupedThreads()
+        } catch {
+            // Older bridges can lack this RPC; recent-thread grouping still renders.
+            debugSidebarLog("configured projects unavailable error=\(error.localizedDescription)")
         }
     }
 
@@ -415,14 +442,20 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 || ($0.normalizedProjectPath?.localizedCaseInsensitiveContains(query) ?? false)
             }
         }
-        let fingerprint = groupingFingerprint(query: query, source: source)
+        let configuredChoices = configuredProjectChoicesForGrouping(query: query)
+        let fingerprint = groupingFingerprint(
+            query: query,
+            source: source,
+            configuredProjectChoices: configuredChoices
+        )
         guard fingerprint != lastGroupedThreadsFingerprint else { return }
         lastGroupedThreadsFingerprint = fingerprint
         groupedThreads = SidebarThreadGrouping.makeGroups(
             from: source,
             pinnedThreadIDs: codex.pinnedThreadIDs,
             scope: sidebarGroupingScope,
-            projectlessRootPaths: projectlessChatRootPaths
+            projectlessRootPaths: projectlessChatRootPaths,
+            configuredProjectChoices: configuredChoices
         )
         debugSidebarLog(
             "rebuildGroupedThreads durationMs=\(Int(Date().timeIntervalSince(startedAt) * 1000)) "
@@ -431,11 +464,21 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         )
     }
 
-    private func groupingFingerprint(query: String, source: [CodexThread]) -> Int {
+    private func groupingFingerprint(
+        query: String,
+        source: [CodexThread],
+        configuredProjectChoices: [SidebarProjectChoice]
+    ) -> Int {
         var hasher = Hasher()
         hasher.combine(query)
         hasher.combine(selectedContentScope)
+        hasher.combine(projectSourceRawValue)
         hasher.combine(projectlessChatRootPaths)
+        for choice in configuredProjectChoices {
+            hasher.combine(choice.id)
+            hasher.combine(choice.label)
+            hasher.combine(choice.projectPath)
+        }
         hasher.combine(codex.pinnedThreadIDs)
         for thread in source {
             hasher.combine(thread)
@@ -491,8 +534,27 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     private var newChatProjectChoices: [SidebarProjectChoice] {
         SidebarThreadGrouping.makeProjectChoices(
             from: codex.threads,
-            projectlessRootPaths: projectlessChatRootPaths
+            projectlessRootPaths: projectlessChatRootPaths,
+            configuredProjectChoices: selectedProjectSource == .configuredProjects ? configuredProjectChoices : []
         )
+    }
+
+    private var selectedProjectSource: SidebarProjectSource {
+        SidebarProjectSource(rawValue: projectSourceRawValue) ?? SidebarProjectSource.defaultSource
+    }
+
+    private func configuredProjectChoicesForGrouping(query: String) -> [SidebarProjectChoice] {
+        guard selectedProjectSource == .configuredProjects else {
+            return []
+        }
+        guard !query.isEmpty else {
+            return configuredProjectChoices
+        }
+
+        return configuredProjectChoices.filter {
+            $0.label.localizedCaseInsensitiveContains(query)
+                || $0.projectPath.localizedCaseInsensitiveContains(query)
+        }
     }
 
     private var sidebarGroupingScope: SidebarThreadGroupingScope {
@@ -538,7 +600,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     private var emptySidebarTitle: String {
         switch selectedContentScope {
         case .projects:
-            return "No project chats"
+            return selectedProjectSource == .configuredProjects ? "No configured projects" : "No project chats"
         case .chats:
             return "No chats"
         case .automations:
@@ -714,6 +776,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         )
         .refreshable {
             await refreshThreads()
+            await refreshConfiguredProjects()
         }
     }
 
@@ -781,6 +844,30 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         guard Self.isSidebarDebugLoggingEnabled else { return }
         print("[SidebarData] \(message())")
         #endif
+    }
+
+    private static func sidebarProjectChoices(from projects: [CodexConfiguredProject]) -> [SidebarProjectChoice] {
+        var seenProjectPaths: Set<String> = []
+        var choices: [SidebarProjectChoice] = []
+
+        for project in projects {
+            guard let projectPath = CodexThread.normalizedFilesystemProjectPath(project.path),
+                  seenProjectPaths.insert(projectPath).inserted else {
+                continue
+            }
+
+            choices.append(
+                SidebarProjectChoice(
+                    id: "project:\(projectPath)",
+                    label: CodexThread.projectDisplayLabel(for: projectPath),
+                    iconSystemName: CodexThread.projectIconSystemName(for: projectPath),
+                    projectPath: projectPath,
+                    sortDate: .distantPast
+                )
+            )
+        }
+
+        return choices
     }
 }
 

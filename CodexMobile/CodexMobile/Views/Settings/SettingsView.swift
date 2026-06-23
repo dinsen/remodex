@@ -55,6 +55,7 @@ struct SettingsView: View {
             SettingsAppearanceCard(appFontStyle: appFontStyleBinding)
             SettingsAppIconCard()
             SettingsNotificationsCard()
+            SettingsProjectsCard()
             SettingsRuntimeDefaultsCard()
             SettingsBridgeVersionCard {
                 presentSettingsSheet(.commandReference)
@@ -394,6 +395,33 @@ private struct SettingsAppIconCard: View {
                 }
             }
         }
+    }
+}
+
+private struct SettingsProjectsCard: View {
+    @AppStorage(SidebarProjectSource.storageKey)
+    private var projectSourceRawValue = SidebarProjectSource.defaultSource.rawValue
+
+    var body: some View {
+        SettingsCard(
+            title: "Projects",
+            footer: "Configured projects come from the paired Mac's Codex config."
+        ) {
+            Picker("Source", selection: projectSourceBinding) {
+                ForEach(SidebarProjectSource.allCases) { source in
+                    Text(source.title).tag(source)
+                }
+            }
+            .pickerStyle(.menu)
+            .tint(.primary)
+        }
+    }
+
+    private var projectSourceBinding: Binding<SidebarProjectSource> {
+        Binding(
+            get: { SidebarProjectSource(rawValue: projectSourceRawValue) ?? SidebarProjectSource.defaultSource },
+            set: { projectSourceRawValue = $0.rawValue }
+        )
     }
 }
 

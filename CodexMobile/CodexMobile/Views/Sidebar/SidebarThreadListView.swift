@@ -207,8 +207,12 @@ struct SidebarThreadListView: View {
             isCreatingThread: isCreatingThread,
             onToggle: { toggleProjectGroupExpansion(group.id) },
             onCreate: { onCreateThreadInProjectGroup(group) },
-            onArchive: onArchiveProjectGroup.map { handler in { handler(group) } },
-            onDelete: onDeleteProjectGroup.map { handler in { handler(group) } }
+            onArchive: group.threads.isEmpty
+                ? nil
+                : onArchiveProjectGroup.map { handler in { handler(group) } },
+            onDelete: group.threads.isEmpty
+                ? nil
+                : onDeleteProjectGroup.map { handler in { handler(group) } }
         )
     }
 

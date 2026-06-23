@@ -12,6 +12,7 @@ const path = require("path");
 const {
   handleProjectRequest,
   handleProjectMethod,
+  projectConfiguredProjects,
   projectCreateDirectory,
   projectCreateRootlessChatRoot,
   projectListDirectory,
@@ -48,6 +49,39 @@ test("project/projectlessRoots returns host-side Codex chat roots", async () => 
   assert.deepEqual(result.roots, [
     path.join(codexHome, "threads"),
     path.join(homeDir, "Documents", "Codex"),
+  ]);
+});
+
+test("project/configuredProjects returns trusted existing Codex config projects", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const existingProject = path.join(projectsRoot, "helper");
+  const untrustedProject = path.join(projectsRoot, "scratch");
+  const missingProject = path.join(projectsRoot, "missing");
+  fs.mkdirSync(existingProject, { recursive: true });
+  fs.mkdirSync(untrustedProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${existingProject}"]
+trust_level = "trusted"
+
+[projects."${untrustedProject}"]
+trust_level = "untrusted"
+
+[projects."${missingProject}"]
+trust_level = "trusted"
+`);
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.equal(result.configPath, path.join(codexHome, "config.toml"));
+  assert.deepEqual(result.projects, [
+    {
+      id: `project:${fs.realpathSync(existingProject)}`,
+      label: "helper",
+      path: fs.realpathSync(existingProject),
+    },
   ]);
 });
 

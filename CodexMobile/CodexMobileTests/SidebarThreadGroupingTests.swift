@@ -349,6 +349,51 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.iconSystemName, "arrow.triangle.branch")
     }
 
+    func testMakeGroupsIncludesConfiguredProjectsWithoutThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/helper",
+        ])
+        XCTAssertEqual(groups[1].label, "helper")
+        XCTAssertEqual(groups[1].projectPath, "/Users/me/work/helper")
+        XCTAssertEqual(groups[1].threads.map(\.id), [])
+    }
+
+    func testMakeGroupsMergesConfiguredProjectsWithMatchingRecentThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "helper-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/helper"])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["helper-thread"])
+    }
+
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let allThreads = [
@@ -676,6 +721,16 @@ final class SidebarThreadGroupingTests: XCTestCase {
             sortDate: .distantPast,
             projectPath: id.replacingOccurrences(of: "project:", with: ""),
             threads: []
+        )
+    }
+
+    private func makeProjectChoice(path: String) -> SidebarProjectChoice {
+        SidebarProjectChoice(
+            id: "project:\(path)",
+            label: path.pathDisplayName,
+            iconSystemName: CodexThread.projectIconSystemName(for: path),
+            projectPath: path,
+            sortDate: .distantPast
         )
     }
 
