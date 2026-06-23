@@ -455,6 +455,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             pinnedThreadIDs: codex.pinnedThreadIDs,
             scope: sidebarGroupingScope,
             projectlessRootPaths: projectlessChatRootPaths,
+            projectSource: selectedProjectSource,
             configuredProjectChoices: configuredChoices
         )
         debugSidebarLog(
@@ -535,6 +536,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         SidebarThreadGrouping.makeProjectChoices(
             from: codex.threads,
             projectlessRootPaths: projectlessChatRootPaths,
+            projectSource: selectedProjectSource,
             configuredProjectChoices: selectedProjectSource == .configuredProjects ? configuredProjectChoices : []
         )
     }

@@ -41,13 +41,13 @@ struct SidebarThreadListView: View {
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
 
-            if threads.isEmpty && !isFiltering {
+            if groups.isEmpty && !isFiltering {
                 Text(isConnected ? emptyStateTitle : "Connect to view conversations")
                     .foregroundStyle(.secondary)
                     .font(AppFont.subheadline())
                     .padding(.horizontal, 16)
                     .padding(.top, 20)
-            } else if groups.flatMap(\.threads).isEmpty && isFiltering {
+            } else if groups.isEmpty && isFiltering {
                 Text(emptyFilterTitle)
                     .foregroundStyle(.secondary)
                     .font(AppFont.subheadline())

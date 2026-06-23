@@ -95,6 +95,7 @@ enum SidebarThreadGrouping {
         pinnedThreadIDs: [String] = [],
         scope: SidebarThreadGroupingScope = .all,
         projectlessRootPaths: [String] = [],
+        projectSource: SidebarProjectSource = .recentThreadProjects,
         configuredProjectChoices: [SidebarProjectChoice] = [],
         now _: Date = Date(),
         calendar _: Calendar = .current
@@ -124,6 +125,7 @@ enum SidebarThreadGrouping {
             groups.append(contentsOf: makeProjectGroups(
                 from: projectThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
+                projectSource: projectSource,
                 configuredProjectChoices: configuredProjectChoices
             ))
             if let chatGroup = makeRootlessChatGroup(from: chatThreads, excludingPinnedThreadIDs: pinnedThreadIDSet) {
@@ -133,6 +135,7 @@ enum SidebarThreadGrouping {
             groups.append(contentsOf: makeProjectGroups(
                 from: scopedThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
+                projectSource: projectSource,
                 configuredProjectChoices: configuredProjectChoices
             ))
         case .chats:
@@ -175,13 +178,14 @@ enum SidebarThreadGrouping {
     static func makeProjectChoices(
         from threads: [CodexThread],
         projectlessRootPaths: [String] = [],
+        projectSource: SidebarProjectSource = .recentThreadProjects,
         configuredProjectChoices: [SidebarProjectChoice] = []
     ) -> [SidebarProjectChoice] {
         makeProjectGroups(from: threadsForScope(
             .projects,
             from: threads,
             projectlessRootPaths: projectlessRootPaths
-        ), configuredProjectChoices: configuredProjectChoices).compactMap { group in
+        ), projectSource: projectSource, configuredProjectChoices: configuredProjectChoices).compactMap { group in
             guard let projectPath = group.projectPath else {
                 return nil
             }
@@ -352,12 +356,17 @@ enum SidebarThreadGrouping {
     private static func makeProjectGroups(
         from threads: [CodexThread],
         excludingPinnedThreadIDs pinnedThreadIDs: Set<String> = [],
+        projectSource: SidebarProjectSource = .recentThreadProjects,
         configuredProjectChoices: [SidebarProjectChoice] = []
     ) -> [SidebarThreadGroup] {
         var liveThreadsByProject: [String: [CodexThread]] = [:]
+        let configuredProjectPaths = normalizedConfiguredProjectPaths(configuredProjectChoices)
 
         for thread in threads where thread.syncState != .archivedLocal {
             guard !pinnedThreadIDs.contains(thread.id) else {
+                continue
+            }
+            if projectSource == .configuredProjects && !configuredProjectPaths.contains(thread.projectKey) {
                 continue
             }
             liveThreadsByProject[thread.projectKey, default: []].append(thread)
@@ -368,23 +377,25 @@ enum SidebarThreadGrouping {
             return (group.id, group)
         })
 
-        for choice in configuredProjectChoices {
-            guard let projectPath = CodexThread.normalizedFilesystemProjectPath(choice.projectPath) else {
-                continue
-            }
-            let groupID = projectGroupID(forProjectPath: projectPath)
-            guard groupsByID[groupID] == nil else {
-                continue
-            }
+        if projectSource == .configuredProjects {
+            for choice in configuredProjectChoices {
+                guard let projectPath = CodexThread.normalizedFilesystemProjectPath(choice.projectPath) else {
+                    continue
+                }
+                let groupID = projectGroupID(forProjectPath: projectPath)
+                guard groupsByID[groupID] == nil else {
+                    continue
+                }
 
-            groupsByID[groupID] = SidebarThreadGroup(
-                id: groupID,
-                label: configuredProjectLabel(choice.label, projectPath: projectPath),
-                kind: .project,
-                sortDate: choice.sortDate,
-                projectPath: projectPath,
-                threads: []
-            )
+                groupsByID[groupID] = SidebarThreadGroup(
+                    id: groupID,
+                    label: configuredProjectLabel(choice.label, projectPath: projectPath),
+                    kind: .project,
+                    sortDate: choice.sortDate,
+                    projectPath: projectPath,
+                    threads: []
+                )
+            }
         }
 
         return groupsByID.values.sorted { lhs, rhs in
@@ -398,6 +409,10 @@ enum SidebarThreadGrouping {
 
             return lhs.id < rhs.id
         }
+    }
+
+    private static func normalizedConfiguredProjectPaths(_ choices: [SidebarProjectChoice]) -> Set<String> {
+        Set(choices.compactMap { CodexThread.normalizedFilesystemProjectPath($0.projectPath) })
     }
 
     private static func configuredProjectLabel(_ rawLabel: String, projectPath: String) -> String {

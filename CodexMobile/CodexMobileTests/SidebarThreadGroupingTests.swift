@@ -394,6 +394,39 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(groups[0].threads.map(\.id), ["helper-thread"])
     }
 
+    func testConfiguredProjectSourceExcludesRecentThreadProjectsOutsideConfig() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "configured-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+            makeThread(id: "recent-only-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/recent-only"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let configuredGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+        let recentGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .recentThreadProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(configuredGroups.map(\.id), ["project:/Users/me/work/helper"])
+        XCTAssertEqual(configuredGroups[0].threads.map(\.id), ["configured-thread"])
+        XCTAssertEqual(recentGroups.map(\.id), [
+            "project:/Users/me/work/recent-only",
+            "project:/Users/me/work/helper",
+        ])
+    }
+
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let allThreads = [
