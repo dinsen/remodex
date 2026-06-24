@@ -81,7 +81,7 @@ private struct CodexConnectionReadyWaitConfiguration: Sendable {
     let timeoutMessage: String
 }
 
-private final class CodexConnectionReadyWaitState: @unchecked Sendable {
+nonisolated private final class CodexConnectionReadyWaitState: @unchecked Sendable {
     private let lock = NSLock()
     private let continuation: CheckedContinuation<Void, Error>
     private let connection: NWConnection

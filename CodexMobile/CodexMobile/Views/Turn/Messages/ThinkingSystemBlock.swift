@@ -72,13 +72,13 @@ struct ThinkingSystemBlock: View {
 
         let capitalised = leading.prefix(1).uppercased() + leading.dropFirst()
 
-        return Text(capitalised)
+        let leadingText = Text(capitalised)
             .font(AppFont.caption(weight: .medium))
             .foregroundStyle(.secondary)
-        +
-        Text(remainder)
+        let remainderText = Text(remainder)
             .font(AppFont.caption())
             .foregroundStyle(.tertiary)
+        return Text("\(leadingText)\(remainderText)")
     }
 }
 

@@ -14,7 +14,7 @@ extension String {
     /// Falls back to the original string when `lastPathComponent` would be
     /// empty (e.g. for `"/"` or a trailing slash) so callers never have to
     /// guard against an empty display string after splitting a path.
-    var pathDisplayName: String {
+    nonisolated var pathDisplayName: String {
         let basename = (self as NSString).lastPathComponent
         return basename.isEmpty ? self : basename
     }

@@ -317,11 +317,9 @@ private struct SubagentAgentRowView: View {
     }
 
     private var labelText: some View {
-        (
-            SubagentLabelParser.styledText(for: title, roleSuffixColor: .primary)
-            + Text(" \(statusText)")
-                .foregroundColor(.secondary)
-        )
+        let titleText = SubagentLabelParser.styledText(for: title, roleSuffixColor: .primary)
+        let status = Text(statusText).foregroundColor(.secondary)
+        return Text("\(titleText) \(status)")
         .font(AppFont.caption())
         .lineLimit(1)
         .truncationMode(.tail)
@@ -483,11 +481,12 @@ enum SubagentLabelParser {
         roleSuffix: String,
         roleSuffixColor: Color = .secondary
     ) -> Text {
-        Text(nickname)
+        let nicknameText = Text(nickname)
             .foregroundColor(SubagentColorPalette.color(for: nickname))
             .fontWeight(.semibold)
-        + Text(roleSuffix)
+        let suffixText = Text(roleSuffix)
             .foregroundColor(roleSuffixColor)
+        return Text("\(nicknameText)\(suffixText)")
     }
 
     /// Convenience: parses title first, then builds styled Text.

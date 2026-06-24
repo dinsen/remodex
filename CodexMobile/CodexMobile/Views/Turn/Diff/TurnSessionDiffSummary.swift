@@ -21,7 +21,7 @@ enum TurnSessionDiffScope {
     case wholeThread
 }
 
-enum TurnSessionDiffResetMarker {
+nonisolated enum TurnSessionDiffResetMarker {
     static let manualPushItemID = "git.push.reset.marker"
 
     // Creates the hidden payload persisted after a successful manual push.

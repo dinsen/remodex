@@ -1053,12 +1053,12 @@ nonisolated enum InferredPlanQuestionnaireParser {
     }
 }
 
-private struct QuestionBlock {
+nonisolated private struct QuestionBlock {
     let number: Int
     var lines: [String]
 }
 
-private struct ParsedQuestionBlock {
+nonisolated private struct ParsedQuestionBlock {
     let question: CodexStructuredUserInputQuestion?
     let outroLines: [String]
 

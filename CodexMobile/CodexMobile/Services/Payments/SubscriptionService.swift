@@ -65,7 +65,7 @@ private struct CachedSubscriptionState: Codable, Equatable {
     let managementURLString: String?
 }
 
-private final class CustomerInfoUpdatesTaskStore {
+nonisolated private final class CustomerInfoUpdatesTaskStore {
     var task: Task<Void, Never>?
 
     func cancel() {

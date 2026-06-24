@@ -7,7 +7,7 @@
 import Foundation
 
 // Keeps TurnView lightweight by isolating menu formatting/sorting rules.
-enum TurnComposerMetaMapper {
+nonisolated enum TurnComposerMetaMapper {
     // ─── Model Mapping ────────────────────────────────────────────────
 
     // Returns models sorted using the explicit product order expected by the UI.
@@ -115,7 +115,7 @@ enum TurnComposerMetaMapper {
     }
 }
 
-struct TurnComposerReasoningDisplayOption: Identifiable, Equatable {
+nonisolated struct TurnComposerReasoningDisplayOption: Identifiable, Equatable {
     let effort: String
     let title: String
 

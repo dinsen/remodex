@@ -367,7 +367,7 @@ nonisolated enum AssistantMarkdownImageReferenceParser {
     }
 }
 
-enum CommandOutputImageReferenceParser {
+nonisolated enum CommandOutputImageReferenceParser {
     private static let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "gif", "webp", "heic", "heif"
     ]
@@ -607,17 +607,20 @@ struct CommandExecutionCardBody: View {
         return info
     }
 
+    private var displayText: Text {
+        let info = display
+        let verb = Text(info.verb)
+            .font(AppFont.body(weight: .regular))
+            .foregroundStyle(.secondary)
+        let target = Text(info.target)
+            .font(AppFont.body(weight: .regular))
+            .foregroundStyle(.tertiary)
+        return Text("\(verb) \(target)")
+    }
+
     var body: some View {
         HStack(spacing: 0) {
-            (
-                Text(display.verb)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.secondary)
-                +
-                Text(" " + display.target)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.tertiary)
-            )
+            displayText
             .lineLimit(1)
             .truncationMode(.tail)
 

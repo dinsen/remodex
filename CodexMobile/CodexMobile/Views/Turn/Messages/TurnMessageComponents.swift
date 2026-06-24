@@ -26,11 +26,11 @@ private let timelinePlaceholderCheckByteLimit = 128
 private let timelineFullTrimByteLimit = 64_000
 private let timelineActionTextTrimByteLimit = 64_000
 
-private func messageRowTextSignature(_ text: String) -> String {
+nonisolated private func messageRowTextSignature(_ text: String) -> String {
     return TurnTextCacheKey.stableFingerprint(for: text)
 }
 
-private struct MessageRowMessageSignature: Equatable {
+nonisolated private struct MessageRowMessageSignature: Equatable {
     let id: String
     let threadId: String
     let role: CodexMessageRole
@@ -81,7 +81,7 @@ private struct MessageRowMessageSignature: Equatable {
     }
 }
 
-private struct MessageRowAttachmentSignature: Equatable {
+nonisolated private struct MessageRowAttachmentSignature: Equatable {
     let id: String
     let thumbnailFingerprint: CodexTextContentFingerprint
     let payloadFingerprint: CodexTextContentFingerprint?
@@ -95,7 +95,7 @@ private struct MessageRowAttachmentSignature: Equatable {
     }
 }
 
-private struct MessageRowProposedPlanSignature: Equatable {
+nonisolated private struct MessageRowProposedPlanSignature: Equatable {
     let bodyFingerprint: String
     let summaryFingerprint: String?
 
@@ -105,7 +105,7 @@ private struct MessageRowProposedPlanSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStateSignature: Equatable {
+nonisolated private struct MessageRowPlanStateSignature: Equatable {
     let explanationFingerprint: String?
     let steps: [MessageRowPlanStepSignature]
 
@@ -115,7 +115,7 @@ private struct MessageRowPlanStateSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStepSignature: Equatable {
+nonisolated private struct MessageRowPlanStepSignature: Equatable {
     let id: String
     let stepFingerprint: String
     let status: CodexPlanStepStatus
@@ -127,7 +127,7 @@ private struct MessageRowPlanStepSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentActionSignature: Equatable {
+nonisolated private struct MessageRowSubagentActionSignature: Equatable {
     let tool: String
     let status: String
     let promptFingerprint: String?
@@ -150,7 +150,7 @@ private struct MessageRowSubagentActionSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentRefSignature: Equatable {
+nonisolated private struct MessageRowSubagentRefSignature: Equatable {
     let threadId: String
     let agentId: String?
     let nickname: String?
@@ -168,7 +168,7 @@ private struct MessageRowSubagentRefSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentStateSignature: Equatable {
+nonisolated private struct MessageRowSubagentStateSignature: Equatable {
     let threadId: String
     let status: String
     let messageFingerprint: String?
@@ -180,7 +180,7 @@ private struct MessageRowSubagentStateSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputRequestSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputRequestSignature: Equatable {
     let requestID: JSONValue
     let questions: [MessageRowStructuredInputQuestionSignature]
 
@@ -190,7 +190,7 @@ private struct MessageRowStructuredInputRequestSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputQuestionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputQuestionSignature: Equatable {
     let id: String
     let headerFingerprint: String
     let questionFingerprint: String
@@ -210,7 +210,7 @@ private struct MessageRowStructuredInputQuestionSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputOptionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputOptionSignature: Equatable {
     let id: String
     let labelFingerprint: String
     let descriptionFingerprint: String

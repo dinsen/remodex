@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct WorkspaceImageMetadata: Sendable {
+nonisolated struct WorkspaceImageMetadata: Sendable {
     let path: String
     let fileName: String
     let mimeType: String
@@ -15,7 +15,7 @@ struct WorkspaceImageMetadata: Sendable {
     let previewMaxPixelDimension: Int?
 }
 
-struct WorkspaceImageReadResult: Sendable {
+nonisolated struct WorkspaceImageReadResult: Sendable {
     let path: String
     let fileName: String
     let mimeType: String

@@ -228,7 +228,7 @@ private struct SidebarSubagentNameLabel: View {
 // MARK: - Preview
 
 private enum SidebarRowPreviewFixtures {
-    static let now = Date()
+    nonisolated static let now = Date()
 
     // Two project groups worth of threads with subagent hierarchies
     static let allThreads: [CodexThread] = [
@@ -271,7 +271,7 @@ private enum SidebarRowPreviewFixtures {
         "t3": .ready,
     ]
 
-    static func timingLabel(for thread: CodexThread) -> String? {
+    nonisolated static func timingLabel(for thread: CodexThread) -> String? {
         guard let updated = thread.updatedAt else { return nil }
         let seconds = Int(now.timeIntervalSince(updated))
         if seconds < 60 { return "\(seconds)s" }

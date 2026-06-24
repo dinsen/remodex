@@ -29,7 +29,7 @@ enum CodexMessageKind: String, Codable, Hashable, Sendable {
     case userInputPrompt
 }
 
-struct CodexMessageTextRenderSignature: Codable, Hashable, Sendable {
+nonisolated struct CodexMessageTextRenderSignature: Codable, Hashable, Sendable {
     let byteCount: Int
     let revision: Int
 

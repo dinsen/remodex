@@ -184,6 +184,16 @@ private struct TurnTimelineToolBurstView: View {
         group.hiddenCount == 1 ? "tool call" : "tool calls"
     }
 
+    private var summaryLabelText: Text {
+        let count = Text(summaryCountLabel)
+            .font(AppFont.subheadline(weight: .medium))
+            .foregroundStyle(.secondary)
+        let noun = Text(summaryNounLabel)
+            .font(AppFont.subheadline())
+            .foregroundStyle(.tertiary)
+        return Text("\(count) \(noun)")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             ForEach(group.pinnedMessages) { message in
@@ -217,15 +227,7 @@ private struct TurnTimelineToolBurstView: View {
                             .font(AppFont.system(size: 10, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        (
-                            Text(summaryCountLabel)
-                                .font(AppFont.subheadline(weight: .medium))
-                                .foregroundStyle(.secondary)
-                            +
-                            Text(" " + summaryNounLabel)
-                                .font(AppFont.subheadline())
-                                .foregroundStyle(.tertiary)
-                        )
+                        summaryLabelText
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())

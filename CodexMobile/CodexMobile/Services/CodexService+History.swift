@@ -7,7 +7,7 @@
 import Foundation
 import UIKit
 
-fileprivate struct UserMessageSemanticKey: Equatable {
+nonisolated fileprivate struct UserMessageSemanticKey: Equatable {
     let text: String
     let skillMentions: Set<String>
     let pluginMentions: Set<String>

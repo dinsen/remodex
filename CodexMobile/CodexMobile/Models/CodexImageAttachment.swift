@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexImageAttachment: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexImageAttachment: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let thumbnailBase64JPEG: String
     let payloadDataURL: String?
@@ -79,7 +79,7 @@ struct CodexImageAttachment: Identifiable, Codable, Hashable, Sendable {
 
     // History rows usually keep thumbnails; callers can preserve bounded inline payloads
     // when the original file path is not previewable through the workspace bridge.
-    func sanitizedForStorage(preservingPayloadDataURL: Bool) -> CodexImageAttachment {
+    nonisolated func sanitizedForStorage(preservingPayloadDataURL: Bool) -> CodexImageAttachment {
         CodexImageAttachment(
             id: id,
             thumbnailBase64JPEG: thumbnailBase64JPEG,

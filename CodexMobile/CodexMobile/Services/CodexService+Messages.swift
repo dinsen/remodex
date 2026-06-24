@@ -1531,7 +1531,6 @@ extension CodexService {
                 if threadMessages[targetIndex].itemId == nil {
                     threadMessages[targetIndex].itemId = itemId
                 }
-                let keepID = threadMessages[targetIndex].id
                 pruneDuplicateSystemRows(
                     in: &threadMessages,
                     keepIndex: targetIndex,

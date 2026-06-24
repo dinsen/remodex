@@ -100,7 +100,7 @@ final class BoundedCache<Key: Hashable, Value> {
     }
 }
 
-enum TurnTextCacheKey {
+nonisolated enum TurnTextCacheKey {
     private static let sampleByteCount = 24
     private static let hexDigits = Array("0123456789abcdef")
 
