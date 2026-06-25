@@ -240,7 +240,7 @@ extension CodexService {
         SecureStore.deleteValue(for: CodexSecureKeys.relayMacDeviceId)
         SecureStore.deleteValue(for: CodexSecureKeys.relayMacIdentityPublicKey)
         SecureStore.deleteValue(for: CodexSecureKeys.relayProtocolVersion)
-        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.deleteRelayLastAppliedBridgeOutboundSeq()
         relaySessionId = nil
         relayUrl = nil
         relayMacDeviceId = nil
@@ -269,7 +269,7 @@ extension CodexService {
         }
 
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
-        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.deleteRelayLastAppliedBridgeOutboundSeq()
         relaySessionId = nil
         lastAppliedBridgeOutboundSeq = 0
         shouldForceQRBootstrapOnNextHandshake = false

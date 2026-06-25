@@ -1200,9 +1200,13 @@ extension ContentViewModel {
             SecureStore.deleteValue(for: CodexSecureKeys.relayMacIdentityPublicKey)
         }
         SecureStore.writeString(String(snapshot.relayProtocolVersion), for: CodexSecureKeys.relayProtocolVersion)
-        SecureStore.writeString(
-            String(snapshot.lastAppliedBridgeOutboundSeq),
-            for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
-        )
+        if let relaySessionId = snapshot.relaySessionId {
+            SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+                snapshot.lastAppliedBridgeOutboundSeq,
+                sessionID: relaySessionId
+            )
+        } else {
+            SecureStoreReplayCursorWriter.shared.deleteRelayLastAppliedBridgeOutboundSeq()
+        }
     }
 }

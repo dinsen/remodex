@@ -133,3 +133,91 @@ enum SecureStore {
         Bundle.main.bundleIdentifier ?? "com.codexmobile.app"
     }
 }
+
+actor SecureStoreReplayCursorWriter {
+    nonisolated static let shared = SecureStoreReplayCursorWriter()
+
+    private struct PendingRelayReplayCursor {
+        let sessionID: String
+        let sequence: Int
+    }
+
+    private var currentRelaySessionID: String?
+    private var pendingRelayReplayCursor: PendingRelayReplayCursor?
+    private var relayReplayCursorFlushTask: Task<Void, Never>?
+
+    nonisolated func scheduleRelayLastAppliedBridgeOutboundSeq(_ sequence: Int, sessionID: String) {
+        Task.detached(priority: .utility) {
+            await self.enqueueRelayLastAppliedBridgeOutboundSeq(sequence, sessionID: sessionID)
+        }
+    }
+
+    nonisolated func persistRelayLastAppliedBridgeOutboundSeqImmediately(_ sequence: Int, sessionID: String) {
+        Task.detached(priority: .utility) {
+            await self.persistRelayLastAppliedBridgeOutboundSeq(sequence, sessionID: sessionID)
+        }
+    }
+
+    nonisolated func deleteRelayLastAppliedBridgeOutboundSeq() {
+        Task.detached(priority: .utility) {
+            await self.deleteRelayLastAppliedBridgeOutboundSeqValue()
+        }
+    }
+
+    private func enqueueRelayLastAppliedBridgeOutboundSeq(_ sequence: Int, sessionID: String) {
+        if let currentRelaySessionID, currentRelaySessionID != sessionID {
+            return
+        }
+
+        currentRelaySessionID = sessionID
+        let pendingSequence: Int
+        if let pendingRelayReplayCursor, pendingRelayReplayCursor.sessionID == sessionID {
+            pendingSequence = max(pendingRelayReplayCursor.sequence, sequence)
+        } else {
+            pendingSequence = sequence
+        }
+        pendingRelayReplayCursor = PendingRelayReplayCursor(
+            sessionID: sessionID,
+            sequence: pendingSequence
+        )
+
+        relayReplayCursorFlushTask?.cancel()
+        relayReplayCursorFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.flushRelayLastAppliedBridgeOutboundSeq()
+        }
+    }
+
+    private func persistRelayLastAppliedBridgeOutboundSeq(_ sequence: Int, sessionID: String) {
+        currentRelaySessionID = sessionID
+        pendingRelayReplayCursor = nil
+        relayReplayCursorFlushTask?.cancel()
+        relayReplayCursorFlushTask = nil
+        SecureStore.writeString(
+            String(sequence),
+            for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
+        )
+    }
+
+    private func deleteRelayLastAppliedBridgeOutboundSeqValue() {
+        currentRelaySessionID = nil
+        pendingRelayReplayCursor = nil
+        relayReplayCursorFlushTask?.cancel()
+        relayReplayCursorFlushTask = nil
+        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+    }
+
+    private func flushRelayLastAppliedBridgeOutboundSeq() {
+        relayReplayCursorFlushTask = nil
+        guard let pendingRelayReplayCursor else { return }
+        self.pendingRelayReplayCursor = nil
+        guard pendingRelayReplayCursor.sessionID == currentRelaySessionID else {
+            return
+        }
+        SecureStore.writeString(
+            String(pendingRelayReplayCursor.sequence),
+            for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
+        )
+    }
+}

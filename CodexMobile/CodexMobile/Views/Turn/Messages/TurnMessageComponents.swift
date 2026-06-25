@@ -26,17 +26,47 @@ private let timelinePlaceholderCheckByteLimit = 128
 private let timelineFullTrimByteLimit = 64_000
 private let timelineActionTextTrimByteLimit = 64_000
 
-private func messageRowTextSignature(_ text: String) -> String {
-    return TurnTextCacheKey.stableFingerprint(for: text)
+private nonisolated func messageRowTextSignature(_ text: String) -> String {
+    return CodexTextContentFingerprint.cacheKey(for: text)
 }
 
-private struct MessageRowMessageSignature: Equatable {
+private nonisolated func messageRowJSONSignature(_ value: JSONValue) -> String {
+    switch value {
+    case .string(let string):
+        return "s:\(messageRowTextSignature(string))"
+    case .integer(let integer):
+        return "i:\(integer)"
+    case .double(let double):
+        return "d:\(double.bitPattern)"
+    case .bool(let bool):
+        return "b:\(bool)"
+    case .object(let object):
+        return object
+            .keys
+            .sorted()
+            .map { key in
+                "\(messageRowTextSignature(key)):\(messageRowJSONSignature(object[key] ?? .null))"
+            }
+            .joined(separator: ",")
+    case .array(let array):
+        return array
+            .map(messageRowJSONSignature)
+            .joined(separator: ",")
+    case .null:
+        return "n"
+    }
+}
+
+nonisolated private struct MessageRowMessageSignature: Equatable {
+    private static let focusedComposerStreamingTextByteLimit = 512
+
     let id: String
     let threadId: String
     let role: CodexMessageRole
     let kind: CodexMessageKind
     let assistantPhase: String?
-    let textFingerprint: CodexMessageTextRenderSignature
+    let textByteCount: Int?
+    let textRevision: Int?
     let fileMentions: [String]
     let skillMentions: [String]
     let pluginMentions: [String]
@@ -54,13 +84,22 @@ private struct MessageRowMessageSignature: Equatable {
     let structuredUserInputRequest: MessageRowStructuredInputRequestSignature?
     let orderIndex: Int
 
-    init(_ message: CodexMessage) {
+    init(_ message: CodexMessage, prioritizesComposerInput: Bool) {
         self.id = message.id
         self.threadId = message.threadId
         self.role = message.role
         self.kind = message.kind
         self.assistantPhase = message.assistantPhase
-        self.textFingerprint = message.textRenderSignature
+        if Self.shouldSuppressStreamingTextInvalidation(
+            for: message,
+            prioritizesComposerInput: prioritizesComposerInput
+        ) {
+            self.textByteCount = nil
+            self.textRevision = nil
+        } else {
+            self.textByteCount = message.textRenderSignature.byteCount
+            self.textRevision = message.textRenderSignature.revision
+        }
         self.fileMentions = message.fileMentions
         self.skillMentions = message.skillMentions
         self.pluginMentions = message.pluginMentions
@@ -79,9 +118,19 @@ private struct MessageRowMessageSignature: Equatable {
             .map(MessageRowStructuredInputRequestSignature.init)
         self.orderIndex = message.orderIndex
     }
+
+    private static func shouldSuppressStreamingTextInvalidation(
+        for message: CodexMessage,
+        prioritizesComposerInput: Bool
+    ) -> Bool {
+        prioritizesComposerInput
+            && message.role == .assistant
+            && message.isStreaming
+            && message.textRenderSignature.byteCount > focusedComposerStreamingTextByteLimit
+    }
 }
 
-private struct MessageRowAttachmentSignature: Equatable {
+nonisolated private struct MessageRowAttachmentSignature: Equatable {
     let id: String
     let thumbnailFingerprint: CodexTextContentFingerprint
     let payloadFingerprint: CodexTextContentFingerprint?
@@ -95,7 +144,7 @@ private struct MessageRowAttachmentSignature: Equatable {
     }
 }
 
-private struct MessageRowProposedPlanSignature: Equatable {
+nonisolated private struct MessageRowProposedPlanSignature: Equatable {
     let bodyFingerprint: String
     let summaryFingerprint: String?
 
@@ -105,7 +154,7 @@ private struct MessageRowProposedPlanSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStateSignature: Equatable {
+nonisolated private struct MessageRowPlanStateSignature: Equatable {
     let explanationFingerprint: String?
     let steps: [MessageRowPlanStepSignature]
 
@@ -115,7 +164,7 @@ private struct MessageRowPlanStateSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStepSignature: Equatable {
+nonisolated private struct MessageRowPlanStepSignature: Equatable {
     let id: String
     let stepFingerprint: String
     let status: CodexPlanStepStatus
@@ -127,7 +176,7 @@ private struct MessageRowPlanStepSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentActionSignature: Equatable {
+nonisolated private struct MessageRowSubagentActionSignature: Equatable {
     let tool: String
     let status: String
     let promptFingerprint: String?
@@ -150,7 +199,7 @@ private struct MessageRowSubagentActionSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentRefSignature: Equatable {
+nonisolated private struct MessageRowSubagentRefSignature: Equatable {
     let threadId: String
     let agentId: String?
     let nickname: String?
@@ -168,7 +217,7 @@ private struct MessageRowSubagentRefSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentStateSignature: Equatable {
+nonisolated private struct MessageRowSubagentStateSignature: Equatable {
     let threadId: String
     let status: String
     let messageFingerprint: String?
@@ -180,17 +229,17 @@ private struct MessageRowSubagentStateSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputRequestSignature: Equatable {
-    let requestID: JSONValue
+nonisolated private struct MessageRowStructuredInputRequestSignature: Equatable {
+    let requestIDFingerprint: String
     let questions: [MessageRowStructuredInputQuestionSignature]
 
     init(_ request: CodexStructuredUserInputRequest) {
-        self.requestID = request.requestID
+        self.requestIDFingerprint = messageRowJSONSignature(request.requestID)
         self.questions = request.questions.map(MessageRowStructuredInputQuestionSignature.init)
     }
 }
 
-private struct MessageRowStructuredInputQuestionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputQuestionSignature: Equatable {
     let id: String
     let headerFingerprint: String
     let questionFingerprint: String
@@ -210,7 +259,7 @@ private struct MessageRowStructuredInputQuestionSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputOptionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputOptionSignature: Equatable {
     let id: String
     let labelFingerprint: String
     let descriptionFingerprint: String
@@ -353,7 +402,13 @@ struct MessageRow: View, Equatable {
     @State private var previewImage: PreviewImagePayload?
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
-        MessageRowMessageSignature(lhs.message) == MessageRowMessageSignature(rhs.message)
+        MessageRowMessageSignature(
+            lhs.message,
+            prioritizesComposerInput: lhs.prioritizesComposerInput
+        ) == MessageRowMessageSignature(
+            rhs.message,
+            prioritizesComposerInput: rhs.prioritizesComposerInput
+        )
             && lhs.isRetryAvailable == rhs.isRetryAvailable
             && lhs.assistantBlockAccessoryState == rhs.assistantBlockAccessoryState
             && lhs.planSessionSource == rhs.planSessionSource

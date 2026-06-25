@@ -264,7 +264,10 @@ extension CodexService {
         SecureStore.writeString(payload.macDeviceId, for: CodexSecureKeys.relayMacDeviceId)
         SecureStore.writeString(payload.macIdentityPublicKey, for: CodexSecureKeys.relayMacIdentityPublicKey)
         SecureStore.writeString(String(codexSecureProtocolVersion), for: CodexSecureKeys.relayProtocolVersion)
-        SecureStore.writeString("0", for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+            0,
+            sessionID: payload.sessionId
+        )
         relaySessionId = payload.sessionId
         relayUrl = payload.relay
         relayMacDeviceId = payload.macDeviceId
@@ -369,7 +372,10 @@ extension CodexService {
         let previousSessionId = normalizedRelaySessionId
         let shouldResetReplayCursor = previousSessionId == nil || previousSessionId != resolved.sessionId
         if shouldResetReplayCursor {
-            SecureStore.writeString("0", for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+            SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+                0,
+                sessionID: resolved.sessionId
+            )
             lastAppliedBridgeOutboundSeq = 0
         }
         rememberResolvedTrustedSession(resolved, relayURL: relayURL)
@@ -984,9 +990,9 @@ private extension CodexService {
                     return
                 }
                 lastAppliedBridgeOutboundSeq = bridgeOutboundSeq
-                SecureStore.writeString(
-                    String(bridgeOutboundSeq),
-                    for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
+                SecureStoreReplayCursorWriter.shared.scheduleRelayLastAppliedBridgeOutboundSeq(
+                    bridgeOutboundSeq,
+                    sessionID: secureSession.sessionId
                 )
             }
 
