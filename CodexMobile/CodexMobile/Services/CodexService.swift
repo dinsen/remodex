@@ -372,6 +372,8 @@ final class CodexService {
     var failedThreadIDs: Set<String> = []
     // Threads that started a real run and haven't completed yet; survives sync-poll clearing.
     @ObservationIgnored var threadsPendingCompletionHaptic: Set<String> = []
+    @ObservationIgnored var composerFocusedThreadIDs: Set<String> = []
+    @ObservationIgnored var deferredStreamingTimelineRefreshThreadIDs: Set<String> = []
     // Keeps the latest terminal outcome per thread so UI can react to real run completion.
     var latestTurnTerminalStateByThread: [String: CodexTurnTerminalState] = [:]
     // Preserves terminal outcome per turn so completed/stopped blocks stay distinguishable.

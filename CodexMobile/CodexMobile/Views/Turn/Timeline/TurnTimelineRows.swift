@@ -120,6 +120,7 @@ private struct TurnTimelineMessageRow: View {
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
     let autoScrollMode: TurnAutoScrollMode
+    let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
@@ -137,8 +138,10 @@ private struct TurnTimelineMessageRow: View {
             threadMessagesForPlanMatching: threadMessagesForPlanMatching,
             currentWorkingDirectory: currentWorkingDirectory,
             planMatchingFingerprint: planMatchingFingerprint,
-            showsStreamingAnimations: autoScrollMode == .followBottom
+            showsStreamingAnimations: !prioritizesComposerInput
+                && autoScrollMode == .followBottom
                 && message.id == newestStreamingMessageID,
+            prioritizesComposerInput: prioritizesComposerInput,
             protectsPendingIndicatorAnchor: showsGlobalRunningIndicator,
             inlineCommitAndPushAction: inlineCommitAndPushAction,
             inlineCommitAndPushPhase: inlineCommitAndPushPhase,
@@ -169,6 +172,7 @@ private struct TurnTimelineToolBurstView: View {
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
     let autoScrollMode: TurnAutoScrollMode
+    let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
@@ -199,6 +203,7 @@ private struct TurnTimelineToolBurstView: View {
                     planMatchingFingerprint: planMatchingFingerprint,
                     newestStreamingMessageID: newestStreamingMessageID,
                     autoScrollMode: autoScrollMode,
+                    prioritizesComposerInput: prioritizesComposerInput,
                     showsGlobalRunningIndicator: showsGlobalRunningIndicator,
                     onRetryUserMessage: onRetryUserMessage,
                     onTapAssistantRevert: onTapAssistantRevert,
@@ -247,6 +252,7 @@ private struct TurnTimelineToolBurstView: View {
                         planMatchingFingerprint: planMatchingFingerprint,
                         newestStreamingMessageID: newestStreamingMessageID,
                         autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: showsGlobalRunningIndicator,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
@@ -270,6 +276,7 @@ private struct TurnTimelinePreviousMessagesView: View {
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
     let autoScrollMode: TurnAutoScrollMode
+    let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
@@ -324,6 +331,7 @@ private struct TurnTimelinePreviousMessagesView: View {
                         planMatchingFingerprint: planMatchingFingerprint,
                         newestStreamingMessageID: newestStreamingMessageID,
                         autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: showsGlobalRunningIndicator,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
@@ -355,6 +363,7 @@ struct TurnTimelineRowsSection: View {
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
     let autoScrollMode: TurnAutoScrollMode
+    let prioritizesComposerInput: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
     let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
@@ -407,6 +416,7 @@ struct TurnTimelineRowsSection: View {
                         planMatchingFingerprint: planMatchingFingerprint,
                         newestStreamingMessageID: newestStreamingMessageID,
                         autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: shouldUseGlobalRunningIndicator,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
@@ -425,6 +435,7 @@ struct TurnTimelineRowsSection: View {
                         planMatchingFingerprint: planMatchingFingerprint,
                         newestStreamingMessageID: newestStreamingMessageID,
                         autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: shouldUseGlobalRunningIndicator,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
@@ -443,6 +454,7 @@ struct TurnTimelineRowsSection: View {
                         planMatchingFingerprint: planMatchingFingerprint,
                         newestStreamingMessageID: newestStreamingMessageID,
                         autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: shouldUseGlobalRunningIndicator,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,

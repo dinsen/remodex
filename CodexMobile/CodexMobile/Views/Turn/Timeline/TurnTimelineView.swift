@@ -353,6 +353,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                             planMatchingFingerprint: planMatchingFingerprint,
                             newestStreamingMessageID: renderCacheState.newestStreamingMessageID,
                             autoScrollMode: autoScrollMode,
+                            prioritizesComposerInput: isComposerFocused,
                             onRetryUserMessage: onRetryUserMessage,
                             onTapAssistantRevert: onTapAssistantRevert,
                             onTapSubagent: onTapSubagent,

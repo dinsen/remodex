@@ -21,10 +21,10 @@ private enum StreamingDeltaCoalescingPolicy {
     static let flushDelayNanoseconds: UInt64 = 50_000_000
     // Assistant prose gets one quick first paint, then a calmer cadence once text is visible.
     static let assistantInitialFlushDelayNanoseconds: UInt64 = 50_000_000
-    static let assistantStreamingFlushDelayNanoseconds: UInt64 = 80_000_000
-    static let assistantLargeStreamingFlushDelayNanoseconds: UInt64 = 100_000_000
-    static let assistantLargePendingDeltaByteCount = 12_000
-    static let assistantLargeVisibleTextByteCount = 32_000
+    static let assistantStreamingFlushDelayNanoseconds: UInt64 = 250_000_000
+    static let assistantLargeStreamingFlushDelayNanoseconds: UInt64 = 500_000_000
+    static let assistantLargePendingDeltaByteCount = 4_000
+    static let assistantLargeVisibleTextByteCount = 2_000
     static let assistantReplayOverlapSearchByteLimit = 32_768
 }
 
@@ -166,6 +166,18 @@ extension CodexService {
         messageRevisionByThread[threadId] ?? 0
     }
 
+    func setComposerInputFocused(_ isFocused: Bool, for threadId: String) {
+        if isFocused {
+            composerFocusedThreadIDs.insert(threadId)
+            return
+        }
+
+        composerFocusedThreadIDs.remove(threadId)
+        if deferredStreamingTimelineRefreshThreadIDs.remove(threadId) != nil {
+            refreshThreadTimelineState(for: threadId)
+        }
+    }
+
     // Returns the service-owned timeline state for a single thread.
     func timelineState(for threadId: String) -> ThreadTimelineState {
         if let existing = threadTimelineStateByThread[threadId] {
@@ -182,6 +194,8 @@ extension CodexService {
     func removeThreadTimelineState(for threadId: String) {
         threadTimelineStateByThread.removeValue(forKey: threadId)
         stoppedTurnIDsByThread.removeValue(forKey: threadId)
+        composerFocusedThreadIDs.remove(threadId)
+        deferredStreamingTimelineRefreshThreadIDs.remove(threadId)
         messageIndexCacheByThread.removeValue(forKey: threadId)
         latestAssistantOutputByThread.removeValue(forKey: threadId)
         latestAssistantMessageIDByThread.removeValue(forKey: threadId)
@@ -236,6 +250,7 @@ extension CodexService {
     // Refreshes the derived output cache and bumps the thread timeline revision.
     func updateCurrentOutput(for threadId: String) {
         noteMessagesChanged(for: threadId)
+        deferredStreamingTimelineRefreshThreadIDs.remove(threadId)
 
         let latestAssistantText = syncLatestAssistantOutputCache(for: threadId)
         refreshThreadTimelineState(for: threadId)
@@ -276,6 +291,11 @@ extension CodexService {
             return
         }
         let updatedMessage = rawMessages[updatedMessageIndex]
+        if shouldDeferStreamingTimelineRefresh(threadId: threadId, message: updatedMessage) {
+            deferredStreamingTimelineRefreshThreadIDs.insert(threadId)
+            return
+        }
+
         if updatedMessage.role == .assistant,
            let terminalMessageId = assistantReplayTargetMessageId(
                in: rawMessages,
@@ -323,6 +343,13 @@ extension CodexService {
             initialTurnsLoaded: state.renderSnapshot.initialTurnsLoaded,
             olderHistoryLoadErrorMessage: state.renderSnapshot.olderHistoryLoadErrorMessage
         )
+    }
+
+    private func shouldDeferStreamingTimelineRefresh(threadId: String, message: CodexMessage) -> Bool {
+        activeThreadId == threadId
+            && composerFocusedThreadIDs.contains(threadId)
+            && message.role == .assistant
+            && message.isStreaming
     }
 
     // Patches an already-projected streaming system row without rerunning the reducer.
@@ -640,10 +667,19 @@ extension CodexService {
 
     // Marks thread as actively running while ensuring stale outcomes are cleared.
     func markThreadAsRunning(_ threadId: String) {
+        let wasRunning = threadHasActiveOrRunningTurn(threadId)
+        let hadTerminalState = latestTurnTerminalStateByThread[threadId] != nil
+        let hadOutcomeBadge = readyThreadIDs.contains(threadId) || failedThreadIDs.contains(threadId)
+
         runningThreadIDs.insert(threadId)
         threadsPendingCompletionHaptic.insert(threadId)
         latestTurnTerminalStateByThread.removeValue(forKey: threadId)
         clearOutcomeBadge(for: threadId)
+
+        guard !wasRunning || hadTerminalState || hadOutcomeBadge else {
+            return
+        }
+
         refreshBusyRepoRootsAndDependentTimelineStates()
         refreshThreadTimelineState(for: threadId)
         updateBackgroundRunGraceTask()

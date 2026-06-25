@@ -424,18 +424,28 @@ struct TurnView: View {
             }
         )
         .onDisappear {
+            codex.setComposerInputFocused(false, for: thread.id)
             viewModel.saveLocalDraft(codex: codex, threadID: thread.id, persistToDisk: true)
             handleVoiceViewDisappear()
             viewModel.cancelTransientTasks()
             viewModel.clearComposerAutocomplete()
         }
         .onChange(of: isInputFocused) { _, isFocused in
-            guard !isFocused else { return }
             // Defer the observable-model mutation out of the .onChange action
             // to avoid AttributeGraph cycles during send.
             DispatchQueue.main.async {
-                viewModel.clearComposerAutocomplete()
+                codex.setComposerInputFocused(isFocused, for: thread.id)
+                if !isFocused {
+                    viewModel.clearComposerAutocomplete()
+                }
             }
+        }
+        .onChange(of: viewModel.input) { _, input in
+            guard isThreadRunning,
+                  !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return
+            }
+            codex.setComposerInputFocused(true, for: thread.id)
         }
         .onChange(of: showsGitControls) { _, isVisible in
             guard isVisible else { return }

@@ -335,6 +335,8 @@ struct MessageRow: View, Equatable {
     var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
+    // Gives composer edits priority over live assistant prose updates during streaming.
+    var prioritizesComposerInput: Bool = false
     // True while the sticky "Remodex is thinking" row is visible at the bottom of the timeline.
     var protectsPendingIndicatorAnchor: Bool = false
     // Passed as init params so .equatable() can invalidate only for row-visible action state.
@@ -360,6 +362,7 @@ struct MessageRow: View, Equatable {
             && lhs.currentWorkingDirectory == rhs.currentWorkingDirectory
             && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
+            && lhs.prioritizesComposerInput == rhs.prioritizesComposerInput
             && lhs.protectsPendingIndicatorAnchor == rhs.protectsPendingIndicatorAnchor
             && (lhs.inlineCommitAndPushAction != nil) == (rhs.inlineCommitAndPushAction != nil)
             && lhs.inlineCommitAndPushPhase == rhs.inlineCommitAndPushPhase
@@ -395,11 +398,15 @@ struct MessageRow: View, Equatable {
 
     private func shouldSynchronizeAssistantDisplayImmediately() -> Bool {
         guard message.isStreaming else { return true }
+        let nextText = timelineDisplayWindow(for: message, expansionLevel: textExpansionLevel).text
+        if prioritizesComposerInput {
+            return throttledAssistantDisplayText == nil
+                && shouldShowInitialStreamingText(nextText)
+        }
         if showsStreamingAnimations {
             return true
         }
 
-        let nextText = timelineDisplayWindow(for: message, expansionLevel: textExpansionLevel).text
         return shouldShowInitialStreamingText(nextText)
     }
 
@@ -474,6 +481,9 @@ struct MessageRow: View, Equatable {
         }
         .onChange(of: message.isStreaming) { _, isStreaming in
             synchronizeAssistantDisplayText(immediate: !isStreaming)
+        }
+        .onChange(of: prioritizesComposerInput) { _, prioritizesComposerInput in
+            synchronizeAssistantDisplayText(immediate: !prioritizesComposerInput)
         }
         .onChange(of: textExpansionLevel) { _, _ in
             synchronizeAssistantDisplayText(immediate: true)
@@ -818,6 +828,14 @@ struct MessageRow: View, Equatable {
             assistantDisplayUpdateTask?.cancel()
             assistantDisplayUpdateTask = nil
             throttledAssistantDisplayText = nextText
+            return
+        }
+
+        if prioritizesComposerInput {
+            if throttledAssistantDisplayText == nil,
+               shouldShowInitialStreamingText(nextText) {
+                throttledAssistantDisplayText = nextText
+            }
             return
         }
 

@@ -25,8 +25,8 @@ enum ThreadHistoryHydrationPolicy {
 }
 
 enum TimelineTextClippingPolicy {
-    private static let streamingProseByteLimit = 4_000
-    private static let proseByteLimit = 4_000
+    private static let streamingProseByteLimit = 1_200
+    private static let proseByteLimit = 2_000
     private static let fileChangeByteLimit = 48_000
     private static let thinkingByteLimit = 16_000
     private static let activityByteLimit = 8_000
