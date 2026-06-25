@@ -25,6 +25,7 @@ private let timelineStreamingPlaceholderTexts: Set<String> = [
 private let timelinePlaceholderCheckByteLimit = 128
 private let timelineFullTrimByteLimit = 64_000
 private let timelineActionTextTrimByteLimit = 64_000
+private let streamingAssistantAccessibilityPreviewCharacterLimit = 600
 
 private nonisolated func messageRowTextSignature(_ text: String) -> String {
     return CodexTextContentFingerprint.cacheKey(for: text)
@@ -809,7 +810,26 @@ struct MessageRow: View, Equatable {
                 animatesReveal: showsStreamingAnimations,
                 protectsPendingIndicatorAnchor: protectsPendingIndicatorAnchor
             )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                streamingAssistantAccessibilityLabel(for: visibleAssistantTextWithoutImageSyntax)
+            )
         }
+    }
+
+    private func streamingAssistantAccessibilityLabel(for text: String) -> String {
+        let preview = text.prefix(streamingAssistantAccessibilityPreviewCharacterLimit)
+        let isTruncated = preview.endIndex < text.endIndex
+        let trimmedPreview = String(preview)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedPreview.isEmpty else {
+            return "Assistant response, streaming"
+        }
+
+        return isTruncated
+            ? "Assistant response, streaming. \(trimmedPreview)..."
+            : "Assistant response, streaming. \(trimmedPreview)"
     }
 
     private func expandVisibleText() {
