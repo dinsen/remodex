@@ -14,13 +14,16 @@ enum TurnTimelineCacheKeyBuilder {
         messages: ArraySlice<CodexMessage>,
         activeTurnID: String? = nil,
         isThreadRunning: Bool = false,
-        completedTurnIDs: Set<String>
+        completedTurnIDs: Set<String>,
+        suppressesLiveStreamingTextUpdates: Bool = false
     ) -> TurnTimelineRenderItemsCacheSignature {
         var hasher = Hasher()
         hasher.combine(completedTurnIDs)
         return TurnTimelineRenderItemsCacheSignature(
             threadID: threadID,
-            timelineChangeToken: timelineChangeToken,
+            timelineChangeToken: suppressesLiveStreamingTextUpdates
+                ? renderShapeToken(for: messages)
+                : timelineChangeToken,
             visibleTailCount: visibleTailCount,
             activeTurnID: activeTurnID,
             isThreadRunning: isThreadRunning,
@@ -41,7 +44,8 @@ enum TurnTimelineCacheKeyBuilder {
         latestTurnTerminalState: CodexTurnTerminalState?,
         completedTurnIDs: Set<String>,
         stoppedTurnIDs: Set<String>,
-        assistantRevertStatesByMessageID: [String: AssistantRevertPresentation]
+        assistantRevertStatesByMessageID: [String: AssistantRevertPresentation],
+        suppressesLiveStreamingTextUpdates: Bool = false
     ) -> Int {
         var hasher = Hasher()
         hasher.combine(messages.count)
@@ -59,9 +63,54 @@ enum TurnTimelineCacheKeyBuilder {
             hasher.combine(message.kind)
             hasher.combine(message.turnId)
             hasher.combine(message.isStreaming)
-            hasher.combine(message.textRenderSignature)
+            if suppressesLiveStreamingTextUpdates,
+               message.role == .assistant,
+               message.isStreaming {
+                hasher.combine(streamingAssistantVisibilityBucket(for: message))
+            } else {
+                hasher.combine(message.textRenderSignature)
+            }
         }
 
         return hasher.finalize()
+    }
+
+    private static func renderShapeToken(for messages: ArraySlice<CodexMessage>) -> Int {
+        var hasher = Hasher()
+        for message in messages {
+            hasher.combine(message.id)
+            hasher.combine(message.role)
+            hasher.combine(message.kind)
+            hasher.combine(message.assistantPhase)
+            hasher.combine(message.turnId)
+            hasher.combine(message.itemId)
+            hasher.combine(message.isStreaming)
+            hasher.combine(message.deliveryState)
+            hasher.combine(message.orderIndex)
+
+            if message.role == .assistant, message.isStreaming {
+                hasher.combine(streamingAssistantVisibilityBucket(for: message))
+            } else if shouldIncludeTextInRenderShape(for: message) {
+                hasher.combine(message.textRenderSignature)
+            }
+        }
+        return hasher.finalize()
+    }
+
+    private static func shouldIncludeTextInRenderShape(for message: CodexMessage) -> Bool {
+        if message.role == .system,
+           message.kind == .fileChange,
+           !message.isStreaming {
+            return true
+        }
+
+        return message.role == .assistant && !message.isStreaming
+    }
+
+    private static func streamingAssistantVisibilityBucket(for message: CodexMessage) -> Int {
+        guard message.text.utf8.count <= 512 else {
+            return 1
+        }
+        return message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 1
     }
 }

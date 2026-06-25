@@ -52,6 +52,7 @@ private struct UncachedMarkdownParser: MarkupParser {
 struct MarkdownTextView: View {
     private static let defaultEmojiProperties = EmojiProperties()
     private static let defaultMathProperties = MathProperties()
+    private static let inlineStyleCache = BoundedCache<String, InlineStyle>(maxEntries: 32)
 
     let text: String
     let profile: MarkdownRenderProfile
@@ -122,15 +123,15 @@ struct MarkdownTextView: View {
 
     // Match markdown links to the app-wide accent palette the user picks for primary actions.
     private var markdownInlineStyle: InlineStyle {
-        .default.link(
-            .foregroundColor(markdownLinkColor),
-            .underlineStyle(.init(pattern: .dot))
-        )
-    }
-
-    private var markdownLinkColor: Color {
-        let palette = (UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default).ctaPalette
-        return palette.bubbleBackground(for: colorScheme)
+        let bubbleColor = UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
+        let palette = bubbleColor.ctaPalette
+        let cacheKey = "\(colorScheme == .dark ? "dark" : "light")|\(palette.rawValue)"
+        return Self.inlineStyleCache.getOrSet(cacheKey) {
+            .default.link(
+                .foregroundColor(palette.bubbleBackground(for: colorScheme)),
+                .underlineStyle(.init(pattern: .dot))
+            )
+        }
     }
 }
 

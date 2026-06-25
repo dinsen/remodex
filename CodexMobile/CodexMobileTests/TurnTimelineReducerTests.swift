@@ -2538,6 +2538,106 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(projectionCount, 2)
     }
 
+    func testRenderItemsCacheSuppressesLiveAssistantTextProjectionWhileComposerIsFocused() {
+        var message = makeMessage(
+            id: "assistant-1",
+            threadID: "thread",
+            role: .assistant,
+            kind: .chat,
+            text: "Streaming",
+            turnID: "turn-1",
+            isStreaming: true
+        )
+        let firstSignature = TurnTimelineCacheKeyBuilder.renderItemsSignature(
+            threadID: "thread",
+            timelineChangeToken: 1,
+            visibleTailCount: 1,
+            messages: [message][...],
+            completedTurnIDs: [],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        message.text = "Streaming\nmore tokens"
+        let secondSignature = TurnTimelineCacheKeyBuilder.renderItemsSignature(
+            threadID: "thread",
+            timelineChangeToken: 2,
+            visibleTailCount: 1,
+            messages: [message][...],
+            completedTurnIDs: [],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        XCTAssertEqual(firstSignature, secondSignature)
+    }
+
+    func testRenderItemsCacheKeepsEmptyStreamingAssistantVisibilityChanges() {
+        var message = makeMessage(
+            id: "assistant-1",
+            threadID: "thread",
+            role: .assistant,
+            kind: .chat,
+            text: "",
+            turnID: "turn-1",
+            isStreaming: true
+        )
+        let emptySignature = TurnTimelineCacheKeyBuilder.renderItemsSignature(
+            threadID: "thread",
+            timelineChangeToken: 1,
+            visibleTailCount: 1,
+            messages: [message][...],
+            completedTurnIDs: [],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        message.text = "First visible token"
+        let visibleSignature = TurnTimelineCacheKeyBuilder.renderItemsSignature(
+            threadID: "thread",
+            timelineChangeToken: 2,
+            visibleTailCount: 1,
+            messages: [message][...],
+            completedTurnIDs: [],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        XCTAssertNotEqual(emptySignature, visibleSignature)
+    }
+
+    func testBlockInfoKeySuppressesLiveAssistantTextDeltasWhileComposerIsFocused() {
+        var message = makeMessage(
+            id: "assistant-1",
+            threadID: "thread",
+            role: .assistant,
+            kind: .chat,
+            text: "Streaming",
+            turnID: "turn-1",
+            isStreaming: true
+        )
+        let firstKey = TurnTimelineCacheKeyBuilder.blockInfoInputKey(
+            messages: [message],
+            isThreadRunning: true,
+            activeTurnID: "turn-1",
+            latestTurnTerminalState: nil,
+            completedTurnIDs: [],
+            stoppedTurnIDs: [],
+            assistantRevertStatesByMessageID: [:],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        message.text = "Streaming\nmore tokens"
+        let secondKey = TurnTimelineCacheKeyBuilder.blockInfoInputKey(
+            messages: [message],
+            isThreadRunning: true,
+            activeTurnID: "turn-1",
+            latestTurnTerminalState: nil,
+            completedTurnIDs: [],
+            stoppedTurnIDs: [],
+            assistantRevertStatesByMessageID: [:],
+            suppressesLiveStreamingTextUpdates: true
+        )
+
+        XCTAssertEqual(firstKey, secondKey)
+    }
+
     func testEnforceIntraTurnOrderPreservesInterleavedMultiItemFlow() {
         let now = Date()
         var order = 0

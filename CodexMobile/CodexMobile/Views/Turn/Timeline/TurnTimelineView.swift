@@ -302,7 +302,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             messages: messages,
             activeTurnID: activeTurnID,
             isThreadRunning: isThreadRunning,
-            completedTurnIDs: completedTurnIDs
+            completedTurnIDs: completedTurnIDs,
+            suppressesLiveStreamingTextUpdates: isComposerFocused
         )
     }
 
@@ -540,7 +541,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             latestTurnTerminalState: latestTurnTerminalState,
             completedTurnIDs: completedTurnIDs,
             stoppedTurnIDs: stoppedTurnIDs,
-            assistantRevertStatesByMessageID: assistantRevertStatesByMessageID
+            assistantRevertStatesByMessageID: assistantRevertStatesByMessageID,
+            suppressesLiveStreamingTextUpdates: isComposerFocused
         )
     }
     @ViewBuilder
