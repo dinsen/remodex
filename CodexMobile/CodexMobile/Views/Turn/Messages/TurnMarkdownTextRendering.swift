@@ -50,6 +50,9 @@ private struct UncachedMarkdownParser: MarkupParser {
 }
 
 struct MarkdownTextView: View {
+    private static let defaultEmojiProperties = EmojiProperties()
+    private static let defaultMathProperties = MathProperties()
+
     let text: String
     let profile: MarkdownRenderProfile
     var enablesSelection: Bool = false
@@ -77,6 +80,8 @@ struct MarkdownTextView: View {
         // the chat feel like a pannable canvas. Modal detail views can opt into scroll.
         let baseView = StructuredText(transformed, parser: parser)
             .font(AppFont.body())
+            .textual.emojiProperties(Self.defaultEmojiProperties)
+            .textual.mathProperties(Self.defaultMathProperties)
             .textual.codeBlockStyle(
                 .default(
                     actionIcons: .init(
