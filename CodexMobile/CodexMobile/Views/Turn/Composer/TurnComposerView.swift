@@ -23,7 +23,8 @@ struct TurnComposerInputChangeHandler {
     }
 }
 
-struct TurnComposerView: View {
+struct TurnComposerView: View, Equatable {
+    let threadID: String
     @Binding var input: String
     let isInputFocused: Binding<Bool>
 
@@ -290,6 +291,53 @@ struct TurnComposerView: View {
 
     private var placeholderText: String {
         isEmptyThread ? "Ask Remodex anything..." : "Ask for follow-up changes"
+    }
+
+    static func == (lhs: TurnComposerView, rhs: TurnComposerView) -> Bool {
+        lhs.threadID == rhs.threadID
+            && lhs.input == rhs.input
+            && lhs.isInputFocused.wrappedValue == rhs.isInputFocused.wrappedValue
+            && lhs.accessoryState == rhs.accessoryState
+            && lhs.autocompleteState == rhs.autocompleteState
+            && lhs.remainingAttachmentSlots == rhs.remainingAttachmentSlots
+            && lhs.isComposerInteractionLocked == rhs.isComposerInteractionLocked
+            && lhs.isSendDisabled == rhs.isSendDisabled
+            && lhs.isSending == rhs.isSending
+            && lhs.isPlanModeArmed == rhs.isPlanModeArmed
+            && lhs.queuedCount == rhs.queuedCount
+            && lhs.isQueuePaused == rhs.isQueuePaused
+            && lhs.activeTurnID == rhs.activeTurnID
+            && lhs.isThreadRunning == rhs.isThreadRunning
+            && lhs.isEmptyThread == rhs.isEmptyThread
+            && lhs.hasWorkingDirectory == rhs.hasWorkingDirectory
+            && lhs.isWorktreeProject == rhs.isWorktreeProject
+            && lhs.activeFileChangeStatus == rhs.activeFileChangeStatus
+            && lhs.orderedModelOptions == rhs.orderedModelOptions
+            && lhs.selectedModelID == rhs.selectedModelID
+            && lhs.selectedModelTitle == rhs.selectedModelTitle
+            && lhs.isLoadingModels == rhs.isLoadingModels
+            && lhs.isRuntimeSelectionLoading == rhs.isRuntimeSelectionLoading
+            && lhs.runtimeState == rhs.runtimeState
+            && lhs.voiceButtonPresentation == rhs.voiceButtonPresentation
+            && lhs.selectedAccessMode == rhs.selectedAccessMode
+            && lhs.contextWindowUsage == rhs.contextWindowUsage
+            && lhs.rateLimitBuckets == rhs.rateLimitBuckets
+            && lhs.isLoadingRateLimits == rhs.isLoadingRateLimits
+            && lhs.rateLimitsErrorMessage == rhs.rateLimitsErrorMessage
+            && lhs.shouldAutoRefreshUsageStatus == rhs.shouldAutoRefreshUsageStatus
+            && lhs.showsGitBranchSelector == rhs.showsGitBranchSelector
+            && lhs.isGitBranchSelectorEnabled == rhs.isGitBranchSelectorEnabled
+            && lhs.availableGitBranchTargets == rhs.availableGitBranchTargets
+            && lhs.gitBranchesCheckedOutElsewhere == rhs.gitBranchesCheckedOutElsewhere
+            && lhs.gitWorktreePathsByBranch == rhs.gitWorktreePathsByBranch
+            && lhs.selectedGitBaseBranch == rhs.selectedGitBaseBranch
+            && lhs.currentGitBranch == rhs.currentGitBranch
+            && lhs.gitDefaultBranch == rhs.gitDefaultBranch
+            && lhs.isLoadingGitBranchTargets == rhs.isLoadingGitBranchTargets
+            && lhs.isSwitchingGitBranch == rhs.isSwitchingGitBranch
+            && lhs.isCreatingGitWorktree == rhs.isCreatingGitWorktree
+            && lhs.canHandOffToWorktree == rhs.canHandOffToWorktree
+            && lhs.showsSecondaryBar == rhs.showsSecondaryBar
     }
 
 }
@@ -616,6 +664,7 @@ private struct ComposerPreviewContent: View {
 
     var body: some View {
         TurnComposerView(
+            threadID: "preview-thread",
             input: $input,
             isInputFocused: $isInputFocused,
             accessoryState: TurnComposerAccessoryState(

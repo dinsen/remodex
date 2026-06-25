@@ -495,8 +495,26 @@ enum SidebarThreadGrouping {
         }
         let pathComponents = projectPathComponents(normalizedProjectPath)
 
-        return scopes
-            .filter { isPathComponents(pathComponents, sameOrDescendantOf: $0.pathComponents) }
+        let directMatches = scopes.filter {
+            isPathComponents(pathComponents, sameOrDescendantOf: $0.pathComponents)
+        }
+        if let directMatch = mostSpecificConfiguredProjectScope(from: directMatches) {
+            return directMatch
+        }
+
+        guard let worktreeTailComponents = codexManagedWorktreeTailComponents(pathComponents) else {
+            return nil
+        }
+
+        return mostSpecificConfiguredProjectScope(from: scopes.filter {
+            pathTailComponents(worktreeTailComponents, matchSuffixOf: $0.pathComponents)
+        })
+    }
+
+    private static func mostSpecificConfiguredProjectScope(
+        from scopes: [ConfiguredProjectScope]
+    ) -> ConfiguredProjectScope? {
+        scopes
             .sorted { lhs, rhs in
                 if lhs.pathComponents.count != rhs.pathComponents.count {
                     return lhs.pathComponents.count > rhs.pathComponents.count
@@ -542,10 +560,20 @@ enum SidebarThreadGrouping {
             return projectGroupID(for: thread) == group.id
         }
 
-        return isPathComponents(
-            projectPathComponents(normalizedThreadPath),
-            sameOrDescendantOf: projectPathComponents(normalizedProjectPath)
-        )
+        let normalizedThreadPathComponents = projectPathComponents(normalizedThreadPath)
+        let normalizedProjectPathComponents = projectPathComponents(normalizedProjectPath)
+        if isPathComponents(
+            normalizedThreadPathComponents,
+            sameOrDescendantOf: normalizedProjectPathComponents
+        ) {
+            return true
+        }
+
+        guard let worktreeTailComponents = codexManagedWorktreeTailComponents(normalizedThreadPathComponents) else {
+            return false
+        }
+
+        return pathTailComponents(worktreeTailComponents, matchSuffixOf: normalizedProjectPathComponents)
     }
 
     private static func configuredProjectLabel(_ rawLabel: String, projectPath: String) -> String {
@@ -563,6 +591,35 @@ enum SidebarThreadGrouping {
 
     private static func projectGroupID(for thread: CodexThread) -> String {
         projectGroupID(forProjectPath: thread.projectKey)
+    }
+
+    private static func codexManagedWorktreeTailComponents(_ components: [String]) -> [String]? {
+        guard let worktreesIndex = components.firstIndex(of: "worktrees"),
+              worktreesIndex > 0,
+              components[worktreesIndex - 1] == ".codex" else {
+            return nil
+        }
+
+        let tailStartIndex = components.index(worktreesIndex, offsetBy: 2)
+        guard components.indices.contains(tailStartIndex) else {
+            return nil
+        }
+
+        let tailComponents = Array(components[tailStartIndex...])
+        return tailComponents.isEmpty ? nil : tailComponents
+    }
+
+    private static func pathTailComponents(
+        _ tailComponents: [String],
+        matchSuffixOf fullComponents: [String]
+    ) -> Bool {
+        guard !tailComponents.isEmpty, fullComponents.count >= tailComponents.count else {
+            return false
+        }
+
+        return fullComponents.suffix(tailComponents.count).elementsEqual(tailComponents) {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedSame
+        }
     }
 
     // Keeps pinned roots and their descendants together so sidebar trees do not split across sections.

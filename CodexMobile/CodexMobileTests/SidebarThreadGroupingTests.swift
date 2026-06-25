@@ -452,6 +452,49 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(groups[1].threads.map(\.id), ["helper-child-thread"])
     }
 
+    func testConfiguredProjectSourceMergesCodexManagedWorktreeThreadsByProjectTail() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(
+                id: "worktree-thread",
+                updatedAt: now,
+                cwd: "/Users/me/.codex/worktrees/9a40/finn-ios-vertical"
+            ),
+            makeThread(
+                id: "nested-worktree-thread",
+                updatedAt: now.addingTimeInterval(-60),
+                cwd: "/Users/me/.codex/worktrees/d3de/projects/tai"
+            ),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/projects/finn-ios-vertical"),
+            makeProjectChoice(path: "/Users/me/projects/tai"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/projects/finn-ios-vertical",
+            "project:/Users/me/projects/tai",
+        ])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["worktree-thread"])
+        XCTAssertEqual(groups[1].threads.map(\.id), ["nested-worktree-thread"])
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[0], in: threads),
+            ["worktree-thread"]
+        )
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[1], in: threads),
+            ["nested-worktree-thread"]
+        )
+    }
+
     func testConfiguredProjectSourceExcludesRecentThreadProjectsOutsideConfig() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let threads = [

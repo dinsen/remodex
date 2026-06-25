@@ -113,6 +113,7 @@ struct TurnComposerHostView: View {
             && !SidebarThreadGrouping.isRootlessChatThread(thread)
 
         TurnComposerView(
+            threadID: thread.id,
             input: $viewModel.input,
             isInputFocused: isInputFocused,
             accessoryState: accessoryState,
@@ -308,5 +309,6 @@ struct TurnComposerHostView: View {
             onSend: onSend,
             showsSecondaryBar: showsSecondaryBar
         )
+        .equatable()
     }
 }

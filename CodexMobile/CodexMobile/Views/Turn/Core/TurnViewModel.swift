@@ -55,7 +55,7 @@ struct TurnComposerAttachmentIntakePlan {
     }
 }
 
-struct QueuedTurnDraft: Identifiable {
+struct QueuedTurnDraft: Identifiable, Equatable {
     let id: String
     // Points at the optimistic timeline bubble shown while this draft waits behind a running turn.
     let preAppendedMessageID: String?

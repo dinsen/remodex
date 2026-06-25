@@ -603,7 +603,7 @@ private struct AllModelsSheet: View {
 }
 
 // Keeps the mic button state and styling decisions outside the layout code.
-struct TurnComposerVoiceButtonPresentation {
+struct TurnComposerVoiceButtonPresentation: Equatable {
     let systemImageName: String
     let foregroundColor: Color
     let backgroundColor: Color
@@ -611,4 +611,15 @@ struct TurnComposerVoiceButtonPresentation {
     let isDisabled: Bool
     let showsProgress: Bool
     let hasCircleBackground: Bool
+
+    static func == (
+        lhs: TurnComposerVoiceButtonPresentation,
+        rhs: TurnComposerVoiceButtonPresentation
+    ) -> Bool {
+        lhs.systemImageName == rhs.systemImageName
+            && lhs.accessibilityLabel == rhs.accessibilityLabel
+            && lhs.isDisabled == rhs.isDisabled
+            && lhs.showsProgress == rhs.showsProgress
+            && lhs.hasCircleBackground == rhs.hasCircleBackground
+    }
 }
