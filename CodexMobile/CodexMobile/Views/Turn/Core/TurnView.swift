@@ -15,6 +15,57 @@ private enum TurnWorktreeOverlayRoute: Equatable {
     case fork
 }
 
+private final class TurnActiveFileChangeStatusCache {
+    private var key: TurnActiveFileChangeStatusCacheKey?
+    private var value: FileChangeStatusSnapshot?
+
+    func snapshot(
+        threadID: String,
+        from renderSnapshot: TurnTimelineRenderSnapshot,
+        activeTurnID: String?
+    ) -> FileChangeStatusSnapshot? {
+        let nextKey = TurnActiveFileChangeStatusCacheKey(
+            threadID: threadID,
+            renderSnapshot: renderSnapshot,
+            activeTurnID: activeTurnID
+        )
+        if key == nextKey {
+            return value
+        }
+
+        let nextValue = FileChangeStatusSnapshot.activeTurnSnapshot(
+            from: renderSnapshot.messages,
+            activeTurnID: activeTurnID,
+            isThreadRunning: renderSnapshot.isThreadRunning
+        )
+        key = nextKey
+        value = nextValue
+        return nextValue
+    }
+}
+
+private struct TurnActiveFileChangeStatusCacheKey: Equatable {
+    let threadID: String
+    let timelineChangeToken: Int
+    let activeTurnID: String?
+    let isThreadRunning: Bool
+    let messageCount: Int
+    let lastMessageID: String?
+    let lastMessageByteCount: Int?
+    let lastMessageRevision: Int?
+
+    init(threadID: String, renderSnapshot: TurnTimelineRenderSnapshot, activeTurnID: String?) {
+        self.threadID = threadID
+        self.timelineChangeToken = renderSnapshot.timelineChangeToken
+        self.activeTurnID = activeTurnID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.isThreadRunning = renderSnapshot.isThreadRunning
+        self.messageCount = renderSnapshot.messages.count
+        self.lastMessageID = renderSnapshot.messages.last?.id
+        self.lastMessageByteCount = renderSnapshot.messages.last?.textRenderSignature.byteCount
+        self.lastMessageRevision = renderSnapshot.messages.last?.textRenderSignature.revision
+    }
+}
+
 struct TurnView: View {
     let thread: CodexThread
     let isWakingMacDisplayRecovery: Bool
@@ -44,6 +95,7 @@ struct TurnView: View {
     @State private var isStartingSiblingChat = false
     @State private var isForkingThread = false
     @State private var checkedOutElsewhereAlert: CheckedOutElsewhereAlert?
+    @State private var activeFileChangeStatusCache = TurnActiveFileChangeStatusCache()
     @StateObject private var voiceInput = VoiceInputCoordinator()
     @State private var hasConsumedInitialAssistantAnchor = false
     @State private var workspaceFilePreviewRequest: WorkspaceFilePreviewRequest?
@@ -94,10 +146,10 @@ struct TurnView: View {
             || viewModel.isSkillAutocompleteVisible
             || viewModel.isPluginAutocompleteVisible
             || viewModel.slashCommandPanelState != .hidden
-        let activeFileChangeStatus = FileChangeStatusSnapshot.activeTurnSnapshot(
-            from: renderSnapshot.messages,
-            activeTurnID: activeTurnID,
-            isThreadRunning: isThreadRunning
+        let activeFileChangeStatus = activeFileChangeStatusCache.snapshot(
+            threadID: thread.id,
+            from: renderSnapshot,
+            activeTurnID: activeTurnID
         )
         let isWorktreeHandoffAvailable = isWorktreeHandoffAvailable(
             isThreadRunning: isThreadRunning,
@@ -804,10 +856,10 @@ struct TurnView: View {
     private func composerStructuredPromptReplacement(message: CodexMessage) -> some View {
         let activeTurnID = codex.activeTurnID(for: thread.id)
         let renderSnapshot = codex.timelineState(for: thread.id).renderSnapshot
-        let activeFileChangeStatus = FileChangeStatusSnapshot.activeTurnSnapshot(
-            from: renderSnapshot.messages,
-            activeTurnID: activeTurnID,
-            isThreadRunning: renderSnapshot.isThreadRunning
+        let activeFileChangeStatus = activeFileChangeStatusCache.snapshot(
+            threadID: thread.id,
+            from: renderSnapshot,
+            activeTurnID: activeTurnID
         )
         let currentThread = currentResolvedThread
         let gitWorkingDirectory = currentThread.gitWorkingDirectory

@@ -648,7 +648,7 @@ extension CodexThread {
     }
 
     private static func codexManagedWorktreeToken(for normalizedProjectPath: String) -> String? {
-        let components = URL(fileURLWithPath: normalizedProjectPath).standardized.pathComponents
+        let components = lexicalPathComponents(for: normalizedProjectPath)
         guard let worktreesIndex = components.firstIndex(of: "worktrees"),
               worktreesIndex > 0,
               components[worktreesIndex - 1] == ".codex" else {
@@ -662,6 +662,13 @@ extension CodexThread {
 
         let token = components[tokenIndex].trimmingCharacters(in: .whitespacesAndNewlines)
         return token.isEmpty ? nil : token
+    }
+
+    private static func lexicalPathComponents(for normalizedProjectPath: String) -> [String] {
+        normalizedProjectPath
+            .replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
     }
 
     private static func codexManagedWorktreeDisplayToken(for normalizedProjectPath: String) -> String? {

@@ -120,6 +120,15 @@ final class CodexThreadStartProjectBindingTests: XCTestCase {
         XCTAssertNil(thread.gitWorkingDirectory)
     }
 
+    func testManagedWorktreeProjectUsesWorktreePresentation() {
+        let path = "/Users/me/project/.codex/worktrees/fix-lag/remodex"
+        let thread = CodexThread(id: "thread-worktree", cwd: path)
+
+        XCTAssertTrue(thread.isManagedWorktreeProject)
+        XCTAssertEqual(thread.projectDisplayName, "remodex [fix-lag]")
+        XCTAssertEqual(CodexThread.projectIconSystemName(for: path), "arrow.triangle.branch")
+    }
+
     func testPseudoProjectBucketDoesNotBecomeGitWorkingDirectory() {
         let thread = CodexThread(id: "thread-1", cwd: "_default")
 
