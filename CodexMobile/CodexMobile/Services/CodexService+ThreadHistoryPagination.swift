@@ -25,7 +25,8 @@ enum ThreadHistoryHydrationPolicy {
 }
 
 enum TimelineTextClippingPolicy {
-    private static let proseByteLimit = 32_000
+    private static let streamingProseByteLimit = 4_000
+    private static let proseByteLimit = 4_000
     private static let fileChangeByteLimit = 48_000
     private static let thinkingByteLimit = 16_000
     private static let activityByteLimit = 8_000
@@ -55,6 +56,10 @@ enum TimelineTextClippingPolicy {
     }
 
     private static func byteLimit(for message: CodexMessage) -> Int {
+        if message.role == .assistant && message.isStreaming {
+            return streamingProseByteLimit
+        }
+
         switch (message.role, message.kind) {
         case (.system, .fileChange):
             return fileChangeByteLimit
