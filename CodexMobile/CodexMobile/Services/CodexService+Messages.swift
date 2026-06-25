@@ -667,17 +667,21 @@ extension CodexService {
 
     // Marks thread as actively running while ensuring stale outcomes are cleared.
     func markThreadAsRunning(_ threadId: String) {
-        let wasRunning = threadHasActiveOrRunningTurn(threadId)
+        let needsRunningFlag = !runningThreadIDs.contains(threadId)
         let hadTerminalState = latestTurnTerminalStateByThread[threadId] != nil
         let hadOutcomeBadge = readyThreadIDs.contains(threadId) || failedThreadIDs.contains(threadId)
 
-        runningThreadIDs.insert(threadId)
         threadsPendingCompletionHaptic.insert(threadId)
-        latestTurnTerminalStateByThread.removeValue(forKey: threadId)
-        clearOutcomeBadge(for: threadId)
-
-        guard !wasRunning || hadTerminalState || hadOutcomeBadge else {
+        guard needsRunningFlag || hadTerminalState || hadOutcomeBadge else {
             return
+        }
+
+        runningThreadIDs.insert(threadId)
+        if hadTerminalState {
+            latestTurnTerminalStateByThread.removeValue(forKey: threadId)
+        }
+        if hadOutcomeBadge {
+            clearOutcomeBadge(for: threadId)
         }
 
         refreshBusyRepoRootsAndDependentTimelineStates()

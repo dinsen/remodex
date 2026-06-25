@@ -53,6 +53,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var selectedContentScope: SidebarContentScope = .projects
     @State private var isCreatingThread = false
     @State private var pendingTopAction: SidebarTopAction? = nil
+    @State private var cachedScopedSidebarThreads: [CodexThread] = []
     @State private var groupedThreads: [SidebarThreadGroup] = []
     @State private var activeSidebarSheet: SidebarPresentedSheet?
     @State private var projectGroupPendingArchive: SidebarThreadGroup? = nil
@@ -60,6 +61,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var threadPendingDeletion: CodexThread? = nil
     @State private var createThreadErrorMessage: String? = nil
     @State private var cachedRunBadges: [String: CodexThreadRunBadgeState] = [:]
+    @State private var lastScopedThreadsFingerprint: Int = 0
     @State private var lastGroupedThreadsFingerprint: Int = 0
     @State private var lastBadgeFingerprint: Int = 0
     @State private var projectlessChatRootPaths: [String] = []
@@ -430,6 +432,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     // Rebuilds sidebar sections only when the source thread array changes.
     private func rebuildGroupedThreads() {
         let startedAt = Date()
+        rebuildScopedSidebarThreads()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let source: [CodexThread]
         if query.isEmpty {
@@ -463,6 +466,27 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 + "queryLength=\(query.count) scope=\(selectedContentScope.rawValue) "
                 + "sourceCount=\(source.count) groupCount=\(groupedThreads.count)"
         )
+    }
+
+    private func rebuildScopedSidebarThreads() {
+        let fingerprint = scopedThreadsFingerprint()
+        guard fingerprint != lastScopedThreadsFingerprint else { return }
+        lastScopedThreadsFingerprint = fingerprint
+        cachedScopedSidebarThreads = SidebarThreadGrouping.threadsForScope(
+            sidebarGroupingScope,
+            from: codex.threads,
+            projectlessRootPaths: projectlessChatRootPaths
+        )
+    }
+
+    private func scopedThreadsFingerprint() -> Int {
+        var hasher = Hasher()
+        hasher.combine(selectedContentScope)
+        hasher.combine(projectlessChatRootPaths)
+        for thread in codex.threads {
+            hasher.combine(thread)
+        }
+        return hasher.finalize()
     }
 
     private func groupingFingerprint(
@@ -589,14 +613,6 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 ? ""
                 : SidebarProjectExpansionState.encodePersistedGroupIDs(projectGroupIDs)
         }
-    }
-
-    private var scopedSidebarThreads: [CodexThread] {
-        SidebarThreadGrouping.threadsForScope(
-            sidebarGroupingScope,
-            from: codex.threads,
-            projectlessRootPaths: projectlessChatRootPaths
-        )
     }
 
     private var emptySidebarTitle: String {
@@ -729,7 +745,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             isFiltering: !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             isConnected: codex.isConnected,
             isCreatingThread: isCreatingThread,
-            threads: scopedSidebarThreads,
+            threads: cachedScopedSidebarThreads,
             groups: groupedThreads,
             selectedThread: selectedThread,
             bottomContentInset: 0,
