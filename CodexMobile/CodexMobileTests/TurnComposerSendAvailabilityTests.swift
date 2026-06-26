@@ -192,6 +192,72 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertEqual(service.thread(for: "thread-new")?.displayTitle, "First message")
     }
 
+    func testSendTurnMovesPendingMessageToContinuationWhenOriginalThreadIsMissing() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            switch method {
+            case "thread/resume":
+                throw CodexServiceError.rpcError(
+                    RPCError(code: -32000, message: "thread not found")
+                )
+            case "thread/start":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "thread": .object([
+                            "id": .string("thread-continuation"),
+                            "title": .string(CodexThread.defaultDisplayTitle),
+                            "cwd": .string("/tmp/remodex-local"),
+                        ]),
+                    ]),
+                    includeJSONRPC: false
+                )
+            case "workspace/checkpointCapture":
+                return self.workspaceCheckpointResponse(threadID: "thread-continuation", kind: "messageStart")
+            case "workspace/checkpointCopy":
+                return self.workspaceCheckpointResponse(threadID: "thread-continuation", kind: "turnStart", copied: true)
+            case "turn/start":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["turnId": .string("turn-continuation")]),
+                    includeJSONRPC: false
+                )
+            case "thread/generateTitle":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["title": .string("Continue this")]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        let viewModel = TurnViewModel()
+        viewModel.input = "Continue this"
+
+        viewModel.sendTurn(codex: service, threadID: "thread-missing")
+        await waitForSendCompletion(viewModel)
+
+        let continuationUserMessages = service.messages(for: "thread-continuation").filter { $0.role == .user }
+
+        XCTAssertEqual(service.activeThreadId, "thread-continuation")
+        XCTAssertTrue(service.messages(for: "thread-missing").isEmpty)
+        XCTAssertEqual(continuationUserMessages.count, 1)
+        XCTAssertEqual(continuationUserMessages.first?.text, "Continue this")
+        XCTAssertEqual(continuationUserMessages.first?.deliveryState, .confirmed)
+        XCTAssertEqual(continuationUserMessages.first?.turnId, "turn-continuation")
+        XCTAssertEqual(recordedMethods.filter { $0 == "thread/resume" }.count, 1)
+        XCTAssertEqual(recordedMethods.filter { $0 == "thread/start" }.count, 1)
+        XCTAssertEqual(recordedMethods.filter { $0 == "turn/start" }.count, 1)
+    }
+
     func testLocalDraftRestoresComposerStateForSameThread() {
         let service = makeService()
         let firstViewModel = TurnViewModel()
@@ -510,12 +576,16 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             .stringValue
     }
 
-    private func workspaceCheckpointResponse(kind: String, copied: Bool? = nil) -> RPCMessage {
+    private func workspaceCheckpointResponse(
+        threadID: String = "thread-new",
+        kind: String,
+        copied: Bool? = nil
+    ) -> RPCMessage {
         var result: RPCObject = [
             "repoRoot": .string("/tmp/remodex-local"),
             "checkpointRef": .string("refs/remodex/checkpoints/test"),
             "checkpointKind": .string(kind),
-            "threadId": .string("thread-new"),
+            "threadId": .string(threadID),
         ]
         if let copied {
             result["copied"] = .bool(copied)

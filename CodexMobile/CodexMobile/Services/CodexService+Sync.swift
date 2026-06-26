@@ -215,6 +215,10 @@ extension CodexService {
 
     func reconcileLocalThreadsWithServer(_ serverThreads: [CodexThread]) {
         let localByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+        var serverByID: [String: CodexThread] = [:]
+        for serverThread in serverThreads {
+            serverByID[serverThread.id] = serverThread
+        }
         let serverThreadIDs = Set(serverThreads.map(\.id))
         let persistedArchivedIDs = locallyArchivedThreadIDs
         let persistedDeletedIDs = locallyDeletedThreadIDs
@@ -263,10 +267,13 @@ extension CodexService {
         ))
         snapshotOnlyPinnedThreadIDs = snapshotOnlyPinnedIDs
 
-        // Local rename intent wins over stale thread/list data, especially for pinned snapshots.
+        // Local rename intent only wins while the server title is still generic/stale.
         for threadID in Array(merged.keys) {
             guard var thread = merged[threadID] else { continue }
-            applyPersistedThreadRename(to: &thread)
+            applyPersistedThreadRename(
+                to: &thread,
+                respectingAuthoritativeTitle: serverByID[threadID].map(hasAuthoritativeThreadTitle) ?? false
+            )
             merged[threadID] = thread
         }
 
@@ -472,11 +479,8 @@ extension CodexService {
             return false
         }
 
-        threads[index].name = trimmedName
         threads[index].title = trimmedName
-        persistThreadRename(trimmedName, for: threadId)
         debugSyncLog("thread renamed automatically: \(threadId) → \(trimmedName)")
-        sendThreadNameSetRPC(threadId: threadId, name: trimmedName)
         return true
     }
 

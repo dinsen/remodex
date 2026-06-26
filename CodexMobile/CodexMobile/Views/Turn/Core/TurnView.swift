@@ -288,6 +288,7 @@ struct TurnView: View {
         .toolbar {
             TurnToolbarContent(
                 displayTitle: resolvedThread.displayTitle,
+                sessionID: resolvedThread.sessionId,
                 navigationContext: toolbarNavigationContext,
                 showsThreadActions: codex.isConnected,
                 isHandingOffToMac: isHandingOffToMac,

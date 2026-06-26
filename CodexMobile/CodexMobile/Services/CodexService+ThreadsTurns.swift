@@ -347,31 +347,18 @@ extension CodexService {
             try await ensureThreadResumed(threadId: initialThreadId)
         } catch {
             if shouldTreatAsThreadNotFound(error) {
-                if shouldAppendUserMessage || !preResumePendingMessageId.isEmpty {
-                    removePreResumePendingUserMessage(
-                        threadId: initialThreadId,
-                        messageId: preResumePendingMessageId,
-                        matchingText: trimmedInput,
-                        matchingAttachments: attachments
-                    )
-                }
-                handleMissingThread(initialThreadId)
-
-                let continuationThread = try await createContinuationThread(from: initialThreadId)
-                migratePlanSessionState(from: initialThreadId, to: continuationThread.id)
-                try await ensureThreadResumed(threadId: continuationThread.id)
-                try await sendTurnStart(
-                    trimmedInput,
+                try await sendTurnToContinuationAfterMissingThread(
+                    archivedThreadId: initialThreadId,
+                    pendingMessageId: preResumePendingMessageId,
+                    automaticTitleSeed: preResumeTitleSeed,
+                    userInput: trimmedInput,
                     attachments: attachments,
                     skillMentions: skillMentions,
                     mentionMentions: mentionMentions,
                     fileMentions: fileMentions,
-                    to: continuationThread.id,
                     shouldAppendUserMessage: shouldAppendOnContinuation,
                     collaborationMode: effectiveCollaborationMode
                 )
-                activeThreadId = continuationThread.id
-                lastErrorMessage = nil
                 return
             }
         }
@@ -393,36 +380,85 @@ extension CodexService {
             if shouldTreatAsThreadNotFound(error) {
                 // If turn/start explicitly says "thread not found", treat it as authoritative.
                 // Some server states can make thread/read flaky, so we avoid blocking on a second check.
-                if shouldAppendUserMessage || !preResumePendingMessageId.isEmpty {
-                    removePreResumePendingUserMessage(
-                        threadId: initialThreadId,
-                        messageId: preResumePendingMessageId,
-                        matchingText: trimmedInput,
-                        matchingAttachments: attachments
-                    )
-                }
-                handleMissingThread(initialThreadId)
-
-                let continuationThread = try await createContinuationThread(from: initialThreadId)
-                migratePlanSessionState(from: initialThreadId, to: continuationThread.id)
-                try await sendTurnStart(
-                    trimmedInput,
+                try await sendTurnToContinuationAfterMissingThread(
+                    archivedThreadId: initialThreadId,
+                    pendingMessageId: preResumePendingMessageId,
+                    automaticTitleSeed: preResumeTitleSeed,
+                    userInput: trimmedInput,
                     attachments: attachments,
                     skillMentions: skillMentions,
                     mentionMentions: mentionMentions,
                     fileMentions: fileMentions,
-                    to: continuationThread.id,
                     shouldAppendUserMessage: shouldAppendOnContinuation,
                     collaborationMode: effectiveCollaborationMode
                 )
-                activeThreadId = continuationThread.id
-                lastErrorMessage = nil
                 return
             }
             throw error
         }
 
         activeThreadId = initialThreadId
+    }
+
+    // Preserves the optimistic user row while recovering a send from an archived or missing thread.
+    private func sendTurnToContinuationAfterMissingThread(
+        archivedThreadId: String,
+        pendingMessageId: String,
+        automaticTitleSeed: String?,
+        userInput: String,
+        attachments: [CodexImageAttachment],
+        skillMentions: [CodexTurnSkillMention],
+        mentionMentions: [CodexTurnMention],
+        fileMentions: [String],
+        shouldAppendUserMessage: Bool,
+        collaborationMode: CodexCollaborationModeKind?
+    ) async throws {
+        var recoveryMessageThreadId = archivedThreadId
+        var recoveryMessageId = pendingMessageId
+
+        do {
+            handleMissingThread(archivedThreadId)
+
+            let continuationThread = try await createContinuationThread(from: archivedThreadId)
+            migratePlanSessionState(from: archivedThreadId, to: continuationThread.id)
+
+            let movedMessage = movePreAppendedOutgoingUserMessage(
+                CodexPreAppendedTurnMessage(
+                    messageID: pendingMessageId,
+                    automaticTitleSeed: automaticTitleSeed
+                ),
+                from: archivedThreadId,
+                to: continuationThread.id
+            )
+            if let movedMessage {
+                recoveryMessageThreadId = continuationThread.id
+                recoveryMessageId = movedMessage.messageID
+            }
+
+            activeThreadId = continuationThread.id
+            try await ensureThreadResumed(threadId: continuationThread.id)
+            try await sendTurnStart(
+                userInput,
+                attachments: attachments,
+                skillMentions: skillMentions,
+                mentionMentions: mentionMentions,
+                fileMentions: fileMentions,
+                to: continuationThread.id,
+                shouldAppendUserMessage: movedMessage == nil && shouldAppendUserMessage,
+                collaborationMode: collaborationMode,
+                preAppendedUserMessageID: movedMessage?.messageID,
+                automaticTitleSeedOverride: movedMessage?.automaticTitleSeed ?? automaticTitleSeed
+            )
+            activeThreadId = continuationThread.id
+            lastErrorMessage = nil
+        } catch {
+            markMessageDeliveryState(
+                threadId: recoveryMessageThreadId,
+                messageId: recoveryMessageId,
+                state: .failed
+            )
+            throw error
+        }
     }
 
     // Lets the New Chat handoff publish the first user row before the real
@@ -545,25 +581,6 @@ extension CodexService {
         return CodexPreAppendedTurnMessage(
             messageID: messageID,
             automaticTitleSeed: automaticTitleSeed
-        )
-    }
-
-    // Removes the optimistic row by id first because structured mention-only rows may not match raw composer text.
-    private func removePreResumePendingUserMessage(
-        threadId: String,
-        messageId: String,
-        matchingText: String,
-        matchingAttachments: [CodexImageAttachment]
-    ) {
-        if removeUserMessage(threadId: threadId, messageId: messageId) {
-            return
-        }
-
-        markMessageDeliveryState(threadId: threadId, messageId: messageId, state: .failed)
-        removeLatestFailedUserMessage(
-            threadId: threadId,
-            matchingText: matchingText,
-            matchingAttachments: matchingAttachments
         )
     }
 

@@ -57,6 +57,13 @@ final class TurnGitDraftFlowTests: XCTestCase {
 
         XCTAssertEqual(recordedMethods, ["turn/start", "thread/generateTitle"])
         XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Fix Thread Naming")
+        XCTAssertNil(service.persistedThreadRename(for: "thread-1"))
+
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(id: "thread-1", title: "Desktop Thread Title"),
+        ])
+
+        XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Desktop Thread Title")
     }
 
     func testAutomaticThreadTitleDoesNotOverwriteUserRename() {

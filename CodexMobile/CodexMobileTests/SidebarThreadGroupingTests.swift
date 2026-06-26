@@ -140,6 +140,29 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(projectGroups.map(\.id), ["project:/Users/me/work/app"])
     }
 
+    func testMakeGroupsTreatsBareMacHomeFallbackAsRootlessChat() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "project-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/app"),
+            makeThread(id: "home-fallback-thread", updatedAt: now, cwd: "/Users/me"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/app"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .all,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/app", "chats:rootless"])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["project-thread"])
+        XCTAssertEqual(groups[1].threads.map(\.id), ["home-fallback-thread"])
+    }
+
     func testMakeGroupsWithChatScopeUsesDynamicProjectlessRoots() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let customRoot = "/Volumes/Fast/CodexChats"

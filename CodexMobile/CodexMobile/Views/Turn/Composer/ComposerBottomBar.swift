@@ -476,21 +476,22 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
         effortPart: String?,
         leadingImageName: String?
     ) -> some View {
-        HStack(spacing: 6) {
+        let modelForegroundStyle = runtimeState.showsSpeedBadgeInModelMenu ? metaLabelColor : Color.primary
+        return HStack(spacing: 6) {
             if let leadingImageName {
                 // Native SF Symbol on purpose: the Central lightning artwork
                 // reads as a different glyph from the system bolt that the
                 // user expects in the speed badge.
                 Image(systemName: leadingImageName)
                     .font(leadingIconFont)
-                    .foregroundStyle(Color.primary)
+                    .foregroundStyle(modelForegroundStyle)
             }
 
             HStack(spacing: 4) {
                 Text(modelPart)
                     .font(metaTextFont)
                     .fontWeight(.regular)
-                    .foregroundStyle(Color.primary)
+                    .foregroundStyle(modelForegroundStyle)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                     .layoutPriority(1)
@@ -570,6 +571,7 @@ private struct AllModelsSheet: View {
     @ViewBuilder
     private func modelRow(for model: CodexModelOption) -> some View {
         let title = TurnComposerMetaMapper.modelTitle(for: model)
+        let modelTitleColor = Color(.label)
         HStack(alignment: .top, spacing: 12) {
             RemodexIcon.image(systemName: model.id == selectedModelID ? "checkmark.circle.fill" : "circle")
                 .font(.system(size: 18))
@@ -580,12 +582,12 @@ private struct AllModelsSheet: View {
                 HStack(spacing: 6) {
                     Text(title)
                         .font(AppFont.body(weight: .medium))
-                        .foregroundStyle(Color(.label))
+                        .foregroundStyle(modelTitleColor)
                     if modelSupportsFastMode(model) {
                         Image(systemName: CodexServiceTier.fast.iconName)
                             .font(.system(size: fastModeIconSide, weight: .regular))
                             .frame(width: fastModeIconSide, height: fastModeIconSide)
-                            .foregroundStyle(Color(.secondaryLabel))
+                            .foregroundStyle(modelTitleColor)
                     }
                 }
                 if !model.description.isEmpty {

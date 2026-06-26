@@ -124,6 +124,39 @@ final class TurnMessageCachesTests: XCTestCase {
         XCTAssertEqual(stopped?.statusLabel, "stopped")
     }
 
+    func testTimelineDisplayTextRemovesGitActionMarkersFromAssistantRows() {
+        let message = CodexMessage(
+            id: "assistant-git-markers",
+            threadId: "thread-1",
+            role: .assistant,
+            kind: .chat,
+            text: """
+            Committed and pushed to `origin/main`.
+
+            Commit: `2d79e98` Improve iOS runtime sync and timeline UI
+
+            ::git-stage{cwd="/Users/brian.dinsen@m10s.io/projects/remodex"} ::git-commit{cwd="/Users/brian.dinsen@m10s.io/projects/remodex"} ::git-push{cwd="/Users/brian.dinsen@m10s.io/projects/remodex" branch="main"}
+            """,
+            isStreaming: false
+        )
+
+        let displayText = timelineDisplayText(for: message)
+        let actionText = timelineActionText(for: message)
+
+        XCTAssertFalse(displayText.contains("::git-stage"))
+        XCTAssertFalse(displayText.contains("::git-commit"))
+        XCTAssertFalse(displayText.contains("::git-push"))
+        XCTAssertEqual(actionText, displayText)
+        XCTAssertEqual(
+            displayText,
+            """
+            Committed and pushed to `origin/main`.
+
+            Commit: `2d79e98` Improve iOS runtime sync and timeline UI
+            """
+        )
+    }
+
     func testTimelineClippingKeepsTailForCompletedLongRows() {
         let message = CodexMessage(
             id: "long-assistant",

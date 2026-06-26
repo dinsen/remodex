@@ -1386,8 +1386,7 @@ final class TurnViewModel {
         threadID: String
     ) {
         guard let pendingSend = buildValidatedPendingSend(
-            codex: codex,
-            subscriptions: subscriptions
+            codex: codex
         ) else {
             return
         }
@@ -1454,8 +1453,7 @@ final class TurnViewModel {
         onSendFailed: (@MainActor @Sendable () -> Void)? = nil
     ) -> Bool {
         guard let pendingSend = buildValidatedPendingSend(
-            codex: codex,
-            subscriptions: subscriptions
+            codex: codex
         ) else {
             return false
         }
@@ -1525,10 +1523,9 @@ final class TurnViewModel {
     }
 
     // Shared validation + payload assembly used by `sendTurn` and `sendNewThread`
-    // so the empty/connected/blocking/review/subscription guards stay in one place.
+    // so the empty/connected/blocking/review guards stay in one place.
     private func buildValidatedPendingSend(
-        codex: CodexService,
-        subscriptions: SubscriptionService?
+        codex: CodexService
     ) -> PendingTurnSend? {
         let payload = buildPayloadWithMentions()
         let attachments = readyComposerAttachments
@@ -1549,11 +1546,6 @@ final class TurnViewModel {
 
         if reviewSelection != nil, hasComposerContentConflictingWithReview {
             codex.lastErrorMessage = "Clear text, files, skills, and images before starting a code review."
-            return nil
-        }
-
-        if let subscriptions, !subscriptions.hasAppAccess {
-            codex.lastErrorMessage = "Your 5 free messages are over. Unlock Remodex Pro to keep chatting."
             return nil
         }
 

@@ -1,5 +1,5 @@
 // FILE: SubscriptionService.swift
-// Purpose: Owns RevenueCat customer state, offerings, purchase/restore flows, and the local free-send gate.
+// Purpose: Owns RevenueCat customer state, offerings, purchase/restore flows, and local access state.
 // Layer: Service
 // Exports: SubscriptionService, SubscriptionPackageOption
 // Depends on: Foundation, Observation, RevenueCat
@@ -108,7 +108,9 @@ final class SubscriptionService {
     }
 
     deinit {
-        customerInfoUpdatesTaskStore.cancel()
+        MainActor.assumeIsolated {
+            customerInfoUpdatesTaskStore.cancel()
+        }
     }
 
     var remainingFreeSendAttempts: Int {
@@ -120,17 +122,11 @@ final class SubscriptionService {
     }
 
     var hasAppAccess: Bool {
-        hasProAccess || hasFreeSendAccess
+        true
     }
 
-    // Counts a valid send attempt for free users even if the turn later fails.
+    // Local-first builds never spend free-send attempts; RevenueCat only affects purchase UI.
     func consumeFreeSendAttemptIfNeeded() {
-        guard !hasProAccess, freeSendCount < Self.freeSendLimit else {
-            return
-        }
-
-        freeSendCount += 1
-        defaults.set(freeSendCount, forKey: Self.freeSendCountDefaultsKey)
     }
 
     // Bootstraps subscription state once at launch or from the recovery retry action.

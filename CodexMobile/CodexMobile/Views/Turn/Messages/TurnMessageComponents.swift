@@ -58,6 +58,44 @@ private nonisolated func messageRowJSONSignature(_ value: JSONValue) -> String {
     }
 }
 
+private enum AssistantGitActionMarkerSanitizer {
+    private static let markerOnlyLineRegex = try? NSRegularExpression(
+        pattern: #"(?m)^[ \t]*(?:(?:::git-(?:stage|commit|push)\{(?:[^"\\}]|\\.|"(?:[^"\\]|\\.)*")*\})[ \t]*)+$"#
+    )
+
+    static func visibleText(from rawText: String) -> String {
+        guard rawText.contains("::git-"),
+              let markerOnlyLineRegex else {
+            return rawText
+        }
+
+        let fullRange = NSRange(location: 0, length: (rawText as NSString).length)
+        guard markerOnlyLineRegex.firstMatch(in: rawText, range: fullRange) != nil else {
+            return rawText
+        }
+
+        let stripped = markerOnlyLineRegex.stringByReplacingMatches(
+            in: rawText,
+            range: fullRange,
+            withTemplate: ""
+        )
+        return collapseMarkerWhitespace(in: stripped)
+    }
+
+    private static func collapseMarkerWhitespace(in text: String) -> String {
+        let collapsedNewlines = text.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        let cleanedLines = collapsedNewlines
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "\n")
+        return cleanedLines.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 nonisolated private struct MessageRowMessageSignature: Equatable {
     private static let focusedComposerStreamingTextByteLimit = 512
 
@@ -318,7 +356,7 @@ func timelineDisplayWindow(
     if message.isStreaming, isTimelineStreamingPlaceholder(rawText) {
         return TimelineTextClippingPolicy.DisplayWindow(text: "", isPartial: false, hiddenByteCount: 0)
     }
-    let displaySource = timelineTrimmedDisplaySource(rawText)
+    let displaySource = timelineTrimmedDisplaySource(timelineDisplaySource(for: message))
     guard !displaySource.isEmpty else {
         return TimelineTextClippingPolicy.DisplayWindow(text: "", isPartial: false, hiddenByteCount: 0)
     }
@@ -348,12 +386,19 @@ private func timelineTrimmedDisplaySource(_ text: String) -> String {
     return text
 }
 
-// Keeps user actions faithful to the underlying message even when display text is clipped.
+private func timelineDisplaySource(for message: CodexMessage) -> String {
+    guard message.role == .assistant else {
+        return message.text
+    }
+    return AssistantGitActionMarkerSanitizer.visibleText(from: message.text)
+}
+
+// Keeps user actions faithful to the visible row text even when display text is clipped.
 func timelineActionText(for message: CodexMessage) -> String {
     if message.isStreaming, isTimelineStreamingPlaceholder(message.text) {
         return ""
     }
-    return message.text
+    return timelineDisplaySource(for: message)
 }
 
 // Context-menu actions may receive the full unclipped row. Avoid trimming huge strings while

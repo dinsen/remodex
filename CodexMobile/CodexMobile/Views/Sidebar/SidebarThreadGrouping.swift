@@ -171,6 +171,7 @@ enum SidebarThreadGrouping {
         projectlessRootPaths: [String] = []
     ) -> Bool {
         thread.normalizedProjectPath == nil
+            || isBareUserHomePath(thread.normalizedProjectPath)
             || isUnderProjectlessRoot(thread.normalizedProjectPath, roots: projectlessRootPaths)
             || isGeneratedCodexProjectlessPath(thread.normalizedProjectPath)
     }
@@ -316,6 +317,31 @@ enum SidebarThreadGrouping {
             || isCodexHomeThreadsPath(pathComponents)
     }
 
+    private static func isBareUserHomePath(_ rawPath: String?) -> Bool {
+        guard let normalizedPath = CodexThread.normalizedFilesystemProjectPath(rawPath) else {
+            return false
+        }
+
+        if normalizedPath == "~/" {
+            return true
+        }
+
+        let pathComponents = projectPathComponents(normalizedPath)
+        if pathComponents.count == 2,
+           isCaseInsensitive(pathComponents[0], equalTo: "Users")
+            || isCaseInsensitive(pathComponents[0], equalTo: "home") {
+            return !pathComponents[1].isEmpty
+        }
+
+        if pathComponents.count == 3,
+           pathComponents[0].hasSuffix(":"),
+           isCaseInsensitive(pathComponents[1], equalTo: "Users") {
+            return !pathComponents[2].isEmpty
+        }
+
+        return false
+    }
+
     private static func isGeneratedDocumentsCodexPath(_ components: [String]) -> Bool {
         for index in components.indices {
             let dateIndex = index + 2
@@ -354,6 +380,10 @@ enum SidebarThreadGrouping {
             .replacingOccurrences(of: "\\", with: "/")
             .split(separator: "/")
             .map(String.init)
+    }
+
+    private static func isCaseInsensitive(_ lhs: String, equalTo rhs: String) -> Bool {
+        lhs.localizedCaseInsensitiveCompare(rhs) == .orderedSame
     }
 
     private static func isISODateFolderName(_ value: String) -> Bool {
