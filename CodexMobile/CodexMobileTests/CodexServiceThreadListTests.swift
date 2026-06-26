@@ -47,8 +47,67 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
         XCTAssertEqual(
             activeRequestParams?["sourceKinds"]?.arrayValue?.compactMap(\.stringValue),
-            ["cli", "vscode", "appServer", "exec", "unknown"]
+            [
+                "cli",
+                "vscode",
+                "appServer",
+                "exec",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown",
+            ]
         )
+    }
+
+    func testListThreadsRetriesLegacySourceKindsWhenRuntimeRejectsSubagentSources() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var capturedSourceKinds: [[String]] = []
+
+        service.requestTransportOverride = { method, params in
+            guard method == "thread/list" else {
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([:]),
+                    includeJSONRPC: false
+                )
+            }
+
+            let sourceKinds = params?.objectValue?["sourceKinds"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            capturedSourceKinds.append(sourceKinds)
+
+            if capturedSourceKinds.count == 1 {
+                throw CodexServiceError.rpcError(RPCError(
+                    code: -32600,
+                    message: "Invalid request: unknown variant `subAgent` for sourceKinds"
+                ))
+            }
+
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "threads": .array([
+                        .object([
+                            "id": .string("thread-active"),
+                            "title": .string("Active thread"),
+                        ]),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        try await service.listThreads()
+
+        XCTAssertEqual(capturedSourceKinds.count, 2)
+        XCTAssertTrue(capturedSourceKinds[0].contains("subAgent"))
+        XCTAssertEqual(capturedSourceKinds[1], ["cli", "vscode", "appServer", "exec", "unknown"])
+        XCTAssertEqual(service.threads.map(\.id), ["thread-active"])
     }
 
     func testListThreadsPublishesActiveThreadsFromSingleFetch() async throws {

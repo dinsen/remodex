@@ -1660,6 +1660,67 @@ test("sanitizeThreadHistoryImagesForRelay does not duplicate or source-mismatch 
   ]);
 });
 
+test("sanitizeThreadHistoryImagesForRelay scans all JSONL sessions for thread/list augmentation", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-jsonl-all-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "06", "25");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  for (let index = 0; index < 45; index += 1) {
+    const id = `thread-jsonl-filler-${String(index).padStart(2, "0")}`;
+    fs.writeFileSync(
+      path.join(sessionsDir, `rollout-2026-06-25T17-${String(index).padStart(2, "0")}-00-${id}.jsonl`),
+      JSON.stringify({
+        timestamp: `2026-06-25T17:${String(index).padStart(2, "0")}:00.000Z`,
+        type: "session_meta",
+        payload: {
+          id,
+          cwd: "/Users/test/projects/filler",
+          source: "vscode",
+        },
+      }),
+      "utf8"
+    );
+  }
+
+  fs.writeFileSync(
+    path.join(sessionsDir, "rollout-2026-06-25T16-00-00-thread-jsonl-older-target.jsonl"),
+    JSON.stringify({
+      timestamp: "2026-06-25T16:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-jsonl-older-target",
+        cwd: "/Users/test/.codex/worktrees/a457/finn-ios-vertical",
+        source: "vscode",
+      },
+    }),
+    "utf8"
+  );
+
+  const sanitized = JSON.parse(sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "req-thread-list-jsonl-all",
+    result: {
+      data: [],
+    },
+  }), "thread/list", {
+    sourceKinds: ["vscode"],
+    cursor: null,
+  }));
+
+  const ids = sanitized.result.data.map((thread) => thread.id);
+  assert.equal(ids.length, 46);
+  assert.ok(ids.includes("thread-jsonl-older-target"));
+});
+
 test("sanitizeThreadHistoryImagesForRelay annotates generated image calls with local paths", () => {
   const rawMessage = JSON.stringify({
     id: "req-thread-generated-image",

@@ -96,8 +96,6 @@ const MODELS_WITHOUT_REASONING_SUMMARY = new Set([
 ]);
 const RELAY_TURNS_LIST_RESULT_KEYS = ["data", "items", "turns"];
 const RELAY_THREAD_LIST_RESULT_KEYS = ["data", "items", "threads"];
-const RELAY_THREAD_LIST_JSONL_CANDIDATE_LIMIT = 40;
-const RELAY_THREAD_LIST_JSONL_MAX_ADDITIONS = 12;
 const RELAY_TURNS_LIST_PAGINATION_RESULT_KEYS = [
   "nextCursor",
   "next_cursor",
@@ -2559,7 +2557,7 @@ function readRecentJsonlThreadListItems({
   let candidates = [];
   try {
     candidates = collectRecentRolloutFiles(resolveSessionsRoot(), {
-      candidateLimit: RELAY_THREAD_LIST_JSONL_CANDIDATE_LIMIT,
+      candidateLimit: Number.POSITIVE_INFINITY,
     });
   } catch {
     return [];
@@ -2567,10 +2565,6 @@ function readRecentJsonlThreadListItems({
 
   const additionsById = new Map();
   for (const candidate of candidates) {
-    if (additionsById.size >= RELAY_THREAD_LIST_JSONL_MAX_ADDITIONS) {
-      break;
-    }
-
     let summary;
     try {
       summary = parseSessionJsonlThreadSummary(fs.readFileSync(candidate.filePath, "utf8"), {

@@ -1109,41 +1109,32 @@ extension CodexService {
         var allThreads: [CodexThread] = []
         var nextCursor: JSONValue = .null
         var hasRequestedFirstPage = false
+        var activeSourceKinds = threadListSourceKinds
 
         repeat {
-            var params: RPCObject = [
-                // Avoid the server's narrower default sourceKinds so multi-project history
-                // includes threads started from the app-server flow as well.
-                "sourceKinds": .array(threadListSourceKinds.map(JSONValue.string)),
-                "cursor": nextCursor,
-            ]
-            if let limit {
-                params["limit"] = .integer(limit)
+            let pageResult: (threads: [CodexThread], nextCursor: JSONValue)
+            do {
+                pageResult = try await fetchServerThreadsPageWithoutFallback(
+                    cursor: nextCursor,
+                    limit: limit,
+                    sourceKinds: activeSourceKinds
+                )
+            } catch {
+                guard activeSourceKinds == threadListSourceKinds,
+                      shouldRetryThreadListWithLegacySourceKinds(error) else {
+                    throw error
+                }
+                activeSourceKinds = legacyThreadListSourceKinds
+                debugRuntimeLog("thread/list retrying with legacy sourceKinds after runtime rejected expanded sourceKinds")
+                pageResult = try await fetchServerThreadsPageWithoutFallback(
+                    cursor: nextCursor,
+                    limit: limit,
+                    sourceKinds: activeSourceKinds
+                )
             }
-
-            let response = try await sendRequest(
-                method: "thread/list",
-                params: .object(params),
-                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
-                timeoutMessage: "thread/list timed out while syncing chats."
-            )
-
-            guard let resultObject = response.result?.objectValue else {
-                throw CodexServiceError.invalidResponse("thread/list response missing payload")
-            }
-
-            let page =
-                resultObject["data"]?.arrayValue
-                ?? resultObject["items"]?.arrayValue
-                ?? resultObject["threads"]?.arrayValue
-            guard let page else {
-                throw CodexServiceError.invalidResponse("thread/list response missing data array")
-            }
-
-            let decodedPage = page.compactMap { decodeModel(CodexThread.self, from: $0) }
-            allThreads.append(contentsOf: decodedPage)
-            onPage?(decodedPage, allThreads)
-            nextCursor = nextThreadListCursor(from: resultObject)
+            allThreads.append(contentsOf: pageResult.threads)
+            onPage?(pageResult.threads, allThreads)
+            nextCursor = pageResult.nextCursor
             hasRequestedFirstPage = true
         } while shouldContinueThreadListPagination(
             nextCursor: nextCursor,
@@ -1154,6 +1145,44 @@ extension CodexService {
         return allThreads
     }
 
+    private func fetchServerThreadsPageWithoutFallback(
+        cursor: JSONValue,
+        limit: Int?,
+        sourceKinds: [String]
+    ) async throws -> (threads: [CodexThread], nextCursor: JSONValue) {
+        var params: RPCObject = [
+            // Avoid the server's narrower default sourceKinds so multi-project history
+            // includes threads started from the app-server flow as well.
+            "sourceKinds": .array(sourceKinds.map(JSONValue.string)),
+            "cursor": cursor,
+        ]
+        if let limit {
+            params["limit"] = .integer(limit)
+        }
+
+        let response = try await sendRequest(
+            method: "thread/list",
+            params: .object(params),
+            timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+            timeoutMessage: "thread/list timed out while syncing chats."
+        )
+
+        guard let resultObject = response.result?.objectValue else {
+            throw CodexServiceError.invalidResponse("thread/list response missing payload")
+        }
+
+        let page =
+            resultObject["data"]?.arrayValue
+            ?? resultObject["items"]?.arrayValue
+            ?? resultObject["threads"]?.arrayValue
+        guard let page else {
+            throw CodexServiceError.invalidResponse("thread/list response missing data array")
+        }
+
+        let decodedPage = page.compactMap { decodeModel(CodexThread.self, from: $0) }
+        return (decodedPage, nextThreadListCursor(from: resultObject))
+    }
+
     // Requests all user-facing thread sources instead of relying on the server default.
     private var threadListSourceKinds: [String] {
         [
@@ -1161,8 +1190,41 @@ extension CodexService {
             "vscode",
             "appServer",
             "exec",
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther",
             "unknown",
         ]
+    }
+
+    private var legacyThreadListSourceKinds: [String] {
+        [
+            "cli",
+            "vscode",
+            "appServer",
+            "exec",
+            "unknown",
+        ]
+    }
+
+    private func shouldRetryThreadListWithLegacySourceKinds(_ error: Error) -> Bool {
+        guard let serviceError = error as? CodexServiceError,
+              case .rpcError(let rpcError) = serviceError else {
+            return false
+        }
+
+        let message = rpcError.message.lowercased()
+        guard rpcError.code == -32600 || rpcError.code == -32602 || rpcError.code == -32000 else {
+            return false
+        }
+
+        return message.contains("sourcekind")
+            || message.contains("source kind")
+            || message.contains("source_kinds")
+            || message.contains("sourcekinds")
+            || (message.contains("unknown variant") && message.contains("subagent"))
     }
 
     // Accepts both modern and legacy cursor field names from thread/list responses.
