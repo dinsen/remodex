@@ -57,8 +57,12 @@ enum ChatEmptyStateTitleBuilder {
               !folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return Text("Hi! How can I help you?")
         }
-        return Text("What should we do in ")
-            + Text(folderName).foregroundStyle(.secondary)
-            + Text("?")
+
+        var title = AttributedString("What should we do in ")
+        var folder = AttributedString(folderName)
+        folder.foregroundColor = .secondary
+        title.append(folder)
+        title.append(AttributedString("?"))
+        return Text(title)
     }
 }

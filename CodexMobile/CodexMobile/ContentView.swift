@@ -1006,7 +1006,7 @@ struct ContentView: View {
     }
 
     private var fallbackSidebarWidth: CGFloat {
-        effectiveSidebarWidth(for: UIScreen.main.bounds.width)
+        sidebarWidth
     }
 
     private func sidebarRevealWidth(for targetWidth: CGFloat) -> CGFloat {

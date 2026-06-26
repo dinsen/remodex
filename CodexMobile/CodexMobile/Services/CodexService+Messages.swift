@@ -774,6 +774,8 @@ extension CodexService {
             return true
         }
 
+        requestRuntimeOptionRefresh()
+
         // Freshly created empty chats do not need an immediate resume/read pass.
         // Skipping that first hydration avoids extra RPC contention when another
         // thread is already running and the user simply wants a blank composer.

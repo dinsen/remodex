@@ -607,17 +607,19 @@ struct CommandExecutionCardBody: View {
         return info
     }
 
+    private var displayText: Text {
+        var text = AttributedString(display.verb)
+        text.foregroundColor = .secondary
+        var target = AttributedString(" " + display.target)
+        target.foregroundColor = Color.secondary.opacity(0.65)
+        text.append(target)
+        return Text(text)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
-            (
-                Text(display.verb)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.secondary)
-                +
-                Text(" " + display.target)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.tertiary)
-            )
+            displayText
+                .font(AppFont.body(weight: .regular))
             .lineLimit(1)
             .truncationMode(.tail)
 

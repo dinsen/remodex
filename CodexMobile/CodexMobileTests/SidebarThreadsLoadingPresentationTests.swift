@@ -25,4 +25,22 @@ final class SidebarThreadsLoadingPresentationTests: XCTestCase {
 
         XCTAssertFalse(shouldShow)
     }
+
+    func testShowsInlineStatusWhenRefreshingExistingThreads() {
+        let shouldShow = SidebarThreadsLoadingPresentation.shouldShowInlineStatus(
+            isLoadingThreads: true,
+            threadCount: 3
+        )
+
+        XCTAssertTrue(shouldShow)
+    }
+
+    func testHidesInlineStatusForInitialThreadLoad() {
+        let shouldShow = SidebarThreadsLoadingPresentation.shouldShowInlineStatus(
+            isLoadingThreads: true,
+            threadCount: 0
+        )
+
+        XCTAssertFalse(shouldShow)
+    }
 }

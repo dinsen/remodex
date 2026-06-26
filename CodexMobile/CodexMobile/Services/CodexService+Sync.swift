@@ -106,7 +106,8 @@ extension CodexService {
                 startWebSocketKeepAliveLoop()
                 startSyncLoop()
                 requestImmediateSync(threadId: activeThreadId)
-                // Re-check bridge-managed state when the app becomes active again.
+                // Re-check bridge-managed state and runtime defaults when the app becomes active again.
+                requestRuntimeOptionRefresh()
                 Task { @MainActor [weak self] in
                     await self?.refreshBridgeManagedState(allowAvailableBridgeUpdatePrompt: true)
                 }

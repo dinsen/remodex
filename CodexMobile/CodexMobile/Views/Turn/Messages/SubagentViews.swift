@@ -317,14 +317,18 @@ private struct SubagentAgentRowView: View {
     }
 
     private var labelText: some View {
-        (
-            SubagentLabelParser.styledText(for: title, roleSuffixColor: .primary)
-            + Text(" \(statusText)")
-                .foregroundColor(.secondary)
-        )
+        Text(labelAttributedString)
         .font(AppFont.caption())
         .lineLimit(1)
         .truncationMode(.tail)
+    }
+
+    private var labelAttributedString: AttributedString {
+        var text = SubagentLabelParser.styledAttributedString(for: title, roleSuffixColor: .primary)
+        var status = AttributedString(" \(statusText)")
+        status.foregroundColor = .secondary
+        text.append(status)
+        return text
     }
 }
 
@@ -483,11 +487,25 @@ enum SubagentLabelParser {
         roleSuffix: String,
         roleSuffixColor: Color = .secondary
     ) -> Text {
-        Text(nickname)
-            .foregroundColor(SubagentColorPalette.color(for: nickname))
-            .fontWeight(.semibold)
-        + Text(roleSuffix)
-            .foregroundColor(roleSuffixColor)
+        Text(styledAttributedString(
+            nickname: nickname,
+            roleSuffix: roleSuffix,
+            roleSuffixColor: roleSuffixColor
+        ))
+    }
+
+    static func styledAttributedString(
+        nickname: String,
+        roleSuffix: String,
+        roleSuffixColor: Color = .secondary
+    ) -> AttributedString {
+        var text = AttributedString(nickname)
+        text.foregroundColor = SubagentColorPalette.color(for: nickname)
+        text.inlinePresentationIntent = .stronglyEmphasized
+        var suffix = AttributedString(roleSuffix)
+        suffix.foregroundColor = roleSuffixColor
+        text.append(suffix)
+        return text
     }
 
     /// Convenience: parses title first, then builds styled Text.
@@ -497,6 +515,18 @@ enum SubagentLabelParser {
     ) -> Text {
         let parts = parse(title)
         return styledText(nickname: parts.nickname, roleSuffix: parts.roleSuffix, roleSuffixColor: roleSuffixColor)
+    }
+
+    static func styledAttributedString(
+        for title: String,
+        roleSuffixColor: Color = .secondary
+    ) -> AttributedString {
+        let parts = parse(title)
+        return styledAttributedString(
+            nickname: parts.nickname,
+            roleSuffix: parts.roleSuffix,
+            roleSuffixColor: roleSuffixColor
+        )
     }
 }
 

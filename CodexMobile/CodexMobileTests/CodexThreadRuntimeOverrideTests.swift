@@ -160,6 +160,85 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(secondService.selectedModelId, "gpt-5.5")
     }
 
+    func testDesktopGPT55ExtraHighDefaultSurvivesModelListRefresh() {
+        let service = makeService()
+        service.applyRuntimeDefaultsFromBridge(CodexRuntimeDefaultsPayload(object: [
+            "model": .string("gpt-5.5"),
+            "reasoningEffort": .string("xhigh"),
+            "serviceTier": .string("fast"),
+        ]))
+
+        service.availableModels = [makeGPT55Model()]
+        service.normalizeRuntimeSelectionsAfterModelsUpdate()
+
+        XCTAssertEqual(service.selectedModelId, "gpt-5.5")
+        XCTAssertEqual(service.selectedReasoningEffort, "xhigh")
+        XCTAssertEqual(service.selectedReasoningEffortForSelectedModel(), "xhigh")
+        XCTAssertEqual(service.effectiveServiceTier(), .fast)
+        XCTAssertTrue(
+            service.supportedReasoningEffortsForSelectedModel()
+                .contains { $0.reasoningEffort == "xhigh" }
+        )
+    }
+
+    func testRuntimeOptionRefreshAppliesDesktopRuntimeDefaultsOnDemand() async {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.selectedReasoningEffort = "medium"
+        service.selectedServiceTier = nil
+
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "runtime/defaults":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "model": .string("gpt-5.5"),
+                        "reasoningEffort": .string("xhigh"),
+                        "serviceTier": .string("fast"),
+                    ]),
+                    includeJSONRPC: false
+                )
+            case "model/list":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "items": .array([
+                            .object([
+                                "id": .string("gpt-5.5"),
+                                "model": .string("gpt-5.5"),
+                                "displayName": .string("GPT-5.5"),
+                                "supportsFastMode": .bool(true),
+                                "supportedReasoningEfforts": .array([
+                                    .string("medium"),
+                                    .string("high"),
+                                ]),
+                                "defaultReasoningEffort": .string("medium"),
+                            ]),
+                        ]),
+                    ]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        service.requestRuntimeOptionRefresh()
+        await service.runtimeOptionRefreshTask?.value
+
+        XCTAssertEqual(service.selectedModelId, "gpt-5.5")
+        XCTAssertEqual(service.selectedReasoningEffort, "xhigh")
+        XCTAssertEqual(service.selectedReasoningEffortForSelectedModel(), "xhigh")
+        XCTAssertEqual(service.effectiveServiceTier(), .fast)
+        XCTAssertTrue(
+            service.supportedReasoningEffortsForSelectedModel()
+                .contains { $0.reasoningEffort == "xhigh" }
+        )
+    }
+
     func testContinuationInheritsThreadRuntimeOverrides() {
         let service = makeService()
         service.availableModels = [makeModel()]

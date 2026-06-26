@@ -364,6 +364,147 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(messageIDs, toolMessages.map(\.id))
     }
 
+    func testTimelineRenderProjectionGroupsFinishedCommandsIntoDisclosureItem() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "command-1",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed rg -n \"needle\"",
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "command-1"
+            ),
+            makeMessage(
+                id: "command-2",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed sed -n '1,40p' File.swift",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "command-2"
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(messages: messages)
+        XCTAssertEqual(items.count, 1)
+
+        guard case .commandGroup(let group) = items[0] else {
+            return XCTFail("Expected completed commands to collapse into one command group")
+        }
+
+        XCTAssertEqual(group.commandCount, 2)
+        XCTAssertEqual(group.messages.map(\.id), ["command-1", "command-2"])
+    }
+
+    func testTimelineRenderProjectionKeepsRunningCommandsVisibleUntilFinished() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "command-running",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Running rg -n \"needle\"",
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "command-running",
+                isStreaming: true
+            ),
+            makeMessage(
+                id: "command-completed",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed sed -n '1,40p' File.swift",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "command-completed"
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(messages: messages)
+        XCTAssertEqual(items.count, 2)
+
+        guard case .message(let runningCommand) = items[0] else {
+            return XCTFail("Expected running command to remain visible")
+        }
+        guard case .commandGroup(let completedGroup) = items[1] else {
+            return XCTFail("Expected completed command to collapse after it finishes")
+        }
+
+        XCTAssertEqual(runningCommand.id, "command-running")
+        XCTAssertEqual(completedGroup.messages.map(\.id), ["command-completed"])
+    }
+
+    func testTimelineRenderProjectionKeepsFinishedCommandGroupOutsideCompletedTurnPreviousMessages() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "user",
+                threadID: "thread",
+                role: .user,
+                text: "Inspect the files",
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "user-item",
+                orderIndex: 1
+            ),
+            makeMessage(
+                id: "status",
+                threadID: "thread",
+                role: .assistant,
+                text: "I'll inspect the relevant files.",
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "status-item",
+                orderIndex: 2
+            ),
+            makeMessage(
+                id: "command",
+                threadID: "thread",
+                role: .system,
+                kind: .commandExecution,
+                text: "Completed rg -n \"needle\"",
+                createdAt: now.addingTimeInterval(2),
+                turnID: "turn-1",
+                itemID: "command-item",
+                orderIndex: 3
+            ),
+            makeMessage(
+                id: "final",
+                threadID: "thread",
+                role: .assistant,
+                text: "Found the relevant files.",
+                createdAt: now.addingTimeInterval(3),
+                turnID: "turn-1",
+                itemID: "final-item",
+                orderIndex: 4
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(
+            messages: messages,
+            completedTurnIDs: ["turn-1"]
+        )
+
+        XCTAssertEqual(items.count, 4)
+        guard case .message(let user) = items[0],
+              case .previousMessages(let previousGroup) = items[1],
+              case .commandGroup(let commandGroup) = items[2],
+              case .message(let final) = items[3] else {
+            return XCTFail("Expected finished command group to stay outside previous messages")
+        }
+
+        XCTAssertEqual(user.id, "user")
+        XCTAssertEqual(previousGroup.messages.map(\.id), ["status"])
+        XCTAssertEqual(commandGroup.messages.map(\.id), ["command"])
+        XCTAssertEqual(final.id, "final")
+    }
+
     func testTimelineRenderProjectionSkipsPlaceholderOnlyThinkingRows() {
         let now = Date()
         let messages = [
@@ -401,7 +542,13 @@ final class TurnTimelineReducerTests: XCTestCase {
         ]
 
         let items = TurnTimelineRenderProjection.project(messages: messages)
-        XCTAssertEqual(items.map(\.id), ["tool-1", "tool-2"])
+        XCTAssertEqual(items.count, 1)
+
+        guard case .commandGroup(let group) = items[0] else {
+            return XCTFail("Expected completed commands to remain grouped around skipped placeholders")
+        }
+
+        XCTAssertEqual(group.messages.map(\.id), ["tool-1", "tool-2"])
     }
 
     func testTimelineRenderProjectionSplitsToolRunsAcrossStableTurnIDs() {

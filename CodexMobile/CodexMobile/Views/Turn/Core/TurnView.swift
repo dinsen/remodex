@@ -1165,9 +1165,9 @@ struct TurnView: View {
         showsGitControls: Bool
     ) async {
         let didPrepare = await codex.prepareThreadForDisplay(threadId: thread.id)
-        guard didPrepare, !Task.isCancelled, codex.activeThreadId == thread.id else { return }
-        await codex.refreshContextWindowUsage(threadId: thread.id)
         guard !Task.isCancelled, codex.activeThreadId == thread.id else { return }
+        await codex.refreshContextWindowUsage(threadId: thread.id)
+        guard didPrepare, !Task.isCancelled, codex.activeThreadId == thread.id else { return }
         viewModel.flushQueueIfPossible(codex: codex, threadID: thread.id)
         guard !Task.isCancelled, codex.activeThreadId == thread.id else { return }
         guard showsGitControls else { return }

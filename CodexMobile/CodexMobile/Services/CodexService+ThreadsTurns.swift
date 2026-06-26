@@ -15,6 +15,23 @@ private enum ThreadListHydrationPolicy {
     static let requestTimeoutNanoseconds: UInt64 = 12_000_000_000
 }
 
+private nonisolated enum CodexThreadPageDecoder {
+    static func decode(_ page: [JSONValue]) async -> [CodexThread] {
+        await Task.detached(priority: .userInitiated) {
+            let encoder = JSONEncoder()
+            let decoder = JSONDecoder()
+
+            return page.compactMap { value in
+                guard let data = try? encoder.encode(value) else {
+                    return nil
+                }
+
+                return try? decoder.decode(CodexThread.self, from: data)
+            }
+        }.value
+    }
+}
+
 private enum StaleInterruptResolution: Equatable {
     case none
     case completed
@@ -1179,7 +1196,7 @@ extension CodexService {
             throw CodexServiceError.invalidResponse("thread/list response missing data array")
         }
 
-        let decodedPage = page.compactMap { decodeModel(CodexThread.self, from: $0) }
+        let decodedPage = await CodexThreadPageDecoder.decode(page)
         return (decodedPage, nextThreadListCursor(from: resultObject))
     }
 

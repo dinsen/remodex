@@ -64,6 +64,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var lastScopedThreadsFingerprint: Int = 0
     @State private var lastGroupedThreadsFingerprint: Int = 0
     @State private var lastBadgeFingerprint: Int = 0
+    @State private var sidebarDataRebuildCoalescer = SidebarDataRebuildCoalescer()
     @State private var projectlessChatRootPaths: [String] = []
     @State private var configuredProjectChoices: [SidebarProjectChoice] = []
     @AppStorage(SidebarProjectSource.storageKey)
@@ -105,26 +106,25 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                     "threads changed while \(isVisible ? "visible" : "hidden-prewarmed") "
                         + "threadCount=\(codex.threads.count)"
                 )
-                rebuildGroupedThreads()
-                rebuildCachedSidebarState()
+                scheduleSidebarDataRebuild(needsGroups: true, needsRunBadges: true)
             }
             .onChange(of: searchText) { _, _ in
                 debugSidebarLog("search changed queryLength=\(searchText.count)")
-                rebuildGroupedThreads()
+                scheduleSidebarDataRebuild(needsGroups: true)
             }
             .onChange(of: selectedContentScope) { _, scope in
                 debugSidebarLog("content scope changed scope=\(scope.rawValue)")
-                rebuildGroupedThreads()
+                scheduleSidebarDataRebuild(needsGroups: true)
             }
             .onChange(of: projectSourceRawValue) { _, rawValue in
                 debugSidebarLog("project source changed source=\(rawValue)")
-                rebuildGroupedThreads()
+                scheduleSidebarDataRebuild(needsGroups: true)
                 guard codex.isConnected, selectedProjectSource == .configuredProjects else { return }
                 Task { @MainActor in await refreshConfiguredProjects() }
             }
             .onChange(of: codex.pinnedThreadIDs) { _, _ in
                 debugSidebarLog("pinned threads changed count=\(codex.pinnedThreadIDs.count)")
-                rebuildGroupedThreads()
+                scheduleSidebarDataRebuild(needsGroups: true)
             }
             .onChange(of: codex.isConnected) { _, isConnected in
                 guard isConnected else { return }
@@ -133,17 +133,18 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                     await refreshConfiguredProjects()
                 }
             }
-            // Deferred to the next runloop tick so rebuilding the cache `@State`
-            // does not trigger another body re-evaluation inside the same frame
-            // (which previously cascaded with iOS 26 `safeAreaBar`'s internal
-            // OnScrollGeometryChange and logged "tried to update multiple times
-            // per frame" warnings).
+            // Deferred through the same sidebar coalescer as thread/group changes
+            // so iOS 26 safeAreaBar scroll geometry does not see several cache
+            // mutations in one frame.
             .onChange(of: badgeFingerprint) { _, _ in
                 debugSidebarLog("badge fingerprint changed visible=\(isVisible)")
-                Task { @MainActor in rebuildCachedRunBadges() }
+                scheduleSidebarDataRebuild(needsRunBadges: true)
             }
             .onChange(of: isVisible) { _, visible in
                 debugSidebarLog("visibility changed visible=\(visible)")
+            }
+            .onDisappear {
+                sidebarDataRebuildCoalescer.cancel()
             }
             .overlay {
                 if SidebarThreadsLoadingPresentation.shouldShowOverlay(
@@ -248,7 +249,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             let roots = try await codex.fetchProjectlessChatRoots().roots
             guard roots != projectlessChatRootPaths else { return }
             projectlessChatRootPaths = roots
-            rebuildGroupedThreads()
+            scheduleSidebarDataRebuild(needsGroups: true)
         } catch {
             // Path-pattern fallbacks still classify current Desktop defaults if the bridge is older.
             debugSidebarLog("projectless roots unavailable error=\(error.localizedDescription)")
@@ -262,7 +263,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             let choices = Self.sidebarProjectChoices(from: try await codex.fetchConfiguredProjects())
             guard choices != configuredProjectChoices else { return }
             configuredProjectChoices = choices
-            rebuildGroupedThreads()
+            scheduleSidebarDataRebuild(needsGroups: true)
         } catch {
             // Older bridges can lack this RPC; recent-thread grouping still renders.
             debugSidebarLog("configured projects unavailable error=\(error.localizedDescription)")
@@ -430,6 +431,33 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     }
 
     // Rebuilds sidebar sections only when the source thread array changes.
+    private func scheduleSidebarDataRebuild(
+        needsGroups: Bool = false,
+        needsRunBadges: Bool = false
+    ) {
+        sidebarDataRebuildCoalescer.needsGroups = sidebarDataRebuildCoalescer.needsGroups || needsGroups
+        sidebarDataRebuildCoalescer.needsRunBadges = sidebarDataRebuildCoalescer.needsRunBadges || needsRunBadges
+        guard sidebarDataRebuildCoalescer.task == nil else { return }
+
+        sidebarDataRebuildCoalescer.task = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+
+            let shouldRebuildGroups = sidebarDataRebuildCoalescer.needsGroups
+            let shouldRebuildRunBadges = sidebarDataRebuildCoalescer.needsRunBadges
+            sidebarDataRebuildCoalescer.needsGroups = false
+            sidebarDataRebuildCoalescer.needsRunBadges = false
+            sidebarDataRebuildCoalescer.task = nil
+
+            if shouldRebuildGroups {
+                rebuildGroupedThreads()
+            }
+            if shouldRebuildRunBadges {
+                rebuildCachedSidebarState()
+            }
+        }
+    }
+
     private func rebuildGroupedThreads() {
         let startedAt = Date()
         rebuildScopedSidebarThreads()
@@ -889,6 +917,20 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     }
 }
 
+@MainActor
+private final class SidebarDataRebuildCoalescer {
+    var needsGroups = false
+    var needsRunBadges = false
+    var task: Task<Void, Never>?
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        needsGroups = false
+        needsRunBadges = false
+    }
+}
+
 private extension SidebarView {
     static var isSidebarDebugLoggingEnabled: Bool { false }
 }
@@ -968,10 +1010,12 @@ private struct SidebarThreadsInlineLoadingView: View {
                 .controlSize(.small)
                 .scaleEffect(0.76)
                 .frame(width: 12, height: 12)
-            Text("Syncing chats")
-                .font(AppFont.callout(weight: .medium))
-                .foregroundStyle(Color.primary)
-                .lineLimit(1)
+            ShimmerText(
+                text: "Syncing chats",
+                font: AppFont.callout(weight: .medium),
+                foregroundStyle: Color.primary
+            )
+            .lineLimit(1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)

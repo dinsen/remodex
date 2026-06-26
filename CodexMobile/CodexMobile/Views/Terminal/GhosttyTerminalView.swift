@@ -456,7 +456,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIGestureRecognize
         callbackState.view = self
         applyTheme()
         clipsToBounds = true
-        contentScaleFactor = UIScreen.main.scale
+        contentScaleFactor = effectiveDisplayScale
 
         terminalViewport.clipsToBounds = true
         terminalViewport.contentScaleFactor = contentScaleFactor
@@ -1609,10 +1609,15 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIGestureRecognize
     }
 
     private func updateContentScale() {
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        let scale = effectiveDisplayScale
         if contentScaleFactor != scale {
             contentScaleFactor = scale
         }
+    }
+
+    private var effectiveDisplayScale: CGFloat {
+        let scale = window?.windowScene?.screen.scale ?? traitCollection.displayScale
+        return scale > 0 ? scale : 1
     }
 
     private func configureIOSurfaceLayers() {

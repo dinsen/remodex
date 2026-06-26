@@ -222,15 +222,14 @@ private struct TurnTimelineToolBurstView: View {
                             .font(AppFont.system(size: 10, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        (
+                        HStack(spacing: 0) {
                             Text(summaryCountLabel)
                                 .font(AppFont.subheadline(weight: .medium))
                                 .foregroundStyle(.secondary)
-                            +
                             Text(" " + summaryNounLabel)
                                 .font(AppFont.subheadline())
                                 .foregroundStyle(.tertiary)
-                        )
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
@@ -261,6 +260,83 @@ private struct TurnTimelineToolBurstView: View {
                 }
             }
         }
+    }
+}
+
+private struct TurnTimelineCommandGroupView: View {
+    let group: TurnTimelineCommandGroup
+    let isRetryAvailable: Bool
+    let cachedBlockInfoByMessageID: [String: AssistantBlockAccessoryState]
+    let planSessionSource: CodexPlanSessionSource?
+    let allowsAssistantPlanFallbackRecovery: Bool
+    let completedTurnIDs: Set<String>
+    let threadMessagesForPlanMatching: [CodexMessage]
+    let currentWorkingDirectory: String?
+    let planMatchingFingerprint: Int
+    let newestStreamingMessageID: String?
+    let autoScrollMode: TurnAutoScrollMode
+    let prioritizesComposerInput: Bool
+    let showsGlobalRunningIndicator: Bool
+    let onRetryUserMessage: (String) -> Void
+    let onTapAssistantRevert: (CodexMessage) -> Void
+    let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
+
+    @State private var isExpanded = false
+
+    private var title: String {
+        group.commandCount == 1 ? "Ran 1 command" : "Ran \(group.commandCount) commands"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    RemodexIcon.image(systemName: "terminal")
+                        .font(AppFont.system(size: 15, weight: .regular))
+                        .foregroundStyle(.secondary)
+                    Text(title)
+                        .font(AppFont.body(weight: .regular))
+                        .foregroundStyle(.secondary)
+                    RemodexIcon.image(systemName: "chevron.right")
+                        .font(AppFont.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityHint(isExpanded ? "Collapse command details" : "Expand command details")
+
+            if isExpanded {
+                ForEach(group.messages) { message in
+                    TurnTimelineMessageRow(
+                        message: message,
+                        isRetryAvailable: isRetryAvailable,
+                        cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
+                        planSessionSource: planSessionSource,
+                        allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
+                        completedTurnIDs: completedTurnIDs,
+                        threadMessagesForPlanMatching: threadMessagesForPlanMatching,
+                        currentWorkingDirectory: currentWorkingDirectory,
+                        planMatchingFingerprint: planMatchingFingerprint,
+                        newestStreamingMessageID: newestStreamingMessageID,
+                        autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
+                        showsGlobalRunningIndicator: showsGlobalRunningIndicator,
+                        onRetryUserMessage: onRetryUserMessage,
+                        onTapAssistantRevert: onTapAssistantRevert,
+                        onTapSubagent: onTapSubagent
+                    )
+                }
+            }
+        }
+        .id(group.id)
     }
 }
 
@@ -424,6 +500,25 @@ struct TurnTimelineRowsSection: View {
                     )
                 case .toolBurst(let group):
                     TurnTimelineToolBurstView(
+                        group: group,
+                        isRetryAvailable: isRetryAvailable,
+                        cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
+                        planSessionSource: planSessionSource,
+                        allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
+                        completedTurnIDs: completedTurnIDs,
+                        threadMessagesForPlanMatching: threadMessagesForPlanMatching,
+                        currentWorkingDirectory: currentWorkingDirectory,
+                        planMatchingFingerprint: planMatchingFingerprint,
+                        newestStreamingMessageID: newestStreamingMessageID,
+                        autoScrollMode: autoScrollMode,
+                        prioritizesComposerInput: prioritizesComposerInput,
+                        showsGlobalRunningIndicator: shouldUseGlobalRunningIndicator,
+                        onRetryUserMessage: onRetryUserMessage,
+                        onTapAssistantRevert: onTapAssistantRevert,
+                        onTapSubagent: onTapSubagent
+                    )
+                case .commandGroup(let group):
+                    TurnTimelineCommandGroupView(
                         group: group,
                         isRetryAvailable: isRetryAvailable,
                         cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,

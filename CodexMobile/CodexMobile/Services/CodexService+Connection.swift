@@ -592,8 +592,12 @@ extension CodexService {
     // Keep model/reasoning metadata off the critical reconnect path. Some bridge
     // runtimes can answer chats while model/list is still slow or unavailable.
     private func scheduleRuntimeOptionRefresh() {
+        requestRuntimeOptionRefresh(delayNanoseconds: 1_000_000_000)
+    }
+
+    func requestRuntimeOptionRefresh(delayNanoseconds: UInt64 = 0) {
         pendingRuntimeOptionRefresh = true
-        flushPendingRuntimeOptionRefreshIfPossible(delayNanoseconds: 1_000_000_000)
+        flushPendingRuntimeOptionRefreshIfPossible(delayNanoseconds: delayNanoseconds)
     }
 
     // Runs a queued runtime metadata refresh once thread hydration is no longer busy.
