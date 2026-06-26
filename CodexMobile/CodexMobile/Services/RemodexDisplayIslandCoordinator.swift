@@ -42,6 +42,7 @@ final class RemodexDisplayIslandCoordinator {
     private var lastTerminalStatesByThread: [String: CodexTurnTerminalState] = [:]
     private var runningStartedAtByThread: [String: Date] = [:]
     private var runningLastSeenAtByThread: [String: Date] = [:]
+    private var didHydrateRunningStartsFromActivity = false
 
     func rememberCompletion(from banner: CodexThreadCompletionBanner?, codex: CodexService) {
         guard let banner else {
@@ -84,8 +85,7 @@ final class RemodexDisplayIslandCoordinator {
         currentRunningThreadIDs(codex: codex)
             .sorted()
             .map { threadId in
-                let snapshot = codex.timelineState(for: threadId).renderSnapshot
-                return "\(threadId):\(snapshot.timelineChangeToken):\(runningState(for: threadId, codex: codex))"
+                "\(threadId):\(runningState(for: threadId, codex: codex))"
             }
             .joined(separator: "|")
     }
@@ -320,7 +320,7 @@ final class RemodexDisplayIslandCoordinator {
                 && message.kind == .chat
                 && message.isStreaming
                 && message.assistantPhase == "final_answer"
-                && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && message.text.contains { !$0.isWhitespace }
         }
         return isFinalAnswerStreaming ? "Finishing" : "Running"
     }
@@ -400,6 +400,11 @@ final class RemodexDisplayIslandCoordinator {
     }
 
     private func hydrateRunningStartsFromCurrentActivity(now: Date) {
+        guard !didHydrateRunningStartsFromActivity else {
+            return
+        }
+        didHydrateRunningStartsFromActivity = true
+
         guard let activity = currentActivity else {
             return
         }
@@ -430,8 +435,15 @@ final class RemodexDisplayIslandCoordinator {
             return
         }
 
-        guard snapshot != lastSnapshot || currentActivity == nil else {
-            return
+        if snapshot == lastSnapshot {
+            if activityID != nil {
+                return
+            }
+
+            if let activity = currentActivity {
+                activityID = activity.id
+                return
+            }
         }
 
         let content = ActivityContent(
