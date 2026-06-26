@@ -392,8 +392,10 @@ final class CodexService {
     // Per-thread unsent composer drafts that survive chat switches and app restarts.
     var composerDraftsByThreadID: [String: TurnComposerLocalDraft] = [:]
     var messagesByThread: [String: [CodexMessage]] = [:]
-    // Monotonic per-thread revision so views can react to message mutations without hashing full transcripts.
-    var messageRevisionByThread: [String: Int] = [:]
+    // Monotonic per-thread revision used to build observed ThreadTimelineState snapshots.
+    // Deferred streaming deltas still bump this counter, but should not invalidate the
+    // whole service-observing SwiftUI tree until a render snapshot is published.
+    @ObservationIgnored var messageRevisionByThread: [String: Int] = [:]
     var syncRealtimeEnabled = true
     var availableModels: [CodexModelOption] = []
     var selectedModelId: String?
