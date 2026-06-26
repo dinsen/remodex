@@ -1510,6 +1510,156 @@ test("sanitizeThreadHistoryImagesForRelay restores JSONL cwd without file change
   assert.equal(sanitized.result.thread.turns[0].items.length, 1);
 });
 
+test("sanitizeThreadHistoryImagesForRelay adds recent JSONL worktree sessions to thread/list", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-jsonl-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const missingThreadId = "thread-jsonl-worktree";
+  const parentThreadId = "parent-thread-jsonl";
+  const cwd = "/Users/test/.codex/worktrees/a457/finn-ios-vertical";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "06", "25");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionsDir, `rollout-2026-06-25T16-21-38-${missingThreadId}.jsonl`),
+    [
+      JSON.stringify({
+        timestamp: "2026-06-25T14:21:38.598Z",
+        type: "session_meta",
+        payload: {
+          id: missingThreadId,
+          cwd,
+          source: "vscode",
+          thread_source: "subagent",
+          model_provider: "openai",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-06-25T14:21:45.594Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: [
+            "<codex_delegation>",
+            `<source_thread_id>${parentThreadId}</source_thread_id>`,
+            "<input>Task: make the MobilityAdIn wizard available when editing an active ad.</input>",
+            "</codex_delegation>",
+          ].join("\n"),
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-06-26T06:44:09.072Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const sanitized = JSON.parse(sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "req-thread-list-jsonl",
+    result: {
+      data: [
+        {
+          id: "server-thread",
+          cwd: "/Users/test/projects/other",
+          updatedAt: "2026-06-24T12:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    },
+  }), "thread/list", {
+    sourceKinds: ["vscode"],
+    cursor: null,
+  }));
+
+  assert.equal(sanitized.result.remodexJsonlThreadListAugmented, true);
+  assert.equal(sanitized.result.data[0].id, missingThreadId);
+  assert.equal(sanitized.result.data[0].cwd, cwd);
+  assert.equal(sanitized.result.data[0].current_working_directory, cwd);
+  assert.equal(sanitized.result.data[0].parentThreadId, parentThreadId);
+  assert.equal(sanitized.result.data[0].thread_source, "subagent");
+  assert.equal(sanitized.result.data[0].modelProvider, "openai");
+  assert.equal(
+    sanitized.result.data[0].preview,
+    "make the MobilityAdIn wizard available when editing an active ad."
+  );
+  assert.equal(sanitized.result.data[1].id, "server-thread");
+});
+
+test("sanitizeThreadHistoryImagesForRelay does not duplicate or source-mismatch JSONL thread/list rows", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-jsonl-filter-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "06", "25");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionsDir, "rollout-2026-06-25T16-21-38-thread-jsonl-existing.jsonl"),
+    JSON.stringify({
+      timestamp: "2026-06-25T14:21:38.598Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-jsonl-existing",
+        cwd: "/Users/test/projects/app",
+        source: "vscode",
+      },
+    }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(sessionsDir, "rollout-2026-06-25T16-22-38-thread-jsonl-exec.jsonl"),
+    JSON.stringify({
+      timestamp: "2026-06-25T14:22:38.598Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-jsonl-exec",
+        cwd: "/Users/test/projects/app",
+        source: "exec",
+      },
+    }),
+    "utf8"
+  );
+
+  const sanitized = sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "req-thread-list-jsonl-filter",
+    result: {
+      data: [
+        {
+          id: "thread-jsonl-existing",
+          cwd: "/Users/test/projects/app",
+        },
+      ],
+    },
+  }), "thread/list", {
+    sourceKinds: ["vscode"],
+    cursor: null,
+  });
+
+  assert.deepEqual(JSON.parse(sanitized).result.data.map((thread) => thread.id), [
+    "thread-jsonl-existing",
+  ]);
+});
+
 test("sanitizeThreadHistoryImagesForRelay annotates generated image calls with local paths", () => {
   const rawMessage = JSON.stringify({
     id: "req-thread-generated-image",

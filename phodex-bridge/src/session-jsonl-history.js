@@ -78,6 +78,95 @@ function parseSessionJsonlMetadata(content) {
   return { threadId, cwd };
 }
 
+function parseSessionJsonlThreadSummary(content, {
+  fallbackUpdatedAt = "",
+} = {}) {
+  let threadId = "";
+  let cwd = "";
+  let source = "";
+  let threadSource = "";
+  let modelProvider = "";
+  let createdAt = "";
+  let updatedAt = normalizeString(fallbackUpdatedAt);
+  let preview = "";
+  let parentThreadId = "";
+
+  const raw = String(content || "");
+  let lineStart = 0;
+  while (lineStart < raw.length) {
+    let lineEnd = raw.indexOf("\n", lineStart);
+    if (lineEnd === -1) {
+      lineEnd = raw.length;
+    }
+    const line = raw.substring(lineStart, lineEnd).trim();
+    lineStart = lineEnd + 1;
+    if (!line) {
+      continue;
+    }
+
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const timestamp = normalizeString(entry?.timestamp);
+    if (timestamp) {
+      updatedAt = timestamp;
+    }
+
+    if (entry?.type === "session_meta") {
+      const payload = objectValue(entry.payload);
+      threadId ||= normalizeString(payload?.id)
+        || normalizeString(payload?.thread_id)
+        || normalizeString(payload?.threadId)
+        || normalizeString(payload?.session_id)
+        || normalizeString(payload?.sessionId);
+      cwd ||= normalizeString(payload?.cwd)
+        || normalizeString(payload?.current_working_directory)
+        || normalizeString(payload?.working_directory);
+      source ||= normalizeString(payload?.source);
+      threadSource ||= normalizeString(payload?.thread_source)
+        || normalizeString(payload?.threadSource);
+      modelProvider ||= normalizeString(payload?.model_provider)
+        || normalizeString(payload?.modelProvider);
+      createdAt ||= normalizeString(payload?.timestamp) || timestamp;
+      continue;
+    }
+
+    if (entry?.type !== "event_msg") {
+      continue;
+    }
+
+    const payload = objectValue(entry.payload);
+    const eventType = normalizeString(payload?.type);
+    if (eventType !== "user_message") {
+      continue;
+    }
+
+    const message = normalizeString(payload?.message);
+    if (!message) {
+      continue;
+    }
+
+    parentThreadId ||= extractDelegationSourceThreadId(message);
+    preview ||= extractThreadSummaryPreview(message);
+  }
+
+  return {
+    threadId,
+    cwd,
+    source,
+    threadSource,
+    modelProvider,
+    parentThreadId,
+    preview,
+    createdAt: createdAt || updatedAt,
+    updatedAt: updatedAt || createdAt,
+  };
+}
+
 function parseSessionJsonlTurns(content, { threadId = "" } = {}) {
   const turns = [];
   const turnsById = new Map();
@@ -1081,6 +1170,45 @@ function normalizeHistoryToken(rawType) {
   return normalizeString(rawType).toLowerCase().replace(/[\s_-]+/g, "");
 }
 
+function extractDelegationSourceThreadId(message) {
+  const match = String(message || "").match(/<source_thread_id>\s*([^<\s]+)\s*<\/source_thread_id>/i);
+  return normalizeString(match?.[1]);
+}
+
+function extractThreadSummaryPreview(message) {
+  const raw = normalizeString(message);
+  if (!raw) {
+    return "";
+  }
+
+  const delegatedInput = extractTagContents(raw, "input");
+  const source = delegatedInput || raw;
+  const lines = source
+    .replace(/<\/?[^>]+>/g, "\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !line.startsWith("# AGENTS.md instructions"));
+  const candidate = lines.find((line) => /^task\s*:/i.test(line))
+    || lines.find((line) => !line.startsWith("@/"))
+    || "";
+  return truncateSummaryText(candidate.replace(/^task\s*:\s*/i, ""));
+}
+
+function extractTagContents(value, tagName) {
+  const escapedTagName = String(tagName || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(value || "").match(new RegExp(`<${escapedTagName}>\\s*([\\s\\S]*?)\\s*<\\/${escapedTagName}>`, "i"));
+  return normalizeString(match?.[1]);
+}
+
+function truncateSummaryText(value, maxChars = 240) {
+  const normalized = normalizeString(value).replace(/\s+/g, " ");
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
@@ -1091,6 +1219,7 @@ function normalizeString(value) {
 
 module.exports = {
   parseSessionJsonlMetadata,
+  parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
   readThreadTurnsListPageFromSessionJsonl,
 };

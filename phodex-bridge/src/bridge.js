@@ -23,6 +23,7 @@ const {
 const { createCodexTransport } = require("./codex-transport");
 const {
   createThreadRolloutActivityWatcher,
+  collectRecentRolloutFiles,
   findRecentRolloutFileForContextRead,
   resolveSessionsRoot,
 } = require("./rollout-watch");
@@ -68,6 +69,7 @@ const {
 const { createShortPairingCode, SHORT_PAIRING_CODE_LENGTH } = require("./qr");
 const {
   parseSessionJsonlMetadata,
+  parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
   readThreadTurnsListPageFromSessionJsonl,
 } = require("./session-jsonl-history");
@@ -93,6 +95,9 @@ const MODELS_WITHOUT_REASONING_SUMMARY = new Set([
   "gpt-5.3-codex-spark",
 ]);
 const RELAY_TURNS_LIST_RESULT_KEYS = ["data", "items", "turns"];
+const RELAY_THREAD_LIST_RESULT_KEYS = ["data", "items", "threads"];
+const RELAY_THREAD_LIST_JSONL_CANDIDATE_LIMIT = 40;
+const RELAY_THREAD_LIST_JSONL_MAX_ADDITIONS = 12;
 const RELAY_TURNS_LIST_PAGINATION_RESULT_KEYS = [
   "nextCursor",
   "next_cursor",
@@ -951,6 +956,8 @@ function startBridge({
         threadId: method === "thread/turns/list" || method === "thread/read" || method === "thread/resume"
           ? threadIdFromRequestParams(parsed.params)
           : "",
+        sourceKinds: method === "thread/list" ? sourceKindsFromThreadListParams(parsed.params) : [],
+        cursor: method === "thread/list" ? parsed.params?.cursor : undefined,
         createdAt: Date.now(),
       };
       if (method === "thread/turns/list") {
@@ -1825,6 +1832,16 @@ function threadIdFromRequestParams(params) {
     || "";
 }
 
+function sourceKindsFromThreadListParams(params) {
+  if (!params || typeof params !== "object" || !Array.isArray(params.sourceKinds)) {
+    return [];
+  }
+
+  return params.sourceKinds
+    .map(normalizeNonEmptyString)
+    .filter(Boolean);
+}
+
 function buildThreadTurnsListRelaySanitizeContext(request, {
   skipJsonlArtifactAugmentation = false,
 } = {}) {
@@ -2401,6 +2418,10 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod, requestC
     return sanitizeThreadTurnsListForRelay(rawMessage, requestContext);
   }
 
+  if (requestMethod === "thread/list") {
+    return sanitizeThreadListForRelay(rawMessage, requestContext);
+  }
+
   if (requestMethod !== "thread/read" && requestMethod !== "thread/resume") {
     return rawMessage;
   }
@@ -2474,6 +2495,196 @@ function sanitizeThreadTurnsListForRelay(rawMessage, requestContext = {}) {
     : parsed;
 
   return trimTurnsListPayloadForRelay(sanitizedParsed, turnsKey, didChange ? null : rawMessage);
+}
+
+function sanitizeThreadListForRelay(rawMessage, requestContext = {}) {
+  if (hasRelayCursor(requestContext?.cursor)) {
+    return rawMessage;
+  }
+
+  const parsed = parseBridgeJSON(rawMessage);
+  const result = parsed?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return rawMessage;
+  }
+
+  const threadsKey = RELAY_THREAD_LIST_RESULT_KEYS.find((key) => Array.isArray(result[key]));
+  if (!threadsKey) {
+    return rawMessage;
+  }
+
+  const { threads, didAugment } = augmentRelayThreadListWithJsonlThreads(result[threadsKey], requestContext);
+  if (!didAugment) {
+    return rawMessage;
+  }
+
+  return JSON.stringify({
+    ...parsed,
+    result: {
+      ...result,
+      [threadsKey]: threads,
+      remodexJsonlThreadListAugmented: true,
+    },
+  });
+}
+
+function augmentRelayThreadListWithJsonlThreads(threads, requestContext = {}) {
+  if (!Array.isArray(threads)) {
+    return { threads, didAugment: false };
+  }
+
+  const existingThreadIds = new Set(
+    threads
+      .map(threadListThreadId)
+      .filter(Boolean)
+  );
+  const additions = readRecentJsonlThreadListItems({
+    existingThreadIds,
+    sourceKinds: requestContext?.sourceKinds,
+  });
+  if (additions.length === 0) {
+    return { threads, didAugment: false };
+  }
+
+  return {
+    threads: [...additions, ...threads].sort(compareThreadListItemsByRecentActivity),
+    didAugment: true,
+  };
+}
+
+function readRecentJsonlThreadListItems({
+  existingThreadIds = new Set(),
+  sourceKinds = [],
+} = {}) {
+  let candidates = [];
+  try {
+    candidates = collectRecentRolloutFiles(resolveSessionsRoot(), {
+      candidateLimit: RELAY_THREAD_LIST_JSONL_CANDIDATE_LIMIT,
+    });
+  } catch {
+    return [];
+  }
+
+  const additionsById = new Map();
+  for (const candidate of candidates) {
+    if (additionsById.size >= RELAY_THREAD_LIST_JSONL_MAX_ADDITIONS) {
+      break;
+    }
+
+    let summary;
+    try {
+      summary = parseSessionJsonlThreadSummary(fs.readFileSync(candidate.filePath, "utf8"), {
+        fallbackUpdatedAt: new Date(candidate.mtimeMs).toISOString(),
+      });
+    } catch {
+      continue;
+    }
+
+    const threadId = normalizeNonEmptyString(summary?.threadId);
+    const cwd = normalizeNonEmptyString(summary?.cwd);
+    if (!threadId || !cwd || !path.isAbsolute(cwd) || existingThreadIds.has(threadId)) {
+      continue;
+    }
+    if (!threadListSummaryMatchesSourceKinds(summary, sourceKinds)) {
+      continue;
+    }
+
+    additionsById.set(threadId, buildJsonlThreadListItem(summary));
+  }
+
+  return Array.from(additionsById.values());
+}
+
+function buildJsonlThreadListItem(summary) {
+  const threadId = normalizeNonEmptyString(summary.threadId);
+  const cwd = normalizeNonEmptyString(summary.cwd);
+  const source = normalizeNonEmptyString(summary.source) || "unknown";
+  const threadSource = normalizeNonEmptyString(summary.threadSource);
+  const createdAt = normalizeNonEmptyString(summary.createdAt) || normalizeNonEmptyString(summary.updatedAt);
+  const updatedAt = normalizeNonEmptyString(summary.updatedAt) || createdAt;
+  const preview = normalizeNonEmptyString(summary.preview);
+  const parentThreadId = normalizeNonEmptyString(summary.parentThreadId);
+  const modelProvider = normalizeNonEmptyString(summary.modelProvider);
+  const metadata = {
+    remodexJsonlThreadListFallback: true,
+  };
+  if (threadSource) {
+    metadata.thread_source = threadSource;
+  }
+
+  return {
+    id: threadId,
+    cwd,
+    current_working_directory: cwd,
+    working_directory: cwd,
+    createdAt,
+    created_at: createdAt,
+    updatedAt,
+    updated_at: updatedAt,
+    preview: preview || undefined,
+    source,
+    thread_source: threadSource || undefined,
+    parentThreadId: parentThreadId || undefined,
+    parent_thread_id: parentThreadId || undefined,
+    modelProvider: modelProvider || undefined,
+    model_provider: modelProvider || undefined,
+    metadata,
+  };
+}
+
+function threadListSummaryMatchesSourceKinds(summary, sourceKinds) {
+  const requestedKinds = normalizeSourceKinds(sourceKinds);
+  if (requestedKinds.size === 0) {
+    return true;
+  }
+
+  const source = normalizeNonEmptyString(summary?.source).toLowerCase() || "unknown";
+  return requestedKinds.has(source) || (source === "unknown" && requestedKinds.has("unknown"));
+}
+
+function normalizeSourceKinds(sourceKinds) {
+  if (!Array.isArray(sourceKinds)) {
+    return new Set();
+  }
+
+  return new Set(
+    sourceKinds
+      .map((value) => normalizeNonEmptyString(value).toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function threadListThreadId(thread) {
+  return normalizeNonEmptyString(thread?.id)
+    || normalizeNonEmptyString(thread?.threadId)
+    || normalizeNonEmptyString(thread?.thread_id);
+}
+
+function compareThreadListItemsByRecentActivity(lhs, rhs) {
+  const lhsTime = threadListItemTimestamp(lhs);
+  const rhsTime = threadListItemTimestamp(rhs);
+  if (lhsTime !== rhsTime) {
+    return rhsTime - lhsTime;
+  }
+
+  return threadListThreadId(lhs).localeCompare(threadListThreadId(rhs));
+}
+
+function threadListItemTimestamp(thread) {
+  const value = thread?.updatedAt
+    ?? thread?.updated_at
+    ?? thread?.lastActivityAt
+    ?? thread?.last_activity_at
+    ?? thread?.createdAt
+    ?? thread?.created_at;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 10_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
 }
 
 function augmentRelayThreadWithJsonlMetadata(thread, threadId = "") {

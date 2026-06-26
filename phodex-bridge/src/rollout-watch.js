@@ -830,6 +830,7 @@ function isRetryableFilesystemError(error) {
 module.exports = {
   watchThreadRollout,
   createThreadRolloutActivityWatcher,
+  collectRecentRolloutFiles,
   contextUsageFromTokenCountPayload,
   readLatestContextWindowUsage,
   resolveSessionsRoot,
