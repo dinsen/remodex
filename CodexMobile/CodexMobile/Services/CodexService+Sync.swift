@@ -255,6 +255,7 @@ extension CodexService {
             }
         }
 
+        let previousSnapshotOnlyPinnedThreadIDs = snapshotOnlyPinnedThreadIDs
         snapshotOnlyPinnedIDs.formUnion(injectPinnedSnapshotThreads(
             into: &merged,
             deletedThreadIDs: persistedDeletedIDs
@@ -268,11 +269,22 @@ extension CodexService {
             merged[threadID] = thread
         }
 
-        threads = sortThreads(Array(merged.values))
-        assistantRevertStateCacheByThread.removeAll()
+        let previousThreads = threads
+        let sortedThreads = sortThreads(Array(merged.values))
+        let timelineAffectedThreadIDs = timelineAffectedByThreadMetadataChange(
+            previous: previousThreads,
+            next: sortedThreads
+        )
+        if sortedThreads != previousThreads || snapshotOnlyPinnedThreadIDs != previousSnapshotOnlyPinnedThreadIDs {
+            threads = sortedThreads
+        }
+        for threadId in timelineAffectedThreadIDs {
+            assistantRevertStateCacheByThread.removeValue(forKey: threadId)
+        }
         refreshBusyRepoRootsAndDependentTimelineStates()
-        // Full reconciliation — always refresh all threads even if busy-roots already hit some.
-        refreshAllThreadTimelineStates()
+        for threadId in timelineAffectedThreadIDs where threadTimelineStateByThread[threadId] != nil {
+            refreshThreadTimelineState(for: threadId)
+        }
 
         if activeThreadId == nil {
             activeThreadId = firstLiveThreadID()
@@ -285,6 +297,27 @@ extension CodexService {
                 _ = await self?.routePendingNotificationOpenIfPossible(refreshIfNeeded: false)
             }
         }
+    }
+
+    private func timelineAffectedByThreadMetadataChange(
+        previous: [CodexThread],
+        next: [CodexThread]
+    ) -> Set<String> {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        var affectedThreadIDs: Set<String> = []
+
+        for thread in next {
+            guard let previousThread = previousByID[thread.id] else {
+                continue
+            }
+
+            if previousThread.gitWorkingDirectory != thread.gitWorkingDirectory
+                || previousThread.syncState != thread.syncState {
+                affectedThreadIDs.insert(thread.id)
+            }
+        }
+
+        return affectedThreadIDs
     }
 
     func handleMissingThread(_ threadId: String) {

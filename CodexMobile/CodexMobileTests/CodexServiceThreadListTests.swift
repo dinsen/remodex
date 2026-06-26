@@ -294,6 +294,66 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.pinnedThreadSnapshotsByRootID["pinned-thread"]?.first?.displayTitle, "Renamed locally")
     }
 
+    func testMetadataOnlyThreadListReconcileDoesNotRefreshExistingTimelineState() {
+        let service = makeService()
+        let threadID = "thread-stable"
+        let oldUpdatedAt = Date(timeIntervalSince1970: 10)
+        let newUpdatedAt = Date(timeIntervalSince1970: 20)
+        let timelineState = ThreadTimelineState(threadID: threadID)
+        timelineState.messageRevision = 999
+
+        service.threads = [
+            CodexThread(
+                id: threadID,
+                title: "Stable thread",
+                updatedAt: oldUpdatedAt,
+                cwd: "/tmp/repo"
+            ),
+        ]
+        service.messageRevisionByThread[threadID] = 7
+        service.threadTimelineStateByThread[threadID] = timelineState
+
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(
+                id: threadID,
+                title: "Stable thread",
+                updatedAt: newUpdatedAt,
+                cwd: "/tmp/repo"
+            ),
+        ])
+
+        XCTAssertEqual(service.thread(for: threadID)?.updatedAt, newUpdatedAt)
+        XCTAssertEqual(timelineState.messageRevision, 999)
+    }
+
+    func testThreadListReconcileRefreshesTimelineStateWhenWorkingDirectoryChanges() {
+        let service = makeService()
+        let threadID = "thread-cwd-changed"
+        let timelineState = ThreadTimelineState(threadID: threadID)
+        timelineState.messageRevision = 999
+
+        service.threads = [
+            CodexThread(
+                id: threadID,
+                title: "Cwd thread",
+                cwd: "/tmp/old-repo"
+            ),
+        ]
+        service.messageRevisionByThread[threadID] = 7
+        service.threadTimelineStateByThread[threadID] = timelineState
+
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(
+                id: threadID,
+                title: "Cwd thread",
+                cwd: "/tmp/new-repo"
+            ),
+        ])
+
+        XCTAssertEqual(service.thread(for: threadID)?.gitWorkingDirectory, "/tmp/new-repo")
+        XCTAssertEqual(timelineState.messageRevision, 7)
+    }
+
     private func makeService() -> CodexService {
         let suiteName = "CodexServiceThreadListTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard
