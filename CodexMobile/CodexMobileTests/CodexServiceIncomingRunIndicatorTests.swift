@@ -22,6 +22,156 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(service.threadRunBadgeState(for: threadID), .running)
     }
 
+    func testDesktopMirroredUserMessageItemStartedAppendsImmediately() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string("\(turnID):input"),
+                    "type": .string("userMessage"),
+                    "content": .array([
+                        .object([
+                            "type": .string("text"),
+                            "text": .string("ciao, come stai?"),
+                        ]),
+                    ]),
+                ]),
+            ])
+        )
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .user)
+        XCTAssertEqual(messages.first?.text, "ciao, come stai?")
+        XCTAssertEqual(messages.first?.turnId, turnID)
+        XCTAssertEqual(messages.first?.deliveryState, .confirmed)
+    }
+
+    // Non-active Desktop turns are mirrored through item/completed only, so the
+    // prompt must upsert from that path too instead of waiting for history sync.
+    func testDesktopMirroredUserMessageItemCompletedAppendsImmediately() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string("\(turnID):input"),
+                    "type": .string("userMessage"),
+                    "content": .array([
+                        .object([
+                            "type": .string("text"),
+                            "text": .string("fix the login bug"),
+                        ]),
+                    ]),
+                ]),
+            ])
+        )
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .user)
+        XCTAssertEqual(messages.first?.text, "fix the login bug")
+        XCTAssertEqual(messages.first?.turnId, turnID)
+        XCTAssertEqual(messages.first?.deliveryState, .confirmed)
+    }
+
+    func testDesktopMirroredUserMessageCompletedDedupsAgainstStartedRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemParams: JSONValue = .object([
+            "threadId": .string(threadID),
+            "turnId": .string(turnID),
+            "remodexDesktopMirror": .bool(true),
+            "item": .object([
+                "id": .string("\(turnID):input"),
+                "type": .string("userMessage"),
+                "content": .array([
+                    .object([
+                        "type": .string("text"),
+                        "text": .string("stessa richiesta"),
+                    ]),
+                ]),
+            ]),
+        ])
+
+        service.handleNotification(method: "item/started", params: itemParams)
+        service.handleNotification(method: "item/completed", params: itemParams)
+
+        let userRows = service.messages(for: threadID).filter { $0.role == .user }
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows.first?.text, "stessa richiesta")
+    }
+
+    // A mirrored item/completed proves finished work: an idle Desktop thread
+    // mirroring its prompt this way must not light up the running indicator.
+    func testDesktopMirroredItemCompletedAloneDoesNotMarkThreadRunning() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string("\(turnID):input"),
+                    "type": .string("userMessage"),
+                    "content": .array([
+                        .object([
+                            "type": .string("text"),
+                            "text": .string("vecchio prompt idle"),
+                        ]),
+                    ]),
+                ]),
+            ])
+        )
+
+        XCTAssertFalse(service.runningThreadIDs.contains(threadID))
+        XCTAssertFalse(service.isDesktopMirroredRunning(threadID))
+        XCTAssertNil(service.activeTurnID(for: threadID))
+    }
+
+    func testTodoListItemLifecycleRendersAsPlanRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "todo-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string(itemID),
+                    "type": .string("todoList"),
+                    "text": .string("1. Audit flow\n2. Ship fix"),
+                ]),
+            ])
+        )
+
+        let planRows = service.messages(for: threadID).filter { $0.kind == .plan }
+        XCTAssertEqual(planRows.count, 1)
+        XCTAssertEqual(planRows.first?.text, "1. Audit flow\n2. Ship fix")
+    }
+
     func testAssistantDeltaCoalescingAppliesOrderedDeltasOnFlush() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -40,6 +190,29 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(messages.first?.role, .assistant)
         XCTAssertEqual(messages.first?.text, "Hello world")
         XCTAssertTrue(messages.first?.isStreaming == true)
+    }
+
+    func testReplayedAssistantDeltaAppliesAsClosedHistory() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "item-\(UUID().uuidString)"
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: itemID,
+            delta: "Historical answer",
+            isReplay: true
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .assistant)
+        XCTAssertEqual(messages.first?.text, "Historical answer")
+        XCTAssertFalse(messages.first?.isStreaming ?? true)
+        XCTAssertNil(service.threadRunBadgeState(for: threadID))
     }
 
     func testAssistantDeltaCoalescingMergesCumulativeSnapshotsBeforeFlush() {
@@ -91,6 +264,33 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(messages.first?.kind, .thinking)
         XCTAssertEqual(messages.first?.text, "Looking around")
         XCTAssertTrue(messages.first?.isStreaming == true)
+    }
+
+    func testReplayedSystemDeltaAppliesAsClosedHistoryAfterFlush() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "file-change-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/fileChange/outputDelta",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "itemId": .string(itemID),
+                "delta": .string("Updated Sources/App.swift"),
+                "remodexReplayedEvent": .bool(true),
+            ])
+        )
+        service.flushAllPendingStreamingDeltas()
+
+        let messages = service.messages(for: threadID)
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.role, .system)
+        XCTAssertEqual(messages.first?.kind, .fileChange)
+        XCTAssertEqual(messages.first?.text, "Updated Sources/App.swift")
+        XCTAssertFalse(messages.first?.isStreaming ?? true)
+        XCTAssertNil(service.threadRunBadgeState(for: threadID))
     }
 
     func testNilTurnSystemDeltasFlushBeforeTurnCompletionClosesRows() {
@@ -2538,6 +2738,58 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(merged[0].text, currentText)
         XCTAssertEqual(merged[0].itemId, itemID)
         XCTAssertTrue(merged[0].isStreaming)
+    }
+
+    // The bridge's history-compaction banner turn ships without a status on
+    // older bridges; treating it as interruptible flagged idle heavy threads
+    // as running ("Remodex is thinking") right after a trimmed thread/read.
+    func testTurnStateSnapshotIgnoresHistoryCompactionMarkerTurn() {
+        let service = makeService()
+        let turnObjects: [RPCObject] = [
+            [
+                "id": .string("remodex-history-compacted-turn-1"),
+                "remodexSynthetic": .bool(true),
+                "remodexHistoryCompacted": .bool(true),
+            ],
+            [
+                "id": .string("turn-30"),
+                "status": .string("completed"),
+            ],
+            [
+                "id": .string("turn-31"),
+                "status": .string("completed"),
+            ],
+        ]
+
+        let snapshot = service.turnStateSnapshot(from: turnObjects, newestFirst: false)
+
+        XCTAssertNil(snapshot.interruptibleTurnID)
+        XCTAssertFalse(snapshot.hasInterruptibleTurnWithoutID)
+        XCTAssertEqual(snapshot.latestTurnID, "turn-31")
+    }
+
+    // A genuinely running turn after the marker must still be detected.
+    func testTurnStateSnapshotStillDetectsRunningTurnPastCompactionMarker() {
+        let service = makeService()
+        let turnObjects: [RPCObject] = [
+            [
+                "id": .string("remodex-history-compacted-turn-1"),
+                "remodexSynthetic": .bool(true),
+            ],
+            [
+                "id": .string("turn-30"),
+                "status": .string("completed"),
+            ],
+            [
+                "id": .string("turn-31"),
+                "status": .string("inProgress"),
+            ],
+        ]
+
+        let snapshot = service.turnStateSnapshot(from: turnObjects, newestFirst: false)
+
+        XCTAssertEqual(snapshot.interruptibleTurnID, "turn-31")
+        XCTAssertEqual(snapshot.latestTurnID, "turn-31")
     }
 
     private func sendTurnStarted(service: CodexService, threadID: String, turnID: String) {

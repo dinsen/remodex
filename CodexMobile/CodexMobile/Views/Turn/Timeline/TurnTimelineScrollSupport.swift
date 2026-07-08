@@ -25,6 +25,9 @@ struct ScrollBottomGeometry: Equatable {
             isAtBottom = geometry.visibleRect.maxY
                 >= contentHeight - TurnScrollStateTracker.bottomThreshold
         }
+        // Whole-point heights: sub-point layout jitter otherwise produces several
+        // distinct values per frame, tripping SwiftUI's multiple-updates-per-frame
+        // runtime issue. Consumers compare with thresholds >= 2pt, so rounding is safe.
         return ScrollBottomGeometry(
             isAtBottom: isAtBottom,
             viewportHeight: viewportHeight,

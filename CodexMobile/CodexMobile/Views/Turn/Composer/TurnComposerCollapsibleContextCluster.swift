@@ -1,8 +1,12 @@
 // FILE: TurnComposerCollapsibleContextCluster.swift
-// Purpose: Collapsible Local + branch picker row above the composer. Starts as a
-//          single chevron circle and expands into the existing runtime/git pills.
+// Purpose: Collapsible Local + branch picker above the composer. The chevron
+//          toggle lives inside the accessory carousel; the expanded pills
+//          render as TurnComposerContextClusterFloatingColumn, overlaid by the
+//          secondary bar OUTSIDE the carousel's UIScrollView so they stay
+//          tappable while floating over the timeline (UIScrollView never
+//          delivers touches outside its own bounds, even with clipping off).
 // Layer: View Component
-// Exports: TurnComposerCollapsibleContextCluster
+// Exports: TurnComposerCollapsibleContextCluster, TurnComposerContextClusterFloatingColumn
 // Depends on: SwiftUI, UIKit, TurnGitBranchSelector, ComposerPillLabel,
 //             UIKitMenuButton, CodexWorktreeIcon, RemodexIcon, AdaptiveGlassModifier
 
@@ -10,88 +14,13 @@ import SwiftUI
 import UIKit
 
 struct TurnComposerCollapsibleContextCluster: View {
-    let isEmptyThread: Bool
-    let hasWorkingDirectory: Bool
-    let isWorktreeProject: Bool
+    @Binding var isExpanded: Bool
 
-    let showsGitBranchSelector: Bool
-    let isGitBranchSelectorEnabled: Bool
-    let availableGitBranchTargets: [String]
-    let gitBranchesCheckedOutElsewhere: Set<String>
-    let gitWorktreePathsByBranch: [String: String]
-    let selectedGitBaseBranch: String
-    let currentGitBranch: String
-    let gitDefaultBranch: String
-    let isLoadingGitBranchTargets: Bool
-    let isSwitchingGitBranch: Bool
-    let isCreatingGitWorktree: Bool
-
-    let onSelectGitBranch: (String) -> Void
-    let onCreateGitBranch: (String) -> Void
-    let onSelectGitBaseBranch: (String) -> Void
-    let onRefreshGitBranches: () -> Void
-    let canHandOffToWorktree: Bool
-    let onTapCreateWorktree: () -> Void
-
-    @State private var isExpanded = false
-
-    private let branchLabelColor = Color(.secondaryLabel)
-    private var branchTextFont: Font { AppFont.subheadline() }
-    private let toggleControlSize: CGFloat = 34
+    static let toggleControlSize: CGFloat = 34
+    static let columnSpacing: CGFloat = 10
     private let toggleChevronSize: CGFloat = 14
 
-    private var runtimeLabelTitle: String {
-        if !hasWorkingDirectory {
-            return "Quick Chat"
-        }
-        return isWorktreeProject ? "Worktree" : "Local"
-    }
-
-    private var runtimeIconSystemName: String {
-        if !hasWorkingDirectory {
-            return "bubble.left.and.bubble.right"
-        }
-        return isWorktreeProject ? "arrow.triangle.branch" : "laptopcomputer"
-    }
-
     var body: some View {
-        HStack(spacing: 8) {
-            expandToggleButton
-
-            if isExpanded {
-                expandedPillsRow
-                    .transition(.contextClusterReveal)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var expandedPillsRow: some View {
-        HStack(spacing: 8) {
-            runtimePickerMenu
-
-            if showsGitBranchSelector {
-                TurnGitBranchSelector(
-                    isEnabled: isGitBranchSelectorEnabled,
-                    availableGitBranchTargets: availableGitBranchTargets,
-                    gitBranchesCheckedOutElsewhere: gitBranchesCheckedOutElsewhere,
-                    gitWorktreePathsByBranch: gitWorktreePathsByBranch,
-                    selectedGitBaseBranch: selectedGitBaseBranch,
-                    currentGitBranch: currentGitBranch,
-                    defaultBranch: gitDefaultBranch,
-                    isLoadingGitBranchTargets: isLoadingGitBranchTargets,
-                    isSwitchingGitBranch: isSwitchingGitBranch,
-                    onSelectGitBranch: onSelectGitBranch,
-                    onCreateGitBranch: onCreateGitBranch,
-                    onSelectGitBaseBranch: onSelectGitBaseBranch,
-                    onRefreshGitBranches: onRefreshGitBranches
-                )
-                .equatable()
-            }
-        }
-    }
-
-    private var expandToggleButton: some View {
         Button {
             HapticFeedback.shared.triggerImpactFeedback(style: .light)
             // Use a tighter, fully damped spring on collapse so the pills
@@ -106,16 +35,80 @@ struct TurnComposerCollapsibleContextCluster: View {
                 isExpanded.toggle()
             }
         } label: {
+            // Quarter-turn from right (collapsed) to up (expanded) so the glyph
+            // sweeps in the same direction the pills travel as they rise out of
+            // the chevron.
             RemodexIcon.image(systemName: "chevron.right", size: toggleChevronSize)
-                .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                .frame(width: toggleControlSize, height: toggleControlSize)
+                .rotationEffect(.degrees(isExpanded ? -90 : 0))
+                .frame(width: Self.toggleControlSize, height: Self.toggleControlSize)
                 .adaptiveGlass(.regular, isInteractive: true, in: Circle())
-                .foregroundStyle(branchLabelColor)
+                .foregroundStyle(Color(.secondaryLabel))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(isExpanded ? "Collapse project controls" : "Expand project controls")
         .accessibilityHint(isExpanded ? "Hides the local and branch pickers" : "Shows the local and branch pickers")
+    }
+}
+
+// The floating pills column. Hosted by TurnComposerSecondaryBar as an overlay
+// anchored to the bar's bottom-leading corner (where the chevron sits) and
+// lifted clear of the chevron so its collapse tap target stays unobstructed.
+// It never participates in the composer's vertical flow, so the composer (and
+// the chat scroll height) stays fixed while the pickers are open.
+struct TurnComposerContextClusterFloatingColumn: View {
+    let isEmptyThread: Bool
+    let hasWorkingDirectory: Bool
+    let isWorktreeProject: Bool
+
+    let gitState: TurnComposerGitState
+    let gitActions: TurnComposerGitActions
+
+    private let branchLabelColor = Color(.secondaryLabel)
+    private var branchTextFont: Font { AppFont.subheadline() }
+
+    private var runtimeLabelTitle: String {
+        if !hasWorkingDirectory {
+            return "Quick Chat"
+        }
+        return isWorktreeProject ? "Worktree" : "Local"
+    }
+
+    private var runtimeIconSystemName: String {
+        if !hasWorkingDirectory {
+            return "bubble.left.and.bubble.right"
+        }
+        return isWorktreeProject ? "remodex.worktree" : "laptopcomputer"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: TurnComposerCollapsibleContextCluster.columnSpacing) {
+            if gitState.showsGitBranchSelector {
+                TurnGitBranchSelector(
+                    isEnabled: gitState.isGitBranchSelectorEnabled,
+                    availableGitBranchTargets: gitState.availableGitBranchTargets,
+                    gitBranchesCheckedOutElsewhere: gitState.gitBranchesCheckedOutElsewhere,
+                    gitWorktreePathsByBranch: gitState.gitWorktreePathsByBranch,
+                    selectedGitBaseBranch: gitState.selectedGitBaseBranch,
+                    currentGitBranch: gitState.currentGitBranch,
+                    defaultBranch: gitState.gitDefaultBranch,
+                    isLoadingGitBranchTargets: gitState.isLoadingGitBranchTargets,
+                    isSwitchingGitBranch: gitState.isSwitchingGitBranch,
+                    onSelectGitBranch: gitActions.onSelectGitBranch,
+                    onCreateGitBranch: gitActions.onCreateGitBranch,
+                    onSelectGitBaseBranch: gitActions.onSelectGitBaseBranch,
+                    onRefreshGitBranches: gitActions.onRefreshGitBranches
+                )
+                .equatable()
+            }
+
+            runtimePickerMenu
+        }
+        .fixedSize()
+        // Lift the column entirely clear of the chevron so its tap target
+        // (collapse) stays unobstructed.
+        .offset(y: -(TurnComposerCollapsibleContextCluster.toggleControlSize
+            + TurnComposerCollapsibleContextCluster.columnSpacing))
     }
 
     // Routed through `UIKitMenuButton` so the menu's UIKit presentation
@@ -142,18 +135,20 @@ struct TurnComposerCollapsibleContextCluster: View {
 
     private func buildRuntimeMenu() -> UIMenu {
         let worktreeTitle: String = {
-            if isCreatingGitWorktree { return "Preparing worktree..." }
+            if gitState.isCreatingGitWorktree { return "Preparing worktree..." }
             if isWorktreeProject { return "Hand off to Local" }
             return isEmptyThread ? "New worktree" : "Hand off to Worktree"
         }()
-        let worktreeDisabled = !canHandOffToWorktree || isCreatingGitWorktree || isSwitchingGitBranch
+        let worktreeDisabled = !gitState.canHandOffToWorktree
+            || gitState.isCreatingGitWorktree
+            || gitState.isSwitchingGitBranch
         let worktreeAction = UIAction(
             title: worktreeTitle,
             image: CodexWorktreeIcon.menuImage(pointSize: 16, weight: .regular),
             attributes: worktreeDisabled ? .disabled : []
         ) { _ in
             HapticFeedback.shared.triggerImpactFeedback(style: .light)
-            onTapCreateWorktree()
+            gitActions.onTapCreateWorktree()
         }
 
         // Returning to Local is intentionally disabled until it can move code + branch safely.
@@ -176,44 +171,37 @@ struct TurnComposerCollapsibleContextCluster: View {
     }
 }
 
-// Scale-from-leading + opacity is applied symmetrically so the pills row
-// shrinks back into the chevron as a single unit when collapsing. An
-// opacity-only removal looked clean for the row itself but let the inner
-// HStack squeeze its two pills together while the parent reflowed, so the
-// runtime and branch chips visibly overlapped mid-animation. Scaling the
-// whole row uniformly keeps the chips' relative geometry intact while they
-// collapse toward the chevron's edge. A small non-zero target scale (0.01)
-// avoids the degenerate scale=0 frame that previously made the spring's
-// midpoint look like the row was sliding across the composer.
-private extension AnyTransition {
+// Scale-from-bottom-leading + opacity is applied symmetrically so the pill
+// column grows up out of the chevron on expand and shrinks back down into it
+// on collapse, as a single unit. Anchoring at `.bottomLeading` keeps the
+// origin at the chevron's near corner so the column appears to emerge from the
+// button rather than slide in from elsewhere. A small non-zero target scale
+// (0.01) avoids the degenerate scale=0 frame that makes the spring's midpoint
+// look like the column is drifting across the composer.
+// Internal (not private): TurnComposerSecondaryBar applies it at the overlay
+// insertion point.
+extension AnyTransition {
     static var contextClusterReveal: AnyTransition {
-        .scale(scale: 0.01, anchor: .leading).combined(with: .opacity)
+        .scale(scale: 0.01, anchor: .bottomLeading).combined(with: .opacity)
     }
 }
 
 #if DEBUG
-#Preview("Collapsed") {
-    TurnComposerCollapsibleContextCluster(
+#Preview("Column") {
+    TurnComposerContextClusterFloatingColumn(
         isEmptyThread: true,
         hasWorkingDirectory: true,
         isWorktreeProject: false,
-        showsGitBranchSelector: true,
-        isGitBranchSelectorEnabled: true,
-        availableGitBranchTargets: ["main", "feature/ui"],
-        gitBranchesCheckedOutElsewhere: [],
-        gitWorktreePathsByBranch: [:],
-        selectedGitBaseBranch: "main",
-        currentGitBranch: "main",
-        gitDefaultBranch: "main",
-        isLoadingGitBranchTargets: false,
-        isSwitchingGitBranch: false,
-        isCreatingGitWorktree: false,
-        onSelectGitBranch: { _ in },
-        onCreateGitBranch: { _ in },
-        onSelectGitBaseBranch: { _ in },
-        onRefreshGitBranches: {},
-        canHandOffToWorktree: true,
-        onTapCreateWorktree: {}
+        gitState: TurnComposerGitState(
+            showsGitBranchSelector: true,
+            isGitBranchSelectorEnabled: true,
+            availableGitBranchTargets: ["main", "feature/ui"],
+            selectedGitBaseBranch: "main",
+            currentGitBranch: "main",
+            gitDefaultBranch: "main",
+            canHandOffToWorktree: true
+        ),
+        gitActions: TurnComposerGitActions()
     )
     .padding()
 }

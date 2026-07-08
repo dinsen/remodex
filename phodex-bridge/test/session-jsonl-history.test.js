@@ -182,6 +182,222 @@ test("readThreadTurnsListPageFromSessionJsonl builds a recent turns page from ro
   );
 });
 
+test("parseSessionJsonlTurns keeps the active turn when a parallel sibling turn completes", () => {
+  // Regression: a sibling task_complete used to clear activeTurnId, so later
+  // turn-less items spawned synthetic running "turn-line-N" turns that pinned
+  // the reopened thread as active on the phone.
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:39.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-newest" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:42:13.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: "turn-older-sibling" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:43:00.000Z",
+      type: "response_item",
+      payload: {
+        id: "assistant-final",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "still the newest turn" }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:21:55.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: "turn-newest" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-parallel" });
+
+  const syntheticRunningTurns = turns.filter((turn) => (
+    turn.id.startsWith("turn-line-") && turn.status === "running"
+  ));
+  assert.deepEqual(syntheticRunningTurns, []);
+
+  const newest = turns.find((turn) => turn.id === "turn-newest");
+  assert.ok(newest);
+  assert.equal(newest.status, "completed");
+  assert.equal(
+    newest.items.some((item) => item.content?.[0]?.text === "still the newest turn"),
+    true
+  );
+});
+
+test("parseSessionJsonlTurns closes a synthetic active turn when terminal is the only real id", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:39.000Z",
+      type: "event_msg",
+      payload: { type: "task_started" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:40.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", message: "turnless start" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:41.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: "turn-real-terminal" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-synthetic-terminal" });
+  const syntheticTurn = turns.find((turn) => turn.id.startsWith("turn-line-"));
+
+  assert.ok(syntheticTurn);
+  assert.equal(syntheticTurn.status, "completed");
+});
+
+test("parseSessionJsonlTurns preserves abort status when closing synthetic terminal turns", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:39.000Z",
+      type: "event_msg",
+      payload: { type: "task_started" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:40.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", message: "turnless start" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:41.000Z",
+      type: "event_msg",
+      payload: { type: "turn_aborted", turn_id: "turn-real-terminal" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-synthetic-abort" });
+  const syntheticTurn = turns.find((turn) => turn.id.startsWith("turn-line-"));
+
+  assert.ok(syntheticTurn);
+  assert.equal(syntheticTurn.status, "aborted");
+});
+
+test("parseSessionJsonlTurns preserves failed status when closing synthetic terminal turns", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:39.000Z",
+      type: "event_msg",
+      payload: { type: "task_started" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:40.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", message: "turnless start" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-04T23:26:41.000Z",
+      type: "event_msg",
+      payload: { type: "error", turn_id: "turn-real-terminal", message: "boom" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-synthetic-error" });
+  const syntheticTurn = turns.find((turn) => turn.id.startsWith("turn-line-"));
+
+  assert.ok(syntheticTurn);
+  assert.equal(syntheticTurn.status, "failed");
+});
+
+test("parseSessionJsonlTurns marks aborted and failed runs with terminal statuses", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-05T01:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-aborted" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:00:01.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", turn_id: "turn-aborted", message: "do the thing" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:00:02.000Z",
+      type: "event_msg",
+      payload: { type: "turn_aborted", turn_id: "turn-aborted" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:01:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-failed" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:01:01.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", turn_id: "turn-failed", message: "try again" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T01:01:02.000Z",
+      type: "event_msg",
+      payload: { type: "error", turn_id: "turn-failed", message: "boom" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-terminal-history" });
+
+  const aborted = turns.find((turn) => turn.id === "turn-aborted");
+  assert.ok(aborted);
+  assert.equal(aborted.status, "aborted");
+
+  const failed = turns.find((turn) => turn.id === "turn-failed");
+  assert.ok(failed);
+  assert.equal(failed.status, "failed");
+});
+
+test("parseSessionJsonlTurns sibling turn_aborted does not orphan the running turn", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-05T02:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-still-running" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T02:00:01.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", turn_id: "turn-still-running", message: "keep going" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T02:00:02.000Z",
+      type: "event_msg",
+      payload: { type: "turn_aborted", turn_id: "turn-parallel-sibling" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T02:00:03.000Z",
+      type: "response_item",
+      payload: {
+        id: "assistant-live",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "still attached to the running turn" }],
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-sibling-abort" });
+
+  const syntheticRunningTurns = turns.filter((turn) => (
+    turn.id.startsWith("turn-line-") && turn.status === "running"
+  ));
+  assert.deepEqual(syntheticRunningTurns, []);
+
+  const running = turns.find((turn) => turn.id === "turn-still-running");
+  assert.ok(running);
+  assert.equal(running.status, "running");
+  assert.equal(
+    running.items.some((item) => item.content?.[0]?.text === "still attached to the running turn"),
+    true
+  );
+});
+
 test("parseSessionJsonlTurns attaches pre-task user messages to following task", () => {
   const content = [
     JSON.stringify({
@@ -322,6 +538,116 @@ test("parseSessionJsonlTurns deduplicates raw skill text against structured skil
   assert.equal(userItems[0].content[0].text, "one last time");
   assert.deepEqual(userItems[0].content[1], { type: "skill", id: "check-code", name: "check-code" });
   assert.equal(userItems[0].createdAt, "2026-05-24T21:52:51.133Z");
+});
+
+test("parseSessionJsonlTurns drops expanded skill context user items", () => {
+  const expandedSkillContext = [
+    "<skill>",
+    "<name>check-code</name>",
+    "<path>$check-code</path>",
+    "---",
+    "name: check-code",
+    "description: Review recent code changes across a repository.",
+    "</skill>",
+  ].join("\n");
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-05-24T21:53:47.000Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-jsonl-expanded-skill",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-24T21:53:51.100Z",
+      type: "event_msg",
+      payload: {
+        type: "task_started",
+        turn_id: "turn-jsonl-expanded-skill",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-24T21:53:51.133Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: expandedSkillContext },
+        ],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-24T21:53:52.000Z",
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        turn_id: "turn-jsonl-expanded-skill",
+        message: expandedSkillContext,
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-05-24T21:53:53.000Z",
+      type: "response_item",
+      payload: {
+        id: "assistant-final",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-jsonl-expanded-skill" });
+  const userItems = turns.flatMap((turn) => turn.items.filter((item) => item.role === "user"));
+
+  assert.equal(userItems.length, 0);
+  assert.equal(turns[0].items.some((item) => item.role === "assistant"), true);
+});
+
+test("parseSessionJsonlTurns drops attribute-bearing internal goal context", () => {
+  const internalContext = [
+    "<codex_internal_context source=\"goal\">",
+    "Continue pursuing hidden runtime state.",
+    "</codex_internal_context>",
+  ].join("\n");
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-05T10:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "thread-jsonl-internal-context" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T10:00:01.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-jsonl-internal-context" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T10:00:02.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: internalContext }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-05T10:00:03.000Z",
+      type: "response_item",
+      payload: {
+        id: "assistant-final",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-jsonl-internal-context" });
+  const userItems = turns.flatMap((turn) => turn.items.filter((item) => item.role === "user"));
+
+  assert.equal(userItems.length, 0);
+  assert.equal(turns[0].items.some((item) => item.role === "assistant"), true);
 });
 
 test("parseSessionJsonlTurns preserves explicit timestamp aliases over entry timestamp", () => {

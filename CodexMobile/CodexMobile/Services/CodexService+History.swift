@@ -287,7 +287,7 @@ extension CodexService {
                         timeZoneIdentifier: timeZoneIdentifier
                     )
 
-                case "plan":
+                case "plan", "todolist":
                     let decodedPlanState = decodeHistoryPlanState(from: itemObject)
                     let isJsonlProgressPlan = itemObject["remodexJsonlProgressPlan"]?.boolValue == true
                     appendHistoryMessage(
@@ -773,16 +773,34 @@ extension CodexService {
 
             // Reconcile turn-scoped file change items even when the streamed row
             // has a synthetic itemId that differs from the server's real one.
+            // Turnless rows only bind inside this turn's contiguous block so
+            // repeated working-tree snapshots cannot move between turns.
             if message.role == .system,
                message.kind == .fileChange,
-               let turnId = message.turnId, !turnId.isEmpty,
-               let index = merged.lastIndex(where: { candidate in
-                   candidate.role == .system
-                       && candidate.kind == .fileChange
-                       && (candidate.turnId == nil || candidate.turnId == turnId)
-               }) {
-                merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
-                continue
+               let turnId = message.turnId, !turnId.isEmpty {
+                let turnBlockRange = Self.contiguousTurnBlockRange(in: merged, turnId: turnId)
+                if let index = merged.indices.last(where: { candidateIndex in
+                    let candidate = merged[candidateIndex]
+                    guard candidate.role == .system,
+                          candidate.kind == .fileChange else {
+                        return false
+                    }
+                    if candidate.turnId == turnId {
+                        return true
+                    }
+                    guard candidate.turnId == nil else {
+                        return false
+                    }
+                    return Self.turnlessFileChangeRowIsClaimable(
+                        in: merged,
+                        candidateIndex: candidateIndex,
+                        turnId: turnId,
+                        turnBlockRange: turnBlockRange
+                    )
+                }) {
+                    merged[index] = reconcileExistingMessage(merged[index], with: message, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningThreadIDs)
+                    continue
+                }
             }
 
             // Rebind generic tool rows when a live synthetic row gets a real history item id later.
@@ -892,6 +910,15 @@ extension CodexService {
                 // represented locally; appending them creates the visible 1:00 echo.
                 if hasFallbackHistoryTimestamp(message.createdAt),
                    !fallbackCandidates.isEmpty {
+                    continue
+                }
+
+                // Desktop-projected rows with synthetic identity that ambiguously
+                // match several real rows are already represented; appending them
+                // duplicates the prompt instead of preserving an intentional repeat.
+                if fallbackCandidates.count > 1,
+                   isSyntheticDesktopTurnIdentifier(message.turnId)
+                    || isSyntheticDesktopUserItemIdentifier(message.itemId) {
                     continue
                 }
             }
@@ -1064,9 +1091,18 @@ extension CodexService {
 
         if value.turnId == nil {
             value.turnId = serverMessage.turnId
+        } else if value.role == .user,
+                  let serverTurnId = normalizedHistoryIdentifier(serverMessage.turnId),
+                  isSyntheticDesktopTurnIdentifier(value.turnId),
+                  !isSyntheticDesktopTurnIdentifier(serverTurnId) {
+            value.turnId = serverTurnId
         }
         let localItemId = normalizedHistoryIdentifier(value.itemId)
         let serverItemId = normalizedHistoryIdentifier(serverMessage.itemId)
+        let shouldUpgradeSyntheticUserItemId = value.role == .user
+            && serverItemId != nil
+            && isSyntheticDesktopUserItemIdentifier(localItemId)
+            && !isSyntheticDesktopUserItemIdentifier(serverItemId)
         let shouldAttachMissingItemId = localItemId == nil
         let shouldRebindRunningAssistantItem = preservesRunningPresentation
             && value.role == .assistant
@@ -1075,6 +1111,7 @@ extension CodexService {
             && localItemId != serverItemId
             && !hasStableAssistantIdentity(localItemId)
         if shouldAttachMissingItemId
+            || shouldUpgradeSyntheticUserItemId
             || shouldRebindRunningAssistantItem
             || (
                 value.role == .system
@@ -1389,6 +1426,120 @@ extension CodexService {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    // Finds the contiguous timeline block owned by one turn; turnless artifact
+    // rows inside that range may be rebound without stealing adjacent turns.
+    nonisolated static func contiguousTurnBlockRange(
+        in messages: [CodexMessage],
+        turnId: String
+    ) -> Range<Int>? {
+        guard let startIndex = messages.firstIndex(where: { $0.turnId == turnId }) else {
+            return nil
+        }
+        let endIndex = messages.indices.first { index in
+            guard index > startIndex else {
+                return false
+            }
+            let message = messages[index]
+            if let candidateTurnId = message.turnId, !candidateTurnId.isEmpty {
+                return candidateTurnId != turnId
+            }
+            // A user prompt without a turn id still marks a boundary: the next
+            // turn's opener lands before turn/started tags it, and this turn's
+            // artifacts must not reach past it (a mid-turn steer closing the
+            // block early costs at most a transient duplicate, never a steal).
+            return message.role == .user
+        } ?? messages.endIndex
+        return startIndex..<endIndex
+    }
+
+    // Single rule for claiming a TURNLESS file-change row into a turn, shared
+    // by live reconciliation (Messages) and history merge: inside the turn's
+    // contiguous block the row is claimable; before the turn has any anchored
+    // row, only a lone bootstrap row above any user boundary may bind. A
+    // transient duplicate is the accepted failure mode — stealing an adjacent
+    // turn's table is not.
+    nonisolated static func turnlessFileChangeRowIsClaimable(
+        in messages: [CodexMessage],
+        candidateIndex: Int,
+        turnId: String,
+        turnBlockRange: Range<Int>?
+    ) -> Bool {
+        guard messages.indices.contains(candidateIndex) else {
+            return false
+        }
+        if let turnBlockRange {
+            return turnBlockRange.contains(candidateIndex)
+        }
+
+        // Once any turn is anchored, a lone turnless row is some finished
+        // turn's tail artifact; rebinding it to a newer turn stole tables
+        // (Desktop-driven turns mirror their user row late, so "no user row
+        // yet" proves nothing).
+        guard !messages.contains(where: {
+            Self.normalizedHistoryIdentifier($0.turnId) != nil
+        }) else {
+            return false
+        }
+
+        // A user prompt after the candidate marks a turn boundary: the row
+        // belongs to the finished turn above it, not to this one.
+        guard !messages[(candidateIndex + 1)...].contains(where: { $0.role == .user }) else {
+            return false
+        }
+
+        let candidate = messages[candidateIndex]
+        let bootstrapRows = messages.filter {
+            $0.role == .system
+                && $0.kind == .fileChange
+                && Self.normalizedHistoryIdentifier($0.turnId) == nil
+        }
+        return bootstrapRows.count == 1 && bootstrapRows[0].id == candidate.id
+    }
+
+    // Desktop-projected snapshots synthesize turn ids and prompt item ids when
+    // the raw Desktop state lacks the real identifiers (see
+    // CodexSyntheticIdentifiers). Those ids are provisional: the same prompt
+    // can also arrive under its real app-server identity, so synthetic ids
+    // must merge with the real row (and upgrade to its identity) instead of
+    // forming a second row.
+    nonisolated static func isSyntheticDesktopTurnIdentifier(_ turnId: String?) -> Bool {
+        guard let turnId = normalizedHistoryIdentifier(turnId) else {
+            return false
+        }
+        return CodexSyntheticIdentifiers.isProjectedDesktopTurnID(turnId)
+    }
+
+    nonisolated static func isSyntheticDesktopUserItemIdentifier(_ itemId: String?) -> Bool {
+        guard let itemId = normalizedHistoryIdentifier(itemId) else {
+            return false
+        }
+        return CodexSyntheticIdentifiers.isProjectedDesktopUserItemID(itemId)
+    }
+
+    // Rollout mirrors tag reasoning rows with synthetic "rollout-*" item ids
+    // and live streams may use turn-scoped placeholders; both are provisional
+    // and must merge with the real reasoning identity of the same turn.
+    nonisolated static func isProvisionalThinkingIdentifier(_ itemId: String?) -> Bool {
+        guard let itemId = normalizedHistoryIdentifier(itemId) else {
+            return true
+        }
+        return CodexSyntheticIdentifiers.isMirrorMintedItemID(itemId)
+    }
+
+    // Turn identities are mergeable when either side lacks a real turn id;
+    // two distinct real turn ids stay separate so intentionally repeated
+    // sends keep one row per turn.
+    nonisolated static func mirroredUserTurnIdentityAllowsMerge(_ lhs: String?, _ rhs: String?) -> Bool {
+        guard let lhsTurnId = normalizedHistoryIdentifier(lhs),
+              let rhsTurnId = normalizedHistoryIdentifier(rhs) else {
+            return true
+        }
+        if lhsTurnId == rhsTurnId {
+            return true
+        }
+        return isSyntheticDesktopTurnIdentifier(lhsTurnId) || isSyntheticDesktopTurnIdentifier(rhsTurnId)
+    }
+
     // Mirrors t3code's provider-message identity as closely as the mobile schema allows.
     nonisolated static func stableAssistantMessageID(threadId: String, turnId: String?, itemId: String?) -> String? {
         guard let itemId = normalizedHistoryIdentifier(itemId) else {
@@ -1402,7 +1553,7 @@ extension CodexService {
         guard let itemId = normalizedHistoryIdentifier(itemId) else {
             return false
         }
-        return !itemId.hasPrefix("turn:") && !itemId.hasPrefix("rollout-")
+        return !CodexSyntheticIdentifiers.isMirrorMintedItemID(itemId)
     }
 
     // Running assistant rows may absorb history only when the provider item identity agrees.
@@ -1502,7 +1653,7 @@ extension CodexService {
         guard let value else {
             return false
         }
-        return !(value.hasPrefix("turn:") && value.contains("|kind:\(CodexMessageKind.toolActivity.rawValue)"))
+        return !CodexSyntheticIdentifiers.isPlaceholderItemID(value, kind: .toolActivity)
     }
 
     // Treats only streaming/skeleton tool rows as safe to rebind by text alone.
@@ -1711,7 +1862,10 @@ extension CodexService {
         ) else {
             return false
         }
-        return candidateTurnId == nil || candidateTurnId == turnId
+        return candidateTurnId == nil
+            || candidateTurnId == turnId
+            || isSyntheticDesktopTurnIdentifier(candidateTurnId)
+            || isSyntheticDesktopTurnIdentifier(turnId)
     }
 
     nonisolated static func shouldReconcilePendingUserHistoryMessage(
@@ -1778,12 +1932,19 @@ extension CodexService {
         in merged: [CodexMessage],
         message: CodexMessage
     ) -> [Int] {
+        let incomingItemId = normalizedHistoryIdentifier(message.itemId)
         guard message.role == .user,
-              normalizedHistoryIdentifier(message.itemId) == nil else {
+              incomingItemId == nil || isSyntheticDesktopUserItemIdentifier(incomingItemId) else {
             return []
         }
 
-        let incomingTurnId = normalizedHistoryIdentifier(message.turnId)
+        let rawIncomingTurnId = normalizedHistoryIdentifier(message.turnId)
+        let incomingTurnIdIsSynthetic = isSyntheticDesktopTurnIdentifier(rawIncomingTurnId)
+        let incomingTurnId = incomingTurnIdIsSynthetic ? nil : rawIncomingTurnId
+        // Synthetic Desktop identity marks a projected row whose prompt the
+        // timeline may already hold under its real identity; projected snapshots
+        // also stamp thread-level fallback dates, so timestamps cannot veto.
+        let incomingHasSyntheticIdentity = incomingTurnIdIsSynthetic || incomingItemId != nil
         let incomingHasFallbackTimestamp = hasFallbackHistoryTimestamp(message.createdAt)
 
         return merged.indices.filter { index in
@@ -1800,9 +1961,13 @@ extension CodexService {
                 return false
             }
 
-            let candidateTurnId = normalizedHistoryIdentifier(candidate.turnId)
+            let rawCandidateTurnId = normalizedHistoryIdentifier(candidate.turnId)
+            let candidateTurnId = isSyntheticDesktopTurnIdentifier(rawCandidateTurnId) ? nil : rawCandidateTurnId
             if let incomingTurnId, let candidateTurnId {
                 return incomingTurnId == candidateTurnId
+            }
+            if incomingHasSyntheticIdentity {
+                return true
             }
             if incomingHasFallbackTimestamp {
                 return true

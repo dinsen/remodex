@@ -1418,7 +1418,10 @@ private extension CodexService {
     }
 
     func debugSecureLog(_ message: String) {
+        #if DEBUG
+        guard AppEnvironment.verboseDiagnosticsEnabled else { return }
         print("[CodexSecure] \(message)")
+        #endif
     }
 
     func shortSecureId(_ value: String) -> String {

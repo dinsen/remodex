@@ -684,6 +684,59 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(fileRows[0].itemId, "file-1")
     }
 
+    // The bootstrap fallback must not reach back across a user prompt: the
+    // previous turn's post-completion table is not claimable by a new turn
+    // whose first file-change event lands before any of its rows are tagged.
+    func testLiveFileChangeBootstrapFallbackDoesNotCrossUserBoundary() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let previousTurnID = "turn-\(UUID().uuidString)"
+        let newTurnID = "turn-\(UUID().uuidString)"
+        let fileChangeText = """
+        Status: completed
+
+        Path: Sources/App.swift
+        Kind: update
+        Totals: +2 -1
+        """
+
+        // Previous turn: anchored user row, then its turnless end-of-turn table.
+        service.appendUserMessage(threadId: threadID, text: "first prompt", turnId: previousTurnID)
+        service.appendSystemMessage(
+            threadId: threadID,
+            text: fileChangeText,
+            kind: .fileChange,
+            isStreaming: false
+        )
+
+        // Next turn starts: pending user row, turn/started, and the turn's
+        // first event is a file-change touching the same working-tree paths.
+        service.appendUserMessage(threadId: threadID, text: "nice")
+        service.handleNotification(
+            method: "turn/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(newTurnID),
+            ])
+        )
+        service.upsertStreamingSystemItemMessage(
+            threadId: threadID,
+            turnId: newTurnID,
+            itemId: "file-new-turn",
+            kind: .fileChange,
+            text: fileChangeText,
+            isStreaming: false
+        )
+
+        let fileRows = service.messages(for: threadID).filter {
+            $0.role == .system && $0.kind == .fileChange
+        }
+        XCTAssertEqual(fileRows.count, 2)
+        XCTAssertNil(fileRows[0].turnId)
+        XCTAssertEqual(fileRows[1].turnId, newTurnID)
+        XCTAssertEqual(fileRows[1].itemId, "file-new-turn")
+    }
+
     func testLiveFileChangeSnapshotFallbackReusesTurnlessRowWithoutPathKeys() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -715,6 +768,71 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(fileRows.count, 1)
         XCTAssertEqual(fileRows[0].turnId, turnID)
         XCTAssertEqual(fileRows[0].itemId, "file-snapshot")
+    }
+
+    func testLiveFileChangeAppendDoesNotStealNextTurnsTurnlessTable() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let oldTurnID = "turn-\(UUID().uuidString)"
+        let newTurnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+        let fileChangeText = """
+        Status: completed
+
+        Path: package.json
+        Kind: update
+        Totals: +1 -1
+        """
+
+        service.messagesByThread[threadID] = [
+            CodexMessage(
+                id: "user-old-turn",
+                threadId: threadID,
+                role: .user,
+                text: "first change",
+                createdAt: now,
+                turnId: oldTurnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "user-new-turn",
+                threadId: threadID,
+                role: .user,
+                text: "second change",
+                createdAt: now.addingTimeInterval(10),
+                turnId: newTurnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "new-turn-table",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: fileChangeText,
+                createdAt: now.addingTimeInterval(12),
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        service.appendSystemMessage(
+            threadId: threadID,
+            text: fileChangeText,
+            turnId: oldTurnID,
+            itemId: "file-old",
+            kind: .fileChange,
+            isStreaming: false
+        )
+
+        let fileRows = service.messages(for: threadID).filter {
+            $0.role == .system && $0.kind == .fileChange
+        }
+        XCTAssertEqual(fileRows.count, 2)
+        XCTAssertNil(service.messages(for: threadID).first(where: { $0.id == "new-turn-table" })?.turnId)
+        XCTAssertTrue(fileRows.contains { $0.turnId == oldTurnID && $0.itemId == "file-old" })
     }
 
     func testTurnDiffUpdatedDoesNotCreateVisibleFileChangeRow() {
@@ -1171,6 +1289,282 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(userRows.filter { $0.deliveryState == .pending }.count, 2)
         XCTAssertEqual(userRows.filter { $0.deliveryState == .confirmed }.count, 1)
         XCTAssertEqual(userRows.last?.turnId, turnID)
+    }
+
+    func testHistoryUserMessageRebindsConfirmedIdentitylessDesktopMirror() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let now = Date()
+
+        let existing = [
+            CodexMessage(
+                id: "desktop-live-mirror",
+                threadId: threadID,
+                role: .user,
+                text: "okok",
+                createdAt: now,
+                turnId: nil,
+                itemId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "user-history",
+                threadId: threadID,
+                role: .user,
+                text: "okok",
+                createdAt: now.addingTimeInterval(0.4),
+                turnId: turnID,
+                itemId: "user-history-item",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let userRows = merged.filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].id, "desktop-live-mirror")
+        XCTAssertEqual(userRows[0].turnId, turnID)
+        XCTAssertEqual(userRows[0].itemId, "user-history-item")
+        XCTAssertEqual(userRows[0].text, "okok")
+    }
+
+    func testDesktopMirroredUserMessageEventAndItemStartedDoNotDuplicate() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "user-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "codex/event/user_message",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "message": .string("okok"),
+                "remodexDesktopMirror": .bool(true),
+            ])
+        )
+        service.handleNotification(
+            method: "item/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string(itemID),
+                    "type": .string("userMessage"),
+                    "content": .array([
+                        .object([
+                            "type": .string("text"),
+                            "text": .string("okok"),
+                        ]),
+                    ]),
+                ]),
+            ])
+        )
+
+        let userRows = service.messages(for: threadID).filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].text, "okok")
+        XCTAssertEqual(userRows[0].turnId, turnID)
+        XCTAssertEqual(userRows[0].deliveryState, .confirmed)
+    }
+
+    // Desktop snapshots without raw turn ids project the same prompt under
+    // synthetic identity ("ipc-turn-N" / "<turnId>:input"); that replay must
+    // merge into the turn-bound row instead of duplicating the bubble.
+    func testDesktopMirroredSyntheticIdentityReplayDoesNotDuplicateUserRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "codex/event/user_message",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "id": .string("\(turnID):input"),
+                "message": .string("jamm bell"),
+                "remodexDesktopMirror": .bool(true),
+            ])
+        )
+        service.handleNotification(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string("ipc-turn-3"),
+                "remodexDesktopMirror": .bool(true),
+                "item": .object([
+                    "id": .string("ipc-turn-3:input"),
+                    "type": .string("userMessage"),
+                    "content": .array([
+                        .object([
+                            "type": .string("text"),
+                            "text": .string("jamm bell"),
+                        ]),
+                    ]),
+                ]),
+            ])
+        )
+
+        let userRows = service.messages(for: threadID).filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].text, "jamm bell")
+        XCTAssertEqual(userRows[0].turnId, turnID)
+        XCTAssertEqual(userRows[0].itemId, "\(turnID):input")
+    }
+
+    // Rollout mirrors can flush the prompt without a resolved turn id; that
+    // event must merge into the already turn-bound row of the same prompt.
+    func testDesktopMirroredTurnlessUserMessageMergesIntoTurnBoundRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "codex/event/user_message",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "message": .string("okok"),
+                "remodexDesktopMirror": .bool(true),
+            ])
+        )
+        service.handleNotification(
+            method: "codex/event/user_message",
+            params: .object([
+                "threadId": .string(threadID),
+                "message": .string("okok"),
+                "remodexDesktopMirror": .bool(true),
+                "remodexRolloutLiveMirror": .bool(true),
+            ])
+        )
+
+        let userRows = service.messages(for: threadID).filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].turnId, turnID)
+    }
+
+    // Follower-served thread/read projects prompts with synthetic identity and
+    // thread-level fallback dates; history merge must bind them to the live row
+    // and keep its real identity instead of appending a second bubble.
+    func testHistoryUserMessageWithSyntheticDesktopIdentityMergesIntoRealRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+
+        let existing = [
+            CodexMessage(
+                id: "user-live-mirror",
+                threadId: threadID,
+                role: .user,
+                text: "jamm bell",
+                createdAt: now,
+                turnId: turnID,
+                itemId: "\(turnID):input",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "user-projected-history",
+                threadId: threadID,
+                role: .user,
+                text: "jamm bell",
+                createdAt: now.addingTimeInterval(-1_380),
+                turnId: "ipc-turn-0",
+                itemId: "ipc-turn-0:input",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let userRows = merged.filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].id, "user-live-mirror")
+        XCTAssertEqual(userRows[0].turnId, turnID)
+    }
+
+    // The reverse direction: a provisional synthetic row created from a projected
+    // mirror must rebind to the real app-server history identity.
+    func testHistoryUserMessageUpgradesSyntheticDesktopIdentityToRealIdentity() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+
+        let existing = [
+            CodexMessage(
+                id: "user-projected-mirror",
+                threadId: threadID,
+                role: .user,
+                text: "jamm bell",
+                createdAt: now,
+                turnId: "ipc-turn-0",
+                itemId: "ipc-turn-0:input",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "user-history",
+                threadId: threadID,
+                role: .user,
+                text: "jamm bell",
+                createdAt: now.addingTimeInterval(0.4),
+                turnId: turnID,
+                itemId: "user-history-item",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let userRows = merged.filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 1)
+        XCTAssertEqual(userRows[0].id, "user-projected-mirror")
+        XCTAssertEqual(userRows[0].turnId, turnID)
+        XCTAssertEqual(userRows[0].itemId, "user-history-item")
+    }
+
+    // Intentional repeats stay separate: two prompts with distinct real turn ids
+    // must not collapse even though the text matches.
+    func testDesktopMirroredRepeatedSendsWithDistinctRealTurnIdsStaySeparate() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let firstTurnID = "turn-\(UUID().uuidString)"
+        let secondTurnID = "turn-\(UUID().uuidString)"
+
+        for turnID in [firstTurnID, secondTurnID] {
+            service.handleNotification(
+                method: "codex/event/user_message",
+                params: .object([
+                    "threadId": .string(threadID),
+                    "turnId": .string(turnID),
+                    "message": .string("okok"),
+                    "remodexDesktopMirror": .bool(true),
+                ])
+            )
+        }
+
+        let userRows = service.messages(for: threadID).filter { $0.role == .user }
+
+        XCTAssertEqual(userRows.count, 2)
+        XCTAssertEqual(Set(userRows.compactMap(\.turnId)), [firstTurnID, secondTurnID])
     }
 
     func testHistoryUserMessageRebindsFallbackTimestampEchoToRealDatedRow() {
@@ -1743,6 +2137,305 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(thinkingRows.count, 1)
         XCTAssertEqual(thinkingRows[0].text, "First second")
         XCTAssertFalse(thinkingRows[0].isStreaming)
+    }
+
+    // The IPC follower streams reasoning under real per-item ids while the
+    // rollout mirror aggregates the same turn under one synthetic
+    // "rollout-thinking:" id. Alternating sources mid-turn must rebind to the
+    // existing row instead of stacking a second "Thinking..." row.
+    func testRolloutMirrorReasoningRebindsToIpcThinkingRowInsteadOfDuplicating() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let realItemID = "reasoning-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "turn/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+            ])
+        )
+        service.handleNotification(
+            method: "item/reasoning/textDelta",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "itemId": .string(realItemID),
+                "delta": .string("Weighing options"),
+            ])
+        )
+        service.handleNotification(
+            method: "item/reasoning/textDelta",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "itemId": .string("rollout-thinking:\(threadID):\(turnID)"),
+                "delta": .string(" and deciding"),
+                "remodexDesktopMirror": .bool(true),
+                "remodexRolloutLiveMirror": .bool(true),
+            ])
+        )
+
+        let thinkingRows = service.messages(for: threadID).filter {
+            $0.role == .system && $0.kind == .thinking
+        }
+        XCTAssertEqual(thinkingRows.count, 1)
+        XCTAssertEqual(thinkingRows[0].itemId, realItemID)
+    }
+
+    // A previous turn's post-completion file-change table has no turnId; the
+    // next turn repeating the same working-tree paths must not re-anchor it
+    // into its own block (the table visually "moved" into the new turn).
+    func testHistoryFileChangeDoesNotStealPreviousTurnsTurnlessTable() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let newTurnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+
+        let existing = [
+            CodexMessage(
+                id: "old-table",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now,
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "user-new-turn",
+                threadId: threadID,
+                role: .user,
+                text: "nice",
+                createdAt: now.addingTimeInterval(10),
+                turnId: newTurnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "new-turn-snapshot",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now.addingTimeInterval(12),
+                turnId: newTurnID,
+                itemId: "fc-new",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let fileChangeRows = merged.filter { $0.kind == .fileChange }
+
+        XCTAssertEqual(fileChangeRows.count, 2)
+        XCTAssertNil(merged.first(where: { $0.id == "old-table" })?.turnId)
+    }
+
+    // The ownership window is bounded by the next turn as well as the previous
+    // one; otherwise late history for an older turn can steal a newer table.
+    func testHistoryFileChangeDoesNotStealNextTurnsTurnlessTable() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let oldTurnID = "turn-\(UUID().uuidString)"
+        let newTurnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+
+        let existing = [
+            CodexMessage(
+                id: "user-old-turn",
+                threadId: threadID,
+                role: .user,
+                text: "first change",
+                createdAt: now,
+                turnId: oldTurnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "user-new-turn",
+                threadId: threadID,
+                role: .user,
+                text: "second change",
+                createdAt: now.addingTimeInterval(10),
+                turnId: newTurnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "new-turn-table",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now.addingTimeInterval(12),
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "old-turn-snapshot",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now.addingTimeInterval(2),
+                turnId: oldTurnID,
+                itemId: "fc-old",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let fileChangeRows = merged.filter { $0.kind == .fileChange }
+
+        XCTAssertEqual(fileChangeRows.count, 2)
+        XCTAssertNil(merged.first(where: { $0.id == "new-turn-table" })?.turnId)
+        XCTAssertNotNil(merged.first(where: { $0.id == "old-turn-snapshot" }))
+    }
+
+    // The same turn's own post-completion snapshot (turnless, positioned after
+    // the turn's rows) must keep reconciling instead of appending a duplicate.
+    func testHistoryFileChangeStillBindsSameTurnTurnlessSnapshot() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+
+        let existing = [
+            CodexMessage(
+                id: "user-turn",
+                threadId: threadID,
+                role: .user,
+                text: "bump the version",
+                createdAt: now,
+                turnId: turnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "turnless-snapshot",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now.addingTimeInterval(5),
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "turn-snapshot",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: "package.json +1 -1",
+                createdAt: now.addingTimeInterval(6),
+                turnId: turnID,
+                itemId: "fc-turn",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let fileChangeRows = merged.filter { $0.kind == .fileChange }
+
+        XCTAssertEqual(fileChangeRows.count, 1)
+        XCTAssertEqual(fileChangeRows[0].id, "turnless-snapshot")
+        XCTAssertEqual(fileChangeRows[0].turnId, turnID)
+    }
+
+    // A pending user prompt (no turnId yet) closes the previous turn's block:
+    // that turn's history reconcile must bind its anchored row and leave the
+    // next turn's turnless table alone instead of re-anchoring it backwards.
+    func testHistoryFileChangeBlockStopsAtPendingUserBoundary() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let now = Date(timeIntervalSince1970: 1_779_654_720)
+        let fileChangeText = """
+        Path: Sources/App.swift
+        Kind: update
+        Totals: +2 -1
+        """
+
+        let existing = [
+            CodexMessage(
+                id: "user-t1",
+                threadId: threadID,
+                role: .user,
+                text: "first prompt",
+                createdAt: now,
+                turnId: turnID,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "fc-t1",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: fileChangeText,
+                createdAt: now.addingTimeInterval(1),
+                turnId: turnID,
+                itemId: "fc-live",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+            CodexMessage(
+                id: "user-pending",
+                threadId: threadID,
+                role: .user,
+                text: "next prompt",
+                createdAt: now.addingTimeInterval(10),
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .pending
+            ),
+            CodexMessage(
+                id: "fc-next-turnless",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: fileChangeText,
+                createdAt: now.addingTimeInterval(12),
+                turnId: nil,
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+        let history = [
+            CodexMessage(
+                id: "fc-t1-history",
+                threadId: threadID,
+                role: .system,
+                kind: .fileChange,
+                text: fileChangeText,
+                createdAt: now.addingTimeInterval(2),
+                turnId: turnID,
+                itemId: "fc-history-item",
+                isStreaming: false,
+                deliveryState: .confirmed
+            ),
+        ]
+
+        let merged = service.mergeHistoryMessages(existing, history)
+        let fileChangeRows = merged.filter { $0.kind == .fileChange }
+
+        XCTAssertEqual(fileChangeRows.count, 2)
+        XCTAssertNil(merged.first(where: { $0.id == "fc-next-turnless" })?.turnId)
     }
 
     func testHistoryMergeReconcilesThinkingByTurnWhenTextDiffers() {

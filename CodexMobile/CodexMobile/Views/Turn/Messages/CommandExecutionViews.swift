@@ -616,23 +616,46 @@ struct CommandExecutionCardBody: View {
         return Text(text)
     }
 
+    // Cached like `display` so the leading-icon classification isn't re-parsed on
+    // every body evaluation while the command streams.
+    private static let iconCache = BoundedCache<String, String>(maxEntries: 128)
+
+    private var iconSystemName: String {
+        if let cached = Self.iconCache.get(command) { return cached }
+        let name = CommandHumanizer.iconSystemName(for: command)
+        Self.iconCache.set(command, value: name)
+        return name
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 6) {
+            RemodexIcon.image(
+                systemName: iconSystemName,
+                size: 17,
+                relativeTo: .body
+            )
+            .foregroundStyle(.secondary)
+
             displayText
                 .font(AppFont.body(weight: .regular))
             .lineLimit(1)
             .truncationMode(.tail)
+            .layoutPriority(1)
 
-            Spacer(minLength: 6)
+            // No status text: the past-tense verb already conveys running vs done.
+            // A failure is flagged only by a red exclamation badge; running/completed show nothing.
+            if accent == .failed {
+                RemodexIcon.image(systemName: "exclamationmark.circle.fill", size: 15, relativeTo: .body)
+                    .foregroundStyle(.red)
+            }
 
-            Text(statusLabel)
-                .font(AppFont.body(weight: .regular))
-                .foregroundStyle(accent == .failed ? Color.red : Color.secondary.opacity(0.5))
-
+            // Keep the disclosure chevron next to the command, not pinned to the far right edge.
             RemodexIcon.image(systemName: "chevron.right")
                 .font(AppFont.system(size: 8, weight: .semibold))
-                .foregroundStyle(.quaternary)
-                .padding(.leading, 4)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+
+            Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Tool rows update often while commands stream; keep the subtree static to avoid whole-row flashing.
@@ -700,6 +723,60 @@ enum CommandHumanizer {
                 target: command
             )
         }
+    }
+
+    /// Leading icon (an SF Symbol name resolved to a Central asset by `RemodexIcon`)
+    /// for a humanized command row, following synara's command classification:
+    /// inspect-style commands → magnifying glass, source control → GitHub mark,
+    /// everything else → console.
+    static func iconSystemName(for raw: String) -> String {
+        let command = unwrapEnvironmentWrapper(unwrapShell(raw))
+        let (tool, _) = splitToolAndArgs(command)
+        switch tool {
+        case "cat", "nl", "head", "tail", "sed", "less", "more",
+             "rg", "grep", "ag", "ack", "find", "fd", "ls":
+            return "magnifyingglass"
+        case "git", "gh", "hub":
+            return "remodex.github"
+        default:
+            return "terminal"
+        }
+    }
+
+    // Mirrors Synara's command-row classifier for GitHub CLI calls hidden behind
+    // simple `env` wrappers such as `env -u GH_TOKEN gh pr status`.
+    private static func unwrapEnvironmentWrapper(_ raw: String) -> String {
+        let tokens = raw.split(separator: " ").map(String.init)
+        guard let firstToken = tokens.first,
+              (firstToken as NSString).lastPathComponent.lowercased() == "env" else {
+            return raw
+        }
+
+        var index = 1
+        while index < tokens.count {
+            let token = tokens[index]
+            if token == "--" {
+                index += 1
+                break
+            }
+            if token.hasPrefix("-") {
+                index += 1
+                if token == "-u" || token == "--unset" || token == "-C" {
+                    index += 1
+                }
+                continue
+            }
+            if token.contains("=") {
+                index += 1
+                continue
+            }
+            break
+        }
+
+        guard index < tokens.count else {
+            return raw
+        }
+        return tokens[index...].joined(separator: " ")
     }
 
     // MARK: - Shell unwrapping

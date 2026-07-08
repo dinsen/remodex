@@ -11,7 +11,8 @@ struct UserMessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
     private static let bubbleCornerRadius: CGFloat = 22
-    private static let darkColoredBubbleOpacity = 0.7
+    private static let darkColoredBubbleOpacity = 0.4
+    private static let lightColoredBubbleOpacity = 0.1
 
     let message: CodexMessage
     let text: String
@@ -50,7 +51,7 @@ struct UserMessageBubble: View {
 
             if let statusText = deliveryStatusText {
                 Text(statusText)
-                    .font(AppFont.caption2())
+                    .font(AppFont.subheadline())
                     .foregroundStyle(message.deliveryState == .failed ? .red : .secondary)
             }
         }
@@ -84,17 +85,26 @@ struct UserMessageBubble: View {
         UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
     }
 
-    // Softens saturated palettes in dark mode without muting the neutral/default choices.
+    // Softens saturated palettes into a tint without muting the neutral/default choices.
     private func userBubbleBackground(for bubbleColor: UserBubbleColor) -> Color {
-        guard colorScheme == .dark else {
-            return bubbleColor.bubbleBackground(for: colorScheme)
-        }
-
         switch bubbleColor {
         case .default, .black:
             return bubbleColor.bubbleBackground(for: colorScheme)
         default:
-            return Color(uiColor: bubbleColor.uiColor).opacity(Self.darkColoredBubbleOpacity)
+            let opacity = colorScheme == .dark ? Self.darkColoredBubbleOpacity : Self.lightColoredBubbleOpacity
+            return Color(uiColor: bubbleColor.uiColor).opacity(opacity)
+        }
+    }
+
+    // In light mode the colored bubbles are a soft tint, so the text takes the full saturated color for contrast.
+    private func userBubbleForeground(for bubbleColor: UserBubbleColor) -> Color {
+        switch bubbleColor {
+        case .default, .black:
+            return bubbleColor.bubbleForeground(for: colorScheme)
+        default:
+            return colorScheme == .dark
+                ? bubbleColor.bubbleForeground(for: colorScheme)
+                : Color(uiColor: bubbleColor.uiColor)
         }
     }
 
@@ -112,24 +122,45 @@ struct UserMessageBubble: View {
     @ViewBuilder
     private func userBubbleTextContent(_ renderModel: UserBubbleRenderModel, bubbleColor: UserBubbleColor) -> some View {
         if isProgressiveTextWindow {
-            userBubbleText(renderModel.text, bubbleColor: bubbleColor)
+            userBubbleText(renderModel, bubbleColor: bubbleColor, isCollapsed: false)
         } else {
             UserBubbleTextBlock(
                 contentIdentity: message.id,
                 rawText: renderModel.text,
-                contentResetKey: renderModel.textFingerprint
-            ) {
-                userBubbleText(renderModel.text, bubbleColor: bubbleColor)
+                contentResetKey: renderModel.textFingerprint,
+                collapsesWithLineLimit: !renderModel.usesBlockMarkdown
+            ) { isCollapsed in
+                userBubbleText(renderModel, bubbleColor: bubbleColor, isCollapsed: isCollapsed)
             }
         }
     }
 
-    private func userBubbleText(_ rawText: String, bubbleColor: UserBubbleColor) -> some View {
-        UserBubbleInlineMarkdownText(
-            rawText,
-            foreground: bubbleColor.bubbleForeground(for: colorScheme)
-        )
-            .font(AppFont.body())
+    // Simple prompts keep the lightweight inline renderer; block-level markdown
+    // (fences, headings, lists, quotes, tables) takes the assistant pipeline.
+    @ViewBuilder
+    private func userBubbleText(
+        _ renderModel: UserBubbleRenderModel,
+        bubbleColor: UserBubbleColor,
+        isCollapsed: Bool
+    ) -> some View {
+        let foreground = userBubbleForeground(for: bubbleColor)
+        if renderModel.usesBlockMarkdown {
+            // While collapsed, lay out only a bounded preview instead of the full
+            // message clipped to bubble height; expanding renders the full text.
+            MarkdownTextView(
+                text: isCollapsed
+                    ? UserBubbleCollapsedMarkdownPreview.previewText(for: renderModel.text)
+                    : renderModel.text,
+                profile: .userProse,
+                constrainsToAvailableWidth: true,
+                linkColor: foreground
+            )
+            .foregroundStyle(foreground)
+            .tint(foreground)
+        } else {
+            UserBubbleInlineMarkdownText(renderModel.text, foreground: foreground)
+                .font(AppFont.body())
+        }
     }
 }
 
@@ -137,6 +168,7 @@ private struct UserBubbleRenderModel: Equatable {
     let text: String
     let textFingerprint: String
     let chips: [TurnMentionChipRef]
+    let usesBlockMarkdown: Bool
 }
 
 enum UserBubbleRenderModelCache {
@@ -256,7 +288,8 @@ private enum UserBubbleMentionExtractor {
         return UserBubbleRenderModel(
             text: displayText,
             textFingerprint: TurnTextCacheKey.stableFingerprint(for: displayText),
-            chips: chips
+            chips: chips,
+            usesBlockMarkdown: UserBubbleBlockMarkdownDetector.containsBlockMarkdown(displayText)
         )
     }
 
@@ -386,6 +419,25 @@ private struct UserBubblePreviewCatalog: View {
                         skillMentions: ["frontend-design"],
                         actionText: "/review run on local changes $frontend-design",
                         bubbleColor: .blue
+                    )
+                }
+
+                previewSection("Block markdown") {
+                    bubblePreview(
+                        text: """
+                        Fix this snippet:
+
+                        ```swift
+                        // TODO: guard against nil
+                        let value = cache[key]!
+                        ```
+
+                        Then check:
+                        - the reconnect path
+                        - the pairing flow
+                        """,
+                        actionText: "Fix this snippet",
+                        bubbleColor: .green
                     )
                 }
             }

@@ -10,6 +10,16 @@ enum AppEnvironment {
     private static let defaultRelayURLInfoPlistKey = "PHODEX_DEFAULT_RELAY_URL"
     private static let supportEmailAddress = "emandipietro@gmail.com"
 
+    // Keeps startup logs concise by default while preserving an explicit deep-diagnostics mode.
+    // Enable from an Xcode scheme with REMODEX_VERBOSE_LOGGING=1.
+    nonisolated static let verboseDiagnosticsEnabled: Bool = {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["REMODEX_VERBOSE_LOGGING"] == "1"
+        #else
+        false
+        #endif
+    }()
+
     // Open-source builds should provide an explicit relay instead of silently
     // pointing at a hosted service the user does not control.
     static let defaultRelayURLString = ""

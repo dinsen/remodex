@@ -9,7 +9,9 @@ import Foundation
 // ─── Render Item Models ───────────────────────────────────────
 
 struct TurnTimelineToolBurstGroup: Identifiable, Equatable {
-    static let collapsedVisibleCount = 5
+    // Once a burst exceeds this threshold, collapse every prior call and reserve
+    // the only visible call row for the newest tool activity.
+    static let collapsedVisibleCount = 4
 
     let id: String
     let messages: [CodexMessage]
@@ -19,12 +21,12 @@ struct TurnTimelineToolBurstGroup: Identifiable, Equatable {
         self.id = "tool-burst:\(messages.first?.id ?? "unknown")"
     }
 
-    var pinnedMessages: [CodexMessage] {
-        Array(messages.prefix(Self.collapsedVisibleCount))
+    var overflowMessages: [CodexMessage] {
+        Array(messages.dropLast())
     }
 
-    var overflowMessages: [CodexMessage] {
-        Array(messages.dropFirst(Self.collapsedVisibleCount))
+    var latestMessage: CodexMessage? {
+        return messages.last
     }
 
     var hiddenCount: Int {
@@ -265,17 +267,21 @@ enum TurnTimelineRenderProjection {
         )
     }
 
-    // Late file-change events can land as adjacent cards from neighboring turns.
-    // Present the final submitted file list as one table; duplicate paths are summed by the builder.
+    // Late file-change events can land as adjacent cards. Collapse only within
+    // one turn so a previous turn's recap cannot appear under the next prompt.
     private static func mergeAdjacentFileChangeItems(
         _ items: [TurnTimelineRenderItem]
     ) -> [TurnTimelineRenderItem] {
         var mergedItems: [TurnTimelineRenderItem] = []
         var pendingFileChanges: [CodexMessage] = []
+        var pendingTurnKey: String?
 
         func flushPendingFileChanges() {
             guard !pendingFileChanges.isEmpty else { return }
-            defer { pendingFileChanges.removeAll(keepingCapacity: true) }
+            defer {
+                pendingFileChanges.removeAll(keepingCapacity: true)
+                pendingTurnKey = nil
+            }
 
             guard pendingFileChanges.count > 1,
                   shouldEagerlyCollapseFileChanges(pendingFileChanges),
@@ -299,11 +305,20 @@ enum TurnTimelineRenderProjection {
                 continue
             }
 
+            let turnKey = fileChangeMergeTurnKey(for: message)
+            if pendingTurnKey != nil, pendingTurnKey != turnKey {
+                flushPendingFileChanges()
+            }
+            pendingTurnKey = turnKey
             pendingFileChanges.append(message)
         }
 
         flushPendingFileChanges()
         return mergedItems
+    }
+
+    private static func fileChangeMergeTurnKey(for message: CodexMessage) -> String {
+        normalizedIdentifier(message.turnId).map { "turn:\($0)" } ?? "turnless"
     }
 
     // File-change collapse parses diff bodies; skip eager parsing for very large rows

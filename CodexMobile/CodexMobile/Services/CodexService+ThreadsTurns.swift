@@ -284,16 +284,48 @@ extension CodexService {
         composerDraftsByThreadID[threadId]
     }
 
+    // Returns the draft mutation revision used to reject stale async attachment merges.
+    func composerDraftMergeRevision(for threadId: String) -> Int {
+        composerDraftMergeRevisionByThreadID[threadId] ?? 0
+    }
+
+    // Stores loading attachment IDs that are still allowed to complete into a saved draft.
+    func setComposerDraftPendingAttachmentIDs(_ ids: Set<String>, for threadId: String) {
+        composerDraftPendingAttachmentIDsByThreadID[threadId] = ids
+    }
+
+    func canMergePendingComposerAttachment(id attachmentID: String, for threadId: String) -> Bool {
+        guard let pendingAttachmentIDs = composerDraftPendingAttachmentIDsByThreadID[threadId] else {
+            return true
+        }
+
+        return pendingAttachmentIDs.contains(attachmentID)
+    }
+
+    func markPendingComposerAttachmentMerged(id attachmentID: String, for threadId: String) {
+        guard var pendingAttachmentIDs = composerDraftPendingAttachmentIDsByThreadID[threadId] else {
+            return
+        }
+
+        pendingAttachmentIDs.remove(attachmentID)
+        setComposerDraftPendingAttachmentIDs(pendingAttachmentIDs, for: threadId)
+    }
+
     // Stores or clears an unsent composer draft, optionally flushing it to local disk.
     func setComposerDraft(
         _ draft: TurnComposerLocalDraft?,
         for threadId: String,
-        persistToDisk: Bool = false
+        persistToDisk: Bool = false,
+        advancesAttachmentMergeRevision: Bool = true
     ) {
         if let draft, !draft.isEmpty {
             composerDraftsByThreadID[threadId] = draft
         } else {
             composerDraftsByThreadID.removeValue(forKey: threadId)
+            composerDraftPendingAttachmentIDsByThreadID.removeValue(forKey: threadId)
+        }
+        if advancesAttachmentMergeRevision {
+            composerDraftMergeRevisionByThreadID[threadId, default: 0] += 1
         }
 
         if persistToDisk {
@@ -645,6 +677,21 @@ extension CodexService {
                 lastErrorMessage = userFacingTurnErrorMessageForFooter(from: error)
                 throw error
             }
+        }
+
+        // A synthetic placeholder id would be rejected by the app-server; resolve
+        // the real in-flight turn id first and keep the placeholder only as a
+        // last resort (the refresh-retry below still covers that path).
+        if let placeholderTurnID = normalizedTurnID,
+           Self.isSyntheticPlaceholderTurnID(placeholderTurnID),
+           let placeholderThreadID = normalizedThreadID
+                ?? threadIdByTurnID[placeholderTurnID]
+                ?? normalizedInterruptIdentifier(activeThreadId),
+           let refreshedTurnID = try? await resolveInFlightTurnID(threadId: placeholderThreadID),
+           let refreshedNormalizedTurnID = normalizedInterruptIdentifier(refreshedTurnID),
+           !Self.isSyntheticPlaceholderTurnID(refreshedNormalizedTurnID) {
+            normalizedTurnID = refreshedNormalizedTurnID
+            setActiveTurnID(refreshedNormalizedTurnID, for: placeholderThreadID)
         }
 
         guard let normalizedTurnID else {
@@ -1599,11 +1646,16 @@ extension CodexService {
                     noteDesktopMirroredRunningActivity(for: normalizedThreadID)
                     setProtectedRunningFallback(true, for: normalizedThreadID)
                 } else {
-                    if isDesktopMirroredRunning(normalizedThreadID),
+                    let existingTurnID = activeTurnID(for: normalizedThreadID)
+                    let latestTurnClosesExistingRun = existingTurnID != nil
+                        && snapshot.latestTurnID == existingTurnID
+                    if latestTurnClosesExistingRun {
+                        clearRunningState(for: normalizedThreadID)
+                    } else if isDesktopMirroredRunning(normalizedThreadID),
                        threadHasActiveOrRunningTurn(normalizedThreadID),
                        shouldPreserveDesktopMirroredRunningAfterStaleSnapshot(for: normalizedThreadID) {
                         markThreadAsRunning(normalizedThreadID)
-                        if let existingTurnID = activeTurnID(for: normalizedThreadID) {
+                        if let existingTurnID {
                             setProtectedRunningFallback(false, for: normalizedThreadID)
                             threadIdByTurnID[existingTurnID] = normalizedThreadID
                             activeTurnId = existingTurnID
@@ -2008,6 +2060,18 @@ extension CodexService {
             pendingMessageId = ""
         }
         var resolvedExpectedTurnID = normalizedInterruptIdentifier(expectedTurnId)
+        // Bridge-synthesized placeholder ids are not valid expectedTurnId values;
+        // resolve the real in-flight turn just like the missing-id path (the
+        // refresh-retry below stays as the fallback if resolution fails).
+        if let placeholderTurnID = resolvedExpectedTurnID,
+           Self.isSyntheticPlaceholderTurnID(placeholderTurnID) {
+            if let refreshedTurnID = try? await resolveInFlightTurnID(threadId: normalizedThreadID),
+               let refreshedNormalizedTurnID = normalizedInterruptIdentifier(refreshedTurnID),
+               !Self.isSyntheticPlaceholderTurnID(refreshedNormalizedTurnID) {
+                resolvedExpectedTurnID = refreshedNormalizedTurnID
+                setActiveTurnID(refreshedNormalizedTurnID, for: normalizedThreadID)
+            }
+        }
         if resolvedExpectedTurnID == nil {
             do {
                 resolvedExpectedTurnID = try await resolveInFlightTurnID(threadId: normalizedThreadID)
@@ -3205,6 +3269,13 @@ extension CodexService {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    // Bridge-synthesized placeholder turn ids group history rows and keep
+    // running state visible, but they are not real app-server turn ids:
+    // acting with one gets rejected ("expected active turn id … but found …").
+    nonisolated static func isSyntheticPlaceholderTurnID(_ turnId: String) -> Bool {
+        CodexSyntheticIdentifiers.isBridgeMintedTurnID(turnId)
+    }
+
     // Resolves the currently interruptible turn id from the latest turn page when local state is stale.
     // If the runtime reports "running" without an id yet, surface that instead of falling
     // back to the latest completed turn and interrupting the wrong run.
@@ -3382,20 +3453,34 @@ extension CodexService {
         }
 
         let newestTurnObjects = newestFirst ? turnObjects : Array(turnObjects.reversed())
-        let latestTurnID = newestTurnObjects.compactMap { turnObject in
-            normalizedInterruptIdentifier(
+        let latestTurnID = newestTurnObjects.compactMap { turnObject -> String? in
+            guard let turnID = normalizedInterruptIdentifier(
                 turnObject["id"]?.stringValue
                     ?? turnObject["turnId"]?.stringValue
                     ?? turnObject["turn_id"]?.stringValue
-            )
+            ), !CodexSyntheticIdentifiers.isHistoryCompactionMarkerTurnID(turnID) else {
+                return nil
+            }
+            return turnID
         }.first
 
-        // Newest-first scanning avoids interrupting an older completed turn when recovery is stale.
+        // Newest-first scanning trusts the latest real turn as the active-state boundary.
+        // If it is terminal, older stale in-progress rows cannot still be interruptible.
         var hasInterruptibleTurnWithoutID = false
         for turnObject in newestTurnObjects {
-            let turnStatus = normalizedInterruptTurnStatus(from: turnObject)
-            guard isInterruptibleTurnStatus(turnStatus) else {
+            // The bridge's compaction banner ships without a real turn status
+            // (older bridges omit it entirely); reading it as interruptible
+            // flagged idle heavy threads as running.
+            if let turnID = normalizedInterruptIdentifier(
+                turnObject["id"]?.stringValue
+                    ?? turnObject["turnId"]?.stringValue
+                    ?? turnObject["turn_id"]?.stringValue
+            ), CodexSyntheticIdentifiers.isHistoryCompactionMarkerTurnID(turnID) {
                 continue
+            }
+            let turnStatus = normalizedInterruptTurnStatus(from: turnObject)
+            if !isInterruptibleTurnStatus(turnStatus) {
+                break
             }
 
             if let interruptibleTurnID = normalizedInterruptIdentifier(
@@ -3407,6 +3492,7 @@ extension CodexService {
             }
 
             hasInterruptibleTurnWithoutID = true
+            break
         }
 
         return (nil, hasInterruptibleTurnWithoutID, latestTurnID)
@@ -3447,7 +3533,11 @@ extension CodexService {
             "no such turn",
             "not active",
             "does not exist",
-            "cannot interrupt"
+            "cannot interrupt",
+            // Codex rejects actions whose turn id does not match the live turn
+            // (e.g. a stale or bridge-synthesized placeholder id):
+            // "expected active turn id <x> but found <y>".
+            "expected active turn"
         ]
         return hints.contains { message.contains($0) }
     }

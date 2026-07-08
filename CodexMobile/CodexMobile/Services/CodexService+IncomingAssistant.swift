@@ -28,7 +28,17 @@ extension CodexService {
             eventObject: eventObject
         ) else { return }
 
-        if let directThreadId = extractThreadID(from: paramsObject), !directThreadId.isEmpty {
+        // Late/replayed deltas for finished turns still merge into closed rows via
+        // applyLateTerminalAssistantDelta, but they must never revive running UI.
+        let isReplayedEvent = isReplayedBridgeEvent(paramsObject)
+        // Rollout bootstrap catch-up (scoped via isApplyingReplayedBridgeEvent) keeps
+        // the thread running but must append text as closed history, not streaming.
+        let appliesAsReplay = isReplayedEvent || isApplyingReplayedBridgeEvent
+
+        if let directThreadId = extractThreadID(from: paramsObject),
+           !directThreadId.isEmpty,
+           !isReplayedEvent,
+           turnTerminalState(for: extractTurnID(from: paramsObject)) == nil {
             markThreadAsRunning(directThreadId)
         }
 
@@ -41,12 +51,14 @@ extension CodexService {
             return
         }
 
-        markThreadAsRunning(context.threadId)
-        if activeTurnID(for: context.threadId) == nil {
-            setActiveTurnID(turnId, for: context.threadId)
-            threadIdByTurnID[turnId] = context.threadId
-            activeTurnId = turnId
-            setProtectedRunningFallback(false, for: context.threadId)
+        if !isReplayedEvent, turnTerminalState(for: turnId) == nil {
+            markThreadAsRunning(context.threadId)
+            if activeTurnID(for: context.threadId) == nil {
+                setActiveTurnID(turnId, for: context.threadId)
+                threadIdByTurnID[turnId] = context.threadId
+                activeTurnId = turnId
+                setProtectedRunningFallback(false, for: context.threadId)
+            }
         }
         clearMirroredRunningCatchupNeeded(for: context.threadId)
         appendAssistantDelta(
@@ -54,7 +66,8 @@ extension CodexService {
             turnId: turnId,
             itemId: context.identity.itemId,
             assistantPhase: context.identity.phase,
-            delta: delta
+            delta: delta,
+            isReplay: appliesAsReplay
         )
     }
 
@@ -76,12 +89,17 @@ extension CodexService {
         ])
         guard let text else { return }
         let createdAt = decodeHistoryTimestamp(from: paramsObject)
+        let itemId = firstNonEmptyString([
+            paramsObject["itemId"]?.stringValue,
+            paramsObject["id"]?.stringValue,
+        ])
 
         markMirroredRunningCatchupNeeded(for: threadId)
         appendConfirmedMirroredUserMessage(
             threadId: threadId,
             turnId: turnId,
             text: text,
+            itemId: itemId,
             createdAt: createdAt
         )
     }
@@ -111,6 +129,20 @@ extension CodexService {
                 eventObject: eventObject,
                 itemObject: nil
             )
+            let appliesAsReplay = isReplayedBridgeEvent(paramsObject) || isApplyingReplayedBridgeEvent
+            if !appliesAsReplay,
+               isDesktopMirroredBridgeEvent(paramsObject),
+               let turnId {
+                appendAssistantDelta(
+                    threadId: context.threadId,
+                    turnId: turnId,
+                    itemId: context.identity.itemId,
+                    assistantPhase: context.identity.phase,
+                    delta: text,
+                    isReplay: false
+                )
+                return
+            }
             completeAssistantMessage(
                 threadId: context.threadId,
                 turnId: turnId,
@@ -122,6 +154,16 @@ extension CodexService {
         }
 
         let itemType = normalizedItemType(itemObject["type"]?.stringValue ?? "")
+        // Non-active Desktop turns mirror user prompts through item/completed only
+        // (no item/started), so the prompt must upsert from here as well.
+        if handleMirroredUserMessageItem(
+            itemObject: itemObject,
+            paramsObject: paramsObject,
+            itemType: itemType
+        ) {
+            return
+        }
+
         if isCompletedGeneratedImageItemType(itemType) {
             appendCompletedGeneratedImageItem(
                 itemObject: itemObject,
@@ -242,7 +284,19 @@ extension CodexService {
         guard let paramsObject else { return }
         let eventObject = envelopeEventObject(from: paramsObject)
 
-        if let directThreadId = extractThreadID(from: paramsObject), !directThreadId.isEmpty {
+        // Replayed starts are only ordering hints; deltas create closed history rows.
+        if isReplayedBridgeEvent(paramsObject) {
+            return
+        }
+
+        // Replayed item lifecycle events for finished turns must not revive running UI.
+        if turnTerminalState(for: extractTurnID(from: paramsObject)) != nil {
+            return
+        }
+
+        if let directThreadId = extractThreadID(from: paramsObject),
+           !directThreadId.isEmpty,
+           !isReplayedBridgeEvent(paramsObject) {
             markThreadAsRunning(directThreadId)
         }
 
@@ -251,6 +305,14 @@ extension CodexService {
         }
 
         let itemType = normalizedItemType(itemObject["type"]?.stringValue ?? "")
+        if handleMirroredUserMessageItem(
+            itemObject: itemObject,
+            paramsObject: paramsObject,
+            itemType: itemType
+        ) {
+            return
+        }
+
         if handleStructuredItemLifecycle(
             itemObject: itemObject,
             paramsObject: paramsObject,
@@ -305,6 +367,48 @@ extension CodexService {
 }
 
 private extension CodexService {
+    // Upserts Desktop-mirrored user prompts delivered as item lifecycle events
+    // (item/started for active turns, item/completed for non-active ones).
+    func handleMirroredUserMessageItem(
+        itemObject: IncomingParamsObject,
+        paramsObject: IncomingParamsObject,
+        itemType: String
+    ) -> Bool {
+        guard isDesktopMirroredBridgeEvent(paramsObject) else {
+            return false
+        }
+
+        let role = itemObject["role"]?.stringValue?.lowercased() ?? ""
+        let isUserMessage = itemType == "usermessage"
+            || (itemType == "message" && role.contains("user"))
+        guard isUserMessage else {
+            return false
+        }
+
+        let turnId = extractTurnID(from: paramsObject)
+        guard let threadId = resolveThreadID(from: paramsObject, turnIdHint: turnId) else {
+            return true
+        }
+        if let turnId {
+            threadIdByTurnID[turnId] = threadId
+        }
+
+        let text = extractIncomingMessageText(from: itemObject)
+        guard !text.isEmpty else {
+            return true
+        }
+
+        markMirroredRunningCatchupNeeded(for: threadId)
+        appendConfirmedMirroredUserMessage(
+            threadId: threadId,
+            turnId: turnId,
+            text: text,
+            itemId: itemObject["id"]?.stringValue,
+            createdAt: decodeHistoryTimestamp(from: paramsObject)
+        )
+        return true
+    }
+
     // Extracts assistant delta text across stable + legacy codex/event envelopes.
     func extractAssistantDeltaText(
         from paramsObject: IncomingParamsObject,

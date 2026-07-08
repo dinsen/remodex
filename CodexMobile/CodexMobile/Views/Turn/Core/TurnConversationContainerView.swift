@@ -154,15 +154,6 @@ struct TurnConversationContainerView: View {
     // Keeps the active plan discoverable without covering the message timeline.
     private func composerWithPinnedPlanAccessory(for messageLayout: TimelineMessageLayout) -> some View {
         VStack(spacing: 8) {
-            if let pinnedTaskPlanMessage = messageLayout.pinnedTaskPlanMessage {
-                PlanExecutionAccessory(message: pinnedTaskPlanMessage) {
-                    isShowingPinnedPlanSheet = true
-                }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
             if let composerRecoveryAccessory {
                 composerRecoveryAccessory
                     .padding(.horizontal, 12)
@@ -176,7 +167,13 @@ struct TurnConversationContainerView: View {
                 composer
             }
         }
-        .animation(.easeInOut(duration: 0.18), value: messageLayout.pinnedTaskPlanMessage?.id)
+        // The active plan renders as a capsule inside the composer's carousel
+        // row; the environment carries it there without widening the composer API.
+        .environment(\.pinnedPlanAccessory, messageLayout.pinnedTaskPlanMessage.map { message in
+            PinnedPlanAccessoryContext(snapshot: PlanAccessorySnapshot(message: message)) {
+                isShowingPinnedPlanSheet = true
+            }
+        })
         .animation(.easeInOut(duration: 0.18), value: messageLayout.activeStructuredPromptMessage?.id)
     }
 

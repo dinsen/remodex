@@ -1,7 +1,7 @@
 // FILE: PlanAccessoryCard.swift
-// Purpose: Hosts the compact active-plan accessory as a standalone, previewable view.
+// Purpose: Hosts the compact active-plan capsule as a standalone, previewable view.
 // Layer: View Component
-// Exports: PlanAccessoryCard, PlanAccessorySnapshot, PlanAccessoryPreviewFixtures
+// Exports: PlanAccessoryCard, PlanAccessorySnapshot, PinnedPlanAccessoryContext, PlanAccessoryPreviewFixtures
 // Depends on: SwiftUI, CodexMessage, CodexCollaboration
 
 import SwiftUI
@@ -52,7 +52,6 @@ struct PlanAccessorySnapshot: Equatable {
     let completedStepCount: Int
     let totalStepCount: Int
     let isStreaming: Bool
-    let stepStatuses: [CodexPlanStepStatus]
 
     init(
         title: String = "Plan",
@@ -60,8 +59,7 @@ struct PlanAccessorySnapshot: Equatable {
         status: PlanAccessoryStatus,
         completedStepCount: Int,
         totalStepCount: Int,
-        isStreaming: Bool = false,
-        stepStatuses: [CodexPlanStepStatus] = []
+        isStreaming: Bool = false
     ) {
         self.title = title
         self.summary = summary
@@ -69,7 +67,6 @@ struct PlanAccessorySnapshot: Equatable {
         self.completedStepCount = completedStepCount
         self.totalStepCount = totalStepCount
         self.isStreaming = isStreaming
-        self.stepStatuses = stepStatuses
     }
 
     init(message: CodexMessage) {
@@ -83,8 +80,7 @@ struct PlanAccessorySnapshot: Equatable {
             status: status,
             completedStepCount: completedStepCount,
             totalStepCount: totalStepCount,
-            isStreaming: message.isStreaming,
-            stepStatuses: steps.map(\.status)
+            isStreaming: message.isStreaming
         )
     }
 
@@ -176,107 +172,78 @@ struct GlassAccessoryCard<LeadingMarker: View, Header: View, Summary: View, Trai
     }
 }
 
+/// Carries the pinned active-plan state from the conversation container down to
+/// the composer's carousel row without widening the composer parameter chain.
+struct PinnedPlanAccessoryContext {
+    let snapshot: PlanAccessorySnapshot
+    let onTap: () -> Void
+}
+
+private struct PinnedPlanAccessoryKey: EnvironmentKey {
+    static let defaultValue: PinnedPlanAccessoryContext? = nil
+}
+
+extension EnvironmentValues {
+    var pinnedPlanAccessory: PinnedPlanAccessoryContext? {
+        get { self[PinnedPlanAccessoryKey.self] }
+        set { self[PinnedPlanAccessoryKey.self] = newValue }
+    }
+}
+
 struct PlanAccessoryCard: View {
     let snapshot: PlanAccessorySnapshot
     let onTap: () -> Void
 
     var body: some View {
-        GlassAccessoryCard(onTap: onTap) {
-            leadingMarker
-        } header: {
-            headerRow
-        } summary: {
-            summaryRow
-        } trailing: {
-            trailingMetric
+        Button {
+            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+            onTap()
+        } label: {
+            GlassStatusPill {
+                leadingMarker
+
+                Text(snapshot.title)
+                    .font(AppFont.caption())
+                    .foregroundStyle(.secondary)
+
+                trailingMetric
+            }
         }
+        .buttonStyle(.plain)
+        .fixedSize()
         .accessibilityLabel("Open active plan")
         .accessibilityValue("\(snapshot.status.label), \(snapshot.progressDescription)")
         .accessibilityHint("Shows the current plan steps in a sheet")
     }
 
+    // Compact status dot mirroring the plan tint, sized to sit on a caption line.
     private var leadingMarker: some View {
         ZStack {
             Circle()
-                .fill(snapshot.status.tint.opacity(0.1))
-                .frame(width: 22, height: 22)
+                .fill(snapshot.status.tint.opacity(0.14))
+                .frame(width: 16, height: 16)
 
             Circle()
                 .fill(snapshot.status.tint)
-                .frame(width: 7, height: 7)
+                .frame(width: 6, height: 6)
         }
     }
 
-    private var headerRow: some View {
-        HStack(alignment: .center, spacing: 6) {
-            Text(snapshot.title)
-                .font(AppFont.mono(.caption2))
-                .foregroundStyle(.secondary)
-
-            Circle()
-                .fill(Color(.separator).opacity(0.6))
-                .frame(width: 3, height: 3)
-
-            Text(snapshot.status.label)
-                .font(AppFont.caption(weight: .regular))
-                .foregroundStyle(snapshot.status.tint)
-
-            if !snapshot.stepStatuses.isEmpty {
-                stepRail
-                    .padding(.leading, 2)
-            }
-
-            if snapshot.isStreaming {
-                ProgressView()
-                    .controlSize(.mini)
-                    .scaleEffect(0.8)
-                    .padding(.leading, 2)
-            }
-        }
-    }
-
-    private var summaryRow: some View {
-        Text(snapshot.summary)
-            .font(AppFont.subheadline(weight: .medium))
-            .foregroundStyle(.primary)
-            .lineLimit(1)
-            .multilineTextAlignment(.leading)
-    }
-
+    @ViewBuilder
     private var trailingMetric: some View {
-        VStack(alignment: .trailing, spacing: 1) {
-            if let progressText = snapshot.progressText {
-                Text(progressText)
-                    .font(AppFont.mono(.caption))
-                    .foregroundStyle(.primary)
-            } else {
-                Text(snapshot.status.label)
-                    .font(AppFont.caption(weight: .medium))
-                    .foregroundStyle(snapshot.status.tint)
-            }
-        }
-        .frame(minWidth: 36, alignment: .trailing)
-    }
+        if let progressText = snapshot.progressText {
+            Text("·")
+                .font(AppFont.caption())
+                .foregroundStyle(.tertiary)
 
-    private var stepRail: some View {
-        HStack(spacing: 3) {
-            ForEach(Array(snapshot.stepStatuses.enumerated()), id: \.offset) { _, status in
-                Capsule()
-                    .fill(stepTint(for: status))
-                    .frame(width: 10, height: 3)
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
-    private func stepTint(for status: CodexPlanStepStatus) -> Color {
-        switch status {
-        case .pending:
-            return Color(.separator).opacity(0.22)
-        case .inProgress:
-            return snapshot.status.tint.opacity(0.72)
-        case .completed:
-            return Color.primary.opacity(0.72)
+            Text(progressText)
+                .font(AppFont.caption())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+        } else if snapshot.isStreaming {
+            ProgressView()
+                .controlSize(.mini)
+                .scaleEffect(0.8)
         }
     }
 }

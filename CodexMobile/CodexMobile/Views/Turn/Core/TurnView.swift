@@ -468,7 +468,7 @@ struct TurnView: View {
                 // Defer the observable-model mutation out of the .onChange action
                 // to avoid AttributeGraph cycles when the parent re-renders.
                 DispatchQueue.main.async { [viewModel] in
-                    viewModel.saveLocalDraft(codex: codex, threadID: thread.id, persistToDisk: true)
+                    viewModel.saveLifecycleLocalDraft(codex: codex, threadID: thread.id)
                 }
                 handleVoiceScenePhaseChange(phase)
             },
@@ -478,7 +478,7 @@ struct TurnView: View {
         )
         .onDisappear {
             codex.setComposerInputFocused(false, for: thread.id)
-            viewModel.saveLocalDraft(codex: codex, threadID: thread.id, persistToDisk: true)
+            viewModel.saveLifecycleLocalDraft(codex: codex, threadID: thread.id)
             handleVoiceViewDisappear()
             viewModel.cancelTransientTasks()
             viewModel.clearComposerAutocomplete()

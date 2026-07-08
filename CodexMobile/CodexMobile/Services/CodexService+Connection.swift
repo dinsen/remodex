@@ -175,6 +175,7 @@ extension CodexService {
         supportsServiceTier = true
         hasPresentedServiceTierBridgeUpdatePrompt = false
         supportsBridgeVoiceTranscription = true
+        supportedBridgeVoiceTranscriptionFormats = ["wav"]
         supportsThreadFork = true
         supportsTurnPagination = true
         hasPresentedThreadForkBridgeUpdatePrompt = false
@@ -690,6 +691,7 @@ extension CodexService {
         supportsServiceTier = true
         hasPresentedServiceTierBridgeUpdatePrompt = false
         supportsBridgeVoiceTranscription = true
+        supportedBridgeVoiceTranscriptionFormats = ["wav"]
         supportsThreadFork = true
         supportsTurnPagination = true
         hasPresentedThreadForkBridgeUpdatePrompt = false

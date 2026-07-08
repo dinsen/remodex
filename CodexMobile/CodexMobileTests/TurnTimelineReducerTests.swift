@@ -331,14 +331,14 @@ final class TurnTimelineReducerTests: XCTestCase {
         }
 
         XCTAssertEqual(group.messages.map(\.id), toolMessages.map(\.id))
-        XCTAssertEqual(group.hiddenCount, 2)
-        XCTAssertEqual(group.pinnedMessages.map(\.id), ["tool-1", "tool-2", "tool-3", "tool-4", "tool-5"])
-        XCTAssertEqual(group.overflowMessages.map(\.id), ["tool-6", "tool-7"])
+        XCTAssertEqual(group.hiddenCount, 6)
+        XCTAssertEqual(group.overflowMessages.map(\.id), ["tool-1", "tool-2", "tool-3", "tool-4", "tool-5", "tool-6"])
+        XCTAssertEqual(group.latestMessage?.id, "tool-7")
     }
 
-    func testTimelineRenderProjectionKeepsShortToolRunsExpanded() {
+    func testTimelineRenderProjectionKeepsUpToFourToolRunsExpanded() {
         let now = Date()
-        let toolMessages = (1...5).map { index in
+        let toolMessages = (1...4).map { index in
             makeMessage(
                 id: "tool-\(index)",
                 threadID: "thread",
@@ -352,7 +352,7 @@ final class TurnTimelineReducerTests: XCTestCase {
         }
 
         let items = TurnTimelineRenderProjection.project(messages: toolMessages)
-        XCTAssertEqual(items.count, 5)
+        XCTAssertEqual(items.count, 4)
 
         let messageIDs = items.compactMap { item -> String? in
             if case .message(let message) = item {
@@ -1244,7 +1244,7 @@ final class TurnTimelineReducerTests: XCTestCase {
                 Totals: +0 -6
                 """,
                 createdAt: now.addingTimeInterval(1),
-                turnID: "turn-2",
+                turnID: "turn-1",
                 orderIndex: 2
             ),
         ]
@@ -1260,6 +1260,48 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(summary?.entries.first?.path, "CodexMobile/CodexMobile/Views/Turn/TurnTimelineView.swift")
         XCTAssertEqual(summary?.entries.first?.additions, 6)
         XCTAssertEqual(summary?.entries.first?.deletions, 6)
+    }
+
+    func testTimelineProjectionKeepsAdjacentFileChangeRowsSeparateAcrossTurns() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "file-change-previous-turn",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/Previous.swift
+                Kind: update
+                Totals: +2 -1
+                """,
+                createdAt: now,
+                turnID: "turn-1",
+                orderIndex: 1
+            ),
+            makeMessage(
+                id: "file-change-new-turn",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/New.swift
+                Kind: update
+                Totals: +3 -0
+                """,
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-2",
+                orderIndex: 2
+            ),
+        ]
+
+        let items = TurnTimelineRenderProjection.project(messages: messages)
+
+        XCTAssertEqual(items.map(\.id), ["file-change-previous-turn", "file-change-new-turn"])
     }
 
     func testTimelineProjectionMergesAdjacentFinalFileChangeRowsIntoOneTable() {
@@ -1294,7 +1336,7 @@ final class TurnTimelineReducerTests: XCTestCase {
                 Totals: +3 -0
                 """,
                 createdAt: now.addingTimeInterval(1),
-                turnID: "turn-2",
+                turnID: "turn-1",
                 orderIndex: 2
             ),
         ]
@@ -2308,6 +2350,206 @@ final class TurnTimelineReducerTests: XCTestCase {
 
         let deduped = TurnTimelineReducer.removeDuplicateFileChangeMessages(in: messages)
         XCTAssertEqual(deduped.map(\.id), ["diff-2"])
+    }
+
+    // A long-running turn keeps one live cumulative aggregate streaming while
+    // completed per-patch cards land; the aggregate must absorb subset cards
+    // instead of showing both the compact card and the growing live list.
+    func testRemoveDuplicateFileChangeMessagesStreamingAggregateAbsorbsCompletedSubsetCard() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "aggregate-live",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +10 -2
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +4 -1
+                """,
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "turn-diff-aggregate",
+                isStreaming: true
+            ),
+            makeMessage(
+                id: "card-subset",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +3 -1
+                """,
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "patch-2",
+                isStreaming: false
+            ),
+        ]
+
+        let deduped = TurnTimelineReducer.removeDuplicateFileChangeMessages(in: messages)
+        XCTAssertEqual(deduped.map(\.id), ["aggregate-live"])
+    }
+
+    // Turn completion can flip the aggregate non-streaming without a final
+    // item snapshot; it must keep absorbing strictly covered per-patch cards
+    // or the duplication resurfaces exactly when the turn ends.
+    func testRemoveDuplicateFileChangeMessagesCompletedAggregateAbsorbsStrictSubsetCard() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "aggregate-final",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +10 -2
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +4 -1
+                """,
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "turn-diff-aggregate",
+                isStreaming: false
+            ),
+            makeMessage(
+                id: "card-subset",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +3 -1
+                """,
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "patch-2",
+                isStreaming: false
+            ),
+        ]
+
+        let deduped = TurnTimelineReducer.removeDuplicateFileChangeMessages(in: messages)
+        XCTAssertEqual(deduped.map(\.id), ["aggregate-final"])
+    }
+
+    // When the row's item id proves it IS the cumulative aggregate (streaming
+    // placeholder / jsonl aggregate id), it also absorbs an EQUAL-path card:
+    // the pair is not ambiguous, the aggregate is the authoritative recap.
+    func testRemoveDuplicateFileChangeMessagesKnownAggregateAbsorbsEqualPathCard() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "aggregate-final",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +10 -2
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +4 -1
+                """,
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: CodexSyntheticIdentifiers.placeholderItemID(turnId: "turn-1", kind: .fileChange),
+                isStreaming: false
+            ),
+            makeMessage(
+                id: "card-equal",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +3 -1
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +1 -0
+                """,
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "patch-2",
+                isStreaming: false
+            ),
+        ]
+
+        let deduped = TurnTimelineReducer.removeDuplicateFileChangeMessages(in: messages)
+        XCTAssertEqual(deduped.map(\.id), ["aggregate-final"])
+    }
+
+    // Without the aggregate id proof, an equal-path completed pair stays
+    // ambiguous (the aggregate often adopts a real item id): both rows must
+    // survive so the wrong one of an identical pair is never killed.
+    func testRemoveDuplicateFileChangeMessagesUnknownCompletedAggregateKeepsEqualPathCard() {
+        let now = Date()
+        let messages = [
+            makeMessage(
+                id: "aggregate-adopted-id",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +10 -2
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +4 -1
+                """,
+                createdAt: now,
+                turnID: "turn-1",
+                itemID: "item-real-42",
+                isStreaming: false
+            ),
+            makeMessage(
+                id: "card-equal",
+                threadID: "thread",
+                role: .system,
+                kind: .fileChange,
+                text: """
+                Status: completed
+
+                Path: Sources/App.swift
+                Kind: update
+                Totals: +3 -1
+
+                Path: Sources/Feature.swift
+                Kind: update
+                Totals: +1 -0
+                """,
+                createdAt: now.addingTimeInterval(1),
+                turnID: "turn-1",
+                itemID: "patch-2",
+                isStreaming: false
+            ),
+        ]
+
+        let deduped = TurnTimelineReducer.removeDuplicateFileChangeMessages(in: messages)
+        XCTAssertEqual(deduped.map(\.id), ["aggregate-adopted-id", "card-equal"])
     }
 
     func testRemoveDuplicateFileChangeMessagesIgnoresStatusOnlyDifferences() {
