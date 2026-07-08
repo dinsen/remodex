@@ -113,7 +113,7 @@ struct SidebarNewChatProjectPickerSheet: View {
                                         .foregroundStyle(.secondary)
                                 ),
                                 title: "Quick Chat",
-                                subtitle: "Start a chat without a working directory."
+                                subtitle: "Start a rootless chat."
                             )
                         }
                         .buttonStyle(.plain)

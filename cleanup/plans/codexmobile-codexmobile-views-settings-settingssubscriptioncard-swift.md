@@ -11,7 +11,7 @@
 - Focused component file with acceptable size.
 
 ## Required End State
-- Keep subscription-specific UI and StoreKit/RevenueCat presentation here.
+- Keep subscription-specific UI and local access presentation here.
 - Reopen if unrelated settings logic starts accumulating here.
 
 ## Ordered Cleanup Tasks

@@ -116,14 +116,14 @@ extension CodexService {
             }
 
             startWebSocketKeepAliveLoop()
+            if performInitialSync {
+                schedulePostConnectSyncPass()
+            }
             startSyncLoop()
             // Push registration is best-effort and talks to the bridge, so it must not
             // hold the main connect path hostage when the managed backend is slow.
             Task { @MainActor [weak self] in
                 await self?.syncManagedPushRegistrationIfNeeded(force: true)
-            }
-            if performInitialSync {
-                schedulePostConnectSyncPass()
             }
             Task { @MainActor [weak self] in
                 await self?.refreshBridgeManagedState(
@@ -540,9 +540,9 @@ extension CodexService {
     // Paint chats first; runtime metadata is useful composer chrome but must
     // never block thread sync on bridges where model/list is slow.
     func performPostConnectSyncPass(preferredThreadId: String? = nil) async {
-        await syncThreadsList()
+        await syncThreadsList(limit: initialVisibleThreadListLimit)
+        scheduleCompleteThreadListHydration()
         if await routePendingNotificationOpenIfPossible(refreshIfNeeded: false) {
-            scheduleCompleteThreadListHydration()
             scheduleRuntimeOptionRefresh()
             return
         }
@@ -574,14 +574,21 @@ extension CodexService {
                 )
             }
         }
-        scheduleCompleteThreadListHydration()
         scheduleRuntimeOptionRefresh()
     }
 
     // Refreshes capped sidebar metadata without keeping initial reconnect in the loading state.
-    private func scheduleCompleteThreadListHydration() {
-        Task { @MainActor [weak self] in
-            guard let self, self.isConnected, self.isInitialized, !self.isLoadingThreads else {
+    func scheduleCompleteThreadListHydration() {
+        guard completeThreadListHydrationTask == nil else {
+            return
+        }
+
+        completeThreadListHydrationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.completeThreadListHydrationTask = nil
+            }
+            guard self.isConnected, self.isInitialized, !self.isLoadingThreads else {
                 return
             }
 
@@ -748,6 +755,10 @@ extension CodexService {
         postConnectSyncToken = nil
         threadListFetchTaskByLimit.values.forEach { $0.task.cancel() }
         threadListFetchTaskByLimit.removeAll()
+        threadListFullHydrationTask?.task.cancel()
+        threadListFullHydrationTask = nil
+        completeThreadListHydrationTask?.cancel()
+        completeThreadListHydrationTask = nil
         cancelAllPerThreadRefreshWork()
     }
 

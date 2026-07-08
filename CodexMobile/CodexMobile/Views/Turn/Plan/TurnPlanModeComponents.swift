@@ -1081,14 +1081,14 @@ private struct ParsedQuestionBlock {
         threadId: "thread-preview-proposed-plan",
         proposedPlan: CodexProposedPlan(
             body: """
-            # RevenueCat Dashboard Improvement Plan
+            # Local Relay Dashboard Improvement Plan
 
             ## Summary
             Improve the app in three passes: first make it safer with tests and API hardening, then improve dashboard accuracy and UX, then refactor the large dashboard component.
 
             ## Key Changes
             - Add a test setup using vitest for pure logic and route-level behavior.
-            - Cover lib/tax-calculator.ts, lib/ranges.ts, lib/chart-normalizer.ts, /api/fx, and /api/revenuecat.
+            - Cover lib/session-router.ts, lib/ranges.ts, lib/chart-normalizer.ts, /api/fx, and /api/relay-health.
             - Keep typecheck as a required verification step.
             """
         ),

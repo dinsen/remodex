@@ -298,7 +298,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         }
     }
 
-    // Starts a chat without a working directory (cwd == nil) directly from the sidebar row.
+    // Starts a rootless chat directly from the sidebar row.
     private func handleQuickChatTap() {
         pendingTopAction = .quickChat
         handleNewChatTap(preferredProjectPath: nil)

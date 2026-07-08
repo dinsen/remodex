@@ -325,6 +325,7 @@ final class CodexPlanModeTests: XCTestCase {
 
         let archivedThreadID = "thread-archived"
         let continuationThreadID = "thread-continuation"
+        var turnStartThreadIDs: [String] = []
 
         service.requestTransportOverride = { method, params in
             switch method {
@@ -357,7 +358,14 @@ final class CodexPlanModeTests: XCTestCase {
                 )
 
             case "turn/start":
-                XCTAssertEqual(params?.objectValue?["threadId"]?.stringValue, continuationThreadID)
+                let threadID = params?.objectValue?["threadId"]?.stringValue
+                turnStartThreadIDs.append(threadID ?? "")
+                if threadID == archivedThreadID {
+                    throw CodexServiceError.rpcError(
+                        RPCError(code: -32000, message: "thread not found")
+                    )
+                }
+                XCTAssertEqual(threadID, continuationThreadID)
                 XCTAssertEqual(
                     params?.objectValue?["collaborationMode"]?.objectValue?["mode"]?.stringValue,
                     "plan"
@@ -380,6 +388,7 @@ final class CodexPlanModeTests: XCTestCase {
             collaborationMode: .plan
         )
 
+        XCTAssertEqual(turnStartThreadIDs, [archivedThreadID, continuationThreadID])
         XCTAssertNil(service.currentPlanSessionSource(for: archivedThreadID))
         XCTAssertEqual(service.currentPlanSessionSource(for: continuationThreadID), .requested)
     }

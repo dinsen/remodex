@@ -93,7 +93,6 @@ async function handleProjectMethod(method, params, options = {}) {
 async function projectQuickLocations(options = {}) {
   const homeDir = resolveHomeDir(options);
   const candidates = [
-    { id: "home", label: "Home", path: homeDir },
     { id: "developer", label: "Developer", path: path.join(homeDir, "Developer") },
     { id: "documents", label: "Documents", path: path.join(homeDir, "Documents") },
     { id: "desktop", label: "Desktop", path: path.join(homeDir, "Desktop") },

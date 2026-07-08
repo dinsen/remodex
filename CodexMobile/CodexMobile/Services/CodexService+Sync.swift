@@ -42,8 +42,10 @@ extension CodexService {
 
         threadListSyncTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                await self.syncThreadsList()
-                await self.refreshInactiveRunningBadgeThreads()
+                if !self.isBootstrappingConnectionSync {
+                    await self.syncThreadsList()
+                    await self.refreshInactiveRunningBadgeThreads()
+                }
                 let interval = self.isAppInForeground ? listIntervalForegroundNs : listIntervalBackgroundNs
                 try? await Task.sleep(nanoseconds: interval)
             }
@@ -134,8 +136,10 @@ extension CodexService {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.syncThreadsList()
-            await self.refreshInactiveRunningBadgeThreads()
+            if !self.isBootstrappingConnectionSync {
+                await self.syncThreadsList()
+                await self.refreshInactiveRunningBadgeThreads()
+            }
             if let threadId = threadId ?? self.activeThreadId {
                 await self.syncActiveThreadState(threadId: threadId)
             }
@@ -174,17 +178,20 @@ extension CodexService {
         }
     }
 
-    func syncThreadsList() async {
+    func syncThreadsList(limit: Int? = nil) async {
         guard isConnected, isInitialized else {
             return
         }
 
         do {
-            // Poll recent metadata only; listThreads() uses the same cap during reconnect/refresh.
-            let activeThreads = try await fetchCoalescedServerThreads(limit: recentActiveThreadListLimit)
+            // Poll only the newest page; full sidebar hydration runs as cursor pages in the background.
+            let activeLimit = limit ?? initialVisibleThreadListLimit
+            let activeThreads = try await fetchCoalescedServerThreads(limit: activeLimit)
 
             reconcileLocalThreadsWithServer(activeThreads)
             debugSyncLog("sync thread/list active=\(activeThreads.count) local=\(threads.count)")
+        } catch is CancellationError {
+            return
         } catch {
             presentConnectionErrorIfNeeded(error)
         }
@@ -237,7 +244,7 @@ extension CodexService {
 
             if let localThread = localByID[liveThread.id] {
                 liveThread = mergedThread(liveThread, with: localThread, treatAsServerState: true)
-                liveThread.syncState = localThread.syncState
+                liveThread.syncState = persistedArchivedIDs.contains(liveThread.id) ? .archivedLocal : .live
             } else if persistedArchivedIDs.contains(liveThread.id) {
                 liveThread.syncState = .archivedLocal
             } else {
@@ -480,7 +487,9 @@ extension CodexService {
         }
 
         threads[index].title = trimmedName
+        threads[index].name = trimmedName
         debugSyncLog("thread renamed automatically: \(threadId) → \(trimmedName)")
+        sendThreadNameSetRPC(threadId: threadId, name: trimmedName)
         return true
     }
 

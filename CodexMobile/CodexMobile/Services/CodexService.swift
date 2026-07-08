@@ -570,6 +570,8 @@ final class CodexService {
     @ObservationIgnored var canonicalHistoryReconcileRetryTaskByThreadID: [String: Task<Void, Never>] = [:]
     // Coalesces sidebar/bootstrap thread/list refreshes so launch paths do not duplicate the same fetch.
     @ObservationIgnored var threadListFetchTaskByLimit: [Int: (id: UUID, task: Task<[CodexThread], Error>)] = [:]
+    @ObservationIgnored var threadListFullHydrationTask: (id: UUID, task: Task<[CodexThread], Error>)?
+    @ObservationIgnored var completeThreadListHydrationTask: Task<Void, Never>?
     var isAppInForeground = true
     // Network quality flag: when true, sync and keepalive intervals are stretched to reduce
     // bandwidth usage on constrained connections (Low Data Mode, hotspot tethering).
@@ -1077,6 +1079,8 @@ final class CodexService {
             activeThreadSyncTask?.cancel()
             runningThreadWatchSyncTask?.cancel()
             postConnectSyncTask?.cancel()
+            threadListFullHydrationTask?.task.cancel()
+            completeThreadListHydrationTask?.cancel()
             gptAccountLoginSyncTask?.cancel()
 
             notificationObserverTokens.forEach { NotificationCenter.default.removeObserver($0) }

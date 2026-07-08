@@ -11,12 +11,12 @@ import XCTest
 final class CodexServiceThreadListTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
-    func testListThreadsRequestsCappedActiveThreadsAndAppServerSourceKinds() async throws {
+    func testListThreadsRequestsInitialAndCursorPagesAndAppServerSourceKinds() async throws {
         let service = makeService()
         service.isConnected = true
         service.isInitialized = true
 
-        var activeRequestParams: RPCObject?
+        var requestParams: [RPCObject] = []
         var requestCount = 0
 
         service.requestTransportOverride = { method, params in
@@ -29,12 +29,14 @@ final class CodexServiceThreadListTests: XCTestCase {
             }
 
             requestCount += 1
-            activeRequestParams = params?.objectValue
+            let activeRequestParams = params?.objectValue ?? [:]
+            requestParams.append(activeRequestParams)
 
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object([
                     "threads": .array([]),
+                    "nextCursor": requestCount == 1 ? .string("cursor-page-2") : .null,
                 ]),
                 includeJSONRPC: false
             )
@@ -42,11 +44,12 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         try await service.listThreads()
 
-        XCTAssertEqual(activeRequestParams?["limit"]?.intValue, 70)
-        XCTAssertNil(activeRequestParams?["archived"])
-        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(requestParams.map { $0["limit"]?.intValue }, [10, 10])
+        XCTAssertEqual(requestParams.compactMap { $0["cursor"] }, [.null, .string("cursor-page-2")])
+        XCTAssertNil(requestParams.last?["archived"])
+        XCTAssertEqual(requestCount, 2)
         XCTAssertEqual(
-            activeRequestParams?["sourceKinds"]?.arrayValue?.compactMap(\.stringValue),
+            requestParams.last?["sourceKinds"]?.arrayValue?.compactMap(\.stringValue),
             [
                 "cli",
                 "vscode",
@@ -60,6 +63,100 @@ final class CodexServiceThreadListTests: XCTestCase {
                 "unknown",
             ]
         )
+    }
+
+    func testListThreadsPublishesInitialBatchBeforeNextCursorPageReturns() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var requestedLimits: [Int] = []
+        var requestedCursors: [JSONValue] = []
+        var secondPageRequestStarted = false
+        var allowSecondPageResponse: CheckedContinuation<Void, Never>?
+
+        service.requestTransportOverride = { method, params in
+            guard method == "thread/list" else {
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+
+            let requestLimit = params?.objectValue?["limit"]?.intValue
+            if let requestLimit {
+                requestedLimits.append(requestLimit)
+            }
+            if let cursor = params?.objectValue?["cursor"] {
+                requestedCursors.append(cursor)
+            }
+
+            if requestLimit == 10, params?.objectValue?["cursor"] == .null {
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "threads": .array([
+                            .object([
+                                "id": .string("thread-initial"),
+                                "title": .string("Initial thread"),
+                                "updatedAt": .string("2026-07-03T12:00:00Z"),
+                            ]),
+                        ]),
+                        "nextCursor": .string("cursor-page-2"),
+                    ]),
+                    includeJSONRPC: false
+                )
+            }
+
+            if requestLimit == 10, params?.objectValue?["cursor"] == .string("cursor-page-2") {
+                secondPageRequestStarted = true
+                await withCheckedContinuation { continuation in
+                    allowSecondPageResponse = continuation
+                }
+
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "threads": .array([
+                            .object([
+                                "id": .string("thread-expanded"),
+                                "title": .string("Expanded thread"),
+                                "updatedAt": .string("2026-07-03T13:00:00Z"),
+                            ]),
+                            .object([
+                                "id": .string("thread-initial"),
+                                "title": .string("Initial thread"),
+                                "updatedAt": .string("2026-07-03T12:00:00Z"),
+                            ]),
+                        ]),
+                        "nextCursor": .null,
+                    ]),
+                    includeJSONRPC: false
+                )
+            }
+
+            XCTFail("Unexpected thread/list limit \(requestLimit.map { String($0) } ?? "nil")")
+            return RPCMessage(id: .string(UUID().uuidString), result: .object(["threads": .array([])]), includeJSONRPC: false)
+        }
+
+        let refreshTask = Task { @MainActor in
+            try await service.listThreads()
+        }
+
+        await waitUntil { secondPageRequestStarted }
+        XCTAssertEqual(service.threads.map(\.id), ["thread-initial"])
+        XCTAssertTrue(service.isLoadingThreads)
+
+        guard let allowSecondPageResponse else {
+            XCTFail("Expected second thread/list page request to be waiting")
+            refreshTask.cancel()
+            return
+        }
+
+        allowSecondPageResponse.resume()
+        try await refreshTask.value
+
+        XCTAssertEqual(requestedLimits, [10, 10])
+        XCTAssertEqual(requestedCursors, [.null, .string("cursor-page-2")])
+        XCTAssertEqual(service.threads.map(\.id), ["thread-expanded", "thread-initial"])
+        XCTAssertFalse(service.isLoadingThreads)
     }
 
     func testListThreadsRetriesLegacySourceKindsWhenRuntimeRejectsSubagentSources() async throws {
@@ -102,7 +199,7 @@ final class CodexServiceThreadListTests: XCTestCase {
             )
         }
 
-        try await service.listThreads()
+        try await service.listThreads(limit: service.recentActiveThreadListLimit)
 
         XCTAssertEqual(capturedSourceKinds.count, 2)
         XCTAssertTrue(capturedSourceKinds[0].contains("subAgent"))
@@ -136,15 +233,46 @@ final class CodexServiceThreadListTests: XCTestCase {
             )
         }
 
-        try await service.listThreads()
+        try await service.listThreads(limit: service.recentActiveThreadListLimit)
         XCTAssertEqual(service.threads.map(\.id), ["thread-active"])
         XCTAssertFalse(service.isLoadingThreads)
     }
 
-    func testRealtimeSyncKeepsThreadListRequestsCapped() async {
+    func testRealtimeSyncRequestsInitialPageFirstWhenLocalThreadListIsEmpty() async {
         let service = makeService()
         service.isConnected = true
         service.isInitialized = true
+
+        var requestedLimits: [Int] = []
+
+        service.requestTransportOverride = { method, params in
+            guard method == "thread/list" else {
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+
+            if let limit = params?.objectValue?["limit"]?.intValue {
+                requestedLimits.append(limit)
+            }
+
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["threads": .array([])]),
+                includeJSONRPC: false
+            )
+        }
+
+        await service.syncThreadsList()
+
+        XCTAssertEqual(requestedLimits, [10])
+    }
+
+    func testRealtimeSyncKeepsPopulatedThreadListRequestsCapped() async {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.threads = [
+            CodexThread(id: "thread-existing", title: "Existing thread"),
+        ]
 
         var activeRequestParams: RPCObject?
         var requestCount = 0
@@ -166,9 +294,122 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         await service.syncThreadsList()
 
-        XCTAssertEqual(activeRequestParams?["limit"]?.intValue, 70)
+        XCTAssertEqual(activeRequestParams?["limit"]?.intValue, 10)
         XCTAssertNil(activeRequestParams?["archived"])
         XCTAssertEqual(requestCount, 1)
+    }
+
+    func testPostConnectSyncRequestsInitialThreadListPageFirst() async {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var requestedLimits: [Int] = []
+
+        service.requestTransportOverride = { method, params in
+            guard method == "thread/list" else {
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+
+            if let limit = params?.objectValue?["limit"]?.intValue {
+                requestedLimits.append(limit)
+            }
+
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["threads": .array([])]),
+                includeJSONRPC: false
+            )
+        }
+
+        await service.performPostConnectSyncPass()
+        await waitUntil { requestedLimits.count >= 2 }
+
+        XCTAssertEqual(requestedLimits, [10, 10])
+    }
+
+    func testPostConnectStartsExpandedThreadListBeforeActiveCatchupFinishes() async {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var requestedLimits: [Int] = []
+        var catchupStarted = false
+        var allowCatchupResponse: CheckedContinuation<Void, Never>?
+
+        service.requestTransportOverride = { method, params in
+            if method == "thread/list" {
+                if let limit = params?.objectValue?["limit"]?.intValue {
+                    requestedLimits.append(limit)
+                }
+
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "threads": .array([
+                            .object([
+                                "id": .string("thread-active"),
+                                "title": .string("Active thread"),
+                            ]),
+                        ]),
+                    ]),
+                    includeJSONRPC: false
+                )
+            }
+
+            if method == "thread/turns/list" {
+                catchupStarted = true
+                await withCheckedContinuation { continuation in
+                    allowCatchupResponse = continuation
+                }
+
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["turns": .array([])]),
+                    includeJSONRPC: false
+                )
+            }
+
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+
+        let postConnectTask = Task { @MainActor in
+            await service.performPostConnectSyncPass()
+        }
+
+        await waitUntil { catchupStarted && requestedLimits == [10, 10] }
+        XCTAssertTrue(catchupStarted)
+        XCTAssertEqual(requestedLimits, [10, 10])
+
+        allowCatchupResponse?.resume()
+        await postConnectTask.value
+    }
+
+    func testRealtimeSyncDoesNotRequestThreadListDuringConnectionBootstrap() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.isBootstrappingConnectionSync = true
+
+        var threadListRequestCount = 0
+
+        service.requestTransportOverride = { method, _ in
+            if method == "thread/list" {
+                threadListRequestCount += 1
+            }
+
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["threads": .array([])]),
+                includeJSONRPC: false
+            )
+        }
+
+        service.startSyncLoop()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        service.stopSyncLoop()
+
+        XCTAssertEqual(threadListRequestCount, 0)
     }
 
     func testConcurrentListThreadsShareInFlightRequest() async throws {
@@ -177,13 +418,17 @@ final class CodexServiceThreadListTests: XCTestCase {
         service.isInitialized = true
 
         var requestCount = 0
+        var requestedLimits: [Int] = []
 
-        service.requestTransportOverride = { method, _ in
+        service.requestTransportOverride = { method, params in
             guard method == "thread/list" else {
                 return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
             }
 
             requestCount += 1
+            if let limit = params?.objectValue?["limit"]?.intValue {
+                requestedLimits.append(limit)
+            }
             try await Task.sleep(nanoseconds: 50_000_000)
 
             return RPCMessage(
@@ -206,6 +451,7 @@ final class CodexServiceThreadListTests: XCTestCase {
         try await firstRefresh.value
         try await secondRefresh.value
 
+        XCTAssertEqual(requestedLimits, [10])
         XCTAssertEqual(requestCount, 1)
         XCTAssertEqual(service.threads.map(\.id), ["thread-active"])
         XCTAssertFalse(service.isLoadingThreads)
@@ -215,6 +461,9 @@ final class CodexServiceThreadListTests: XCTestCase {
         let service = makeService()
         service.isConnected = true
         service.isInitialized = true
+        service.threads = [
+            CodexThread(id: "thread-existing", title: "Existing thread"),
+        ]
 
         var requestCount = 0
 
@@ -240,7 +489,9 @@ final class CodexServiceThreadListTests: XCTestCase {
             )
         }
 
-        let sidebarRefresh = Task { @MainActor in try await service.listThreads() }
+        let sidebarRefresh = Task { @MainActor in
+            try await service.listThreads(limit: service.recentActiveThreadListLimit)
+        }
         try await Task.sleep(nanoseconds: 10_000_000)
 
         await service.syncThreadsList()
@@ -411,6 +662,52 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         XCTAssertEqual(service.thread(for: threadID)?.gitWorkingDirectory, "/tmp/new-repo")
         XCTAssertEqual(timelineState.messageRevision, 7)
+    }
+
+    func testThreadListReconcileRevivesNonPersistedMissingThreadArchive() {
+        let service = makeService()
+        service.threads = [
+            CodexThread(
+                id: "thread-temporary-missing",
+                title: "Still Live",
+                cwd: "/tmp/repo"
+            ),
+        ]
+
+        service.handleMissingThread("thread-temporary-missing")
+        XCTAssertEqual(service.thread(for: "thread-temporary-missing")?.syncState, .archivedLocal)
+
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(
+                id: "thread-temporary-missing",
+                title: "Still Live",
+                cwd: "/tmp/repo"
+            ),
+        ])
+
+        XCTAssertEqual(service.thread(for: "thread-temporary-missing")?.syncState, .live)
+    }
+
+    func testThreadListReconcileKeepsPersistedUserArchiveArchived() {
+        let service = makeService()
+        service.threads = [
+            CodexThread(
+                id: "thread-user-archived",
+                title: "Archived",
+                cwd: "/tmp/repo"
+            ),
+        ]
+
+        service.archiveThread("thread-user-archived")
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(
+                id: "thread-user-archived",
+                title: "Archived",
+                cwd: "/tmp/repo"
+            ),
+        ])
+
+        XCTAssertEqual(service.thread(for: "thread-user-archived")?.syncState, .archivedLocal)
     }
 
     private func makeService() -> CodexService {

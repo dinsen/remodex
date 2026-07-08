@@ -494,6 +494,7 @@ function collectRecentRolloutFiles(
       candidates.push({
         filePath: fullPath,
         mtimeMs: stat.mtimeMs,
+        size: stat.size,
       });
     }
   }

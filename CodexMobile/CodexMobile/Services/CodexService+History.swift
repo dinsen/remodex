@@ -5,7 +5,6 @@
 // Depends on: CodexMessage, JSONValue
 
 import Foundation
-import UIKit
 
 fileprivate struct UserMessageSemanticKey: Equatable {
     let text: String
@@ -601,18 +600,9 @@ extension CodexService {
                 payloadDataURL = nil
             }
 
-            let thumbnailBase64: String
-            if let payloadDataURL,
-               let rawImageData = decodeDataURIImageData(payloadDataURL),
-               let thumbnail = makeThumbnailBase64JPEG(from: rawImageData) {
-                thumbnailBase64 = thumbnail
-            } else {
-                thumbnailBase64 = ""
-            }
-
             attachments.append(
                 CodexImageAttachment(
-                    thumbnailBase64JPEG: thumbnailBase64,
+                    thumbnailBase64JPEG: "",
                     payloadDataURL: payloadDataURL,
                     sourceURL: sourceURL
                 )
@@ -2024,48 +2014,6 @@ extension CodexService {
             .visibleTextRemovingImageSyntax(from: text)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
-    }
-
-    // Parses `data:image/...;base64,...` payloads into raw image bytes.
-    func decodeDataURIImageData(_ dataURI: String) -> Data? {
-        guard let commaIndex = dataURI.firstIndex(of: ",") else {
-            return nil
-        }
-
-        let metadata = dataURI[..<commaIndex].lowercased()
-        guard metadata.hasPrefix("data:image"),
-              metadata.contains(";base64") else {
-            return nil
-        }
-
-        let payloadStart = dataURI.index(after: commaIndex)
-        let base64Part = String(dataURI[payloadStart...])
-        return Data(base64Encoded: base64Part)
-    }
-
-    // Produces the persisted 70x70 JPEG thumbnail preview used in message rows.
-    func makeThumbnailBase64JPEG(from imageData: Data, side: CGFloat = 70) -> String? {
-        guard let image = UIImage(data: imageData) else {
-            return nil
-        }
-
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: side, height: side))
-        let rendered = renderer.image { _ in
-            let sourceSize = image.size
-            let scale = max(side / sourceSize.width, side / sourceSize.height)
-            let scaledSize = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
-            let origin = CGPoint(
-                x: (side - scaledSize.width) / 2,
-                y: (side - scaledSize.height) / 2
-            )
-            image.draw(in: CGRect(origin: origin, size: scaledSize))
-        }
-
-        guard let jpegData = rendered.jpegData(compressionQuality: 0.8) else {
-            return nil
-        }
-
-        return jpegData.base64EncodedString()
     }
 
     func decodeReasoningItemText(from itemObject: [String: JSONValue]) -> String {

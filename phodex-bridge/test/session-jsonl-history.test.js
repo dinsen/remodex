@@ -4,6 +4,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  parseSessionIndexThreadNames,
   parseSessionJsonlMetadata,
   parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
@@ -84,6 +85,24 @@ test("parseSessionJsonlThreadSummary reads delegated worktree thread metadata", 
     createdAt: "2026-06-25T14:21:38.598Z",
     updatedAt: "2026-06-26T06:44:09.072Z",
   });
+});
+
+test("parseSessionIndexThreadNames reads Codex desktop thread names", () => {
+  const names = parseSessionIndexThreadNames([
+    JSON.stringify({
+      id: "thread-indexed",
+      thread_name: "Fix Xcode Logging Timeout",
+      updated_at: "2026-06-26T09:18:49.605617Z",
+    }),
+    JSON.stringify({
+      id: "thread-renamed",
+      threadName: "Rename From Desktop",
+    }),
+    "",
+  ].join("\n"));
+
+  assert.equal(names.get("thread-indexed"), "Fix Xcode Logging Timeout");
+  assert.equal(names.get("thread-renamed"), "Rename From Desktop");
 });
 
 test("readThreadTurnsListPageFromSessionJsonl builds a recent turns page from rollout JSONL", () => {

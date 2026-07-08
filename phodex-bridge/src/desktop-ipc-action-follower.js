@@ -29,6 +29,7 @@ const REPLY_METHOD_BY_ACTION_METHOD = new Map([
 ]);
 const METHOD_VERSION_BY_NAME = new Map([
   ["initialize", 1],
+  ["thread-follower-start-turn", 1],
   ["thread-follower-command-approval-decision", 1],
   ["thread-follower-file-approval-decision", 1],
   ["thread-follower-submit-user-input", 1],
@@ -82,6 +83,28 @@ function createDesktopIpcActionFollower({
     activeThreadIds.add(threadId);
     ipc.ensureConnected();
     return false;
+  }
+
+  function startTurn(request) {
+    if (!request || typeof request !== "object" || request.method !== "turn/start") {
+      return Promise.reject(new Error("Expected turn/start request."));
+    }
+
+    const requestId = requestIdKey(request.id);
+    const params = request.params && typeof request.params === "object" && !Array.isArray(request.params)
+      ? request.params
+      : {};
+    const threadId = readThreadId(params);
+    if (!requestId || !threadId) {
+      return Promise.reject(new Error("Missing turn/start request id or thread id."));
+    }
+
+    activeThreadIds.add(threadId);
+    return ipc.sendRequest("thread-follower-start-turn", {
+      ...params,
+      conversationId: threadId,
+      threadId,
+    });
   }
 
   function stopAll() {
@@ -308,6 +331,7 @@ function createDesktopIpcActionFollower({
 
   return {
     observeInbound,
+    startTurn,
     stopAll,
   };
 }

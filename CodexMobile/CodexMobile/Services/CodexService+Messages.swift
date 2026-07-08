@@ -808,7 +808,7 @@ extension CodexService {
             try await ensureThreadResumed(threadId: threadId)
         } catch {
             if shouldTreatAsThreadNotFound(error) {
-                handleMissingThread(threadId)
+                debugSyncLog("display thread/resume reported missing thread=\(threadId); waiting for send-time confirmation")
             }
             return false
         }

@@ -80,6 +80,7 @@ function parseSessionJsonlMetadata(content) {
 
 function parseSessionJsonlThreadSummary(content, {
   fallbackUpdatedAt = "",
+  threadName = "",
 } = {}) {
   let threadId = "";
   let cwd = "";
@@ -90,6 +91,7 @@ function parseSessionJsonlThreadSummary(content, {
   let updatedAt = normalizeString(fallbackUpdatedAt);
   let preview = "";
   let parentThreadId = "";
+  const title = normalizeString(threadName);
 
   const raw = String(content || "");
   let lineStart = 0;
@@ -154,7 +156,7 @@ function parseSessionJsonlThreadSummary(content, {
     preview ||= extractThreadSummaryPreview(message);
   }
 
-  return {
+  const summary = {
     threadId,
     cwd,
     source,
@@ -165,6 +167,53 @@ function parseSessionJsonlThreadSummary(content, {
     createdAt: createdAt || updatedAt,
     updatedAt: updatedAt || createdAt,
   };
+
+  if (title) {
+    summary.title = title;
+    summary.name = title;
+  }
+
+  return summary;
+}
+
+function parseSessionIndexThreadNames(content) {
+  const namesById = new Map();
+
+  const raw = String(content || "");
+  let lineStart = 0;
+  while (lineStart < raw.length) {
+    let lineEnd = raw.indexOf("\n", lineStart);
+    if (lineEnd === -1) {
+      lineEnd = raw.length;
+    }
+    const line = raw.substring(lineStart, lineEnd).trim();
+    lineStart = lineEnd + 1;
+    if (!line) {
+      continue;
+    }
+
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const threadId = normalizeString(entry?.id)
+      || normalizeString(entry?.thread_id)
+      || normalizeString(entry?.threadId);
+    const threadName = normalizeString(entry?.thread_name)
+      || normalizeString(entry?.threadName)
+      || normalizeString(entry?.name)
+      || normalizeString(entry?.title);
+    if (!threadId || !threadName) {
+      continue;
+    }
+
+    namesById.set(threadId, threadName);
+  }
+
+  return namesById;
 }
 
 function parseSessionJsonlTurns(content, { threadId = "" } = {}) {
@@ -1219,6 +1268,7 @@ function normalizeString(value) {
 
 module.exports = {
   parseSessionJsonlMetadata,
+  parseSessionIndexThreadNames,
   parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
   readThreadTurnsListPageFromSessionJsonl,

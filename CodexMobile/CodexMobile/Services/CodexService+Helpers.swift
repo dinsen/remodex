@@ -43,7 +43,7 @@ extension CodexService {
             return activeThreadId
         }
 
-        let newThread = try await startThread()
+        let newThread = try await startThreadIfReady()
         return newThread.id
     }
 

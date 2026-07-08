@@ -92,6 +92,33 @@ final class CodexServiceThreadDisplayPhaseTests: XCTestCase {
         XCTAssertTrue(service.canLoadOlderThreadHistory(threadId: threadID))
     }
 
+    func testPrepareThreadForDisplayKeepsThreadLiveWhenResumeReportsMissing() async {
+        let service = makeService()
+        service.isConnected = true
+        service.upsertThread(CodexThread(id: "thread-selected", title: "Selected"))
+
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            switch method {
+            case "thread/resume":
+                throw CodexServiceError.rpcError(
+                    RPCError(code: -32000, message: "thread not found")
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        let didPrepare = await service.prepareThreadForDisplay(threadId: "thread-selected")
+
+        XCTAssertFalse(didPrepare)
+        XCTAssertEqual(recordedMethods, ["thread/resume"])
+        XCTAssertEqual(service.activeThreadId, "thread-selected")
+        XCTAssertEqual(service.thread(for: "thread-selected")?.syncState, .live)
+    }
+
     private func makeService() -> CodexService {
         let suiteName = "CodexServiceThreadDisplayPhaseTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard

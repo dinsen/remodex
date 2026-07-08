@@ -1311,17 +1311,15 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             && !(isSuppressingBottomCorrectionsForWarmup && !new.isAtBottom)
         let nextViewportHeight = new.viewportHeight
 
-        Task { @MainActor in
-            if nextViewportHeight > 0, abs(nextViewportHeight - viewportHeight) > 1 {
-                viewportHeight = nextViewportHeight
-                performInitialRecoverySnapIfNeeded(using: proxy)
-            }
-            if shouldScheduleFollowBottom || shouldCorrectForContentHeight {
-                scheduleFollowBottomScroll(using: proxy)
-            }
-            if bottomChanged {
-                handleScrolledToBottomChanged(new.isAtBottom)
-            }
+        if nextViewportHeight > 0, abs(nextViewportHeight - viewportHeight) > 1 {
+            viewportHeight = nextViewportHeight
+            performInitialRecoverySnapIfNeeded(using: proxy)
+        }
+        if shouldScheduleFollowBottom || shouldCorrectForContentHeight {
+            scheduleFollowBottomScroll(using: proxy)
+        }
+        if bottomChanged {
+            handleScrolledToBottomChanged(new.isAtBottom)
         }
         debugTimelineLog(
             "applyScrollGeometryUpdate oldBottom=\(old.isAtBottom) newBottom=\(new.isAtBottom) "

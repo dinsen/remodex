@@ -284,9 +284,13 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
             overridesReasoning: true,
             overridesServiceTier: true
         )
-        let thread = try await service.startThread(runtimeOverride: override)
+        let thread = try await service.startThread(
+            preferredProjectPath: "/tmp/project",
+            runtimeOverride: override
+        )
 
         XCTAssertEqual(thread.id, "thread-new")
+        XCTAssertEqual(capturedThreadStartParams.first?.objectValue?["cwd"]?.stringValue, "/tmp/project")
         XCTAssertEqual(capturedThreadStartParams.first?.objectValue?["serviceTier"]?.stringValue, "fast")
         XCTAssertEqual(service.effectiveServiceTier(for: "thread-new"), .fast)
         XCTAssertTrue(service.hydratedThreadIDs.contains("thread-new"))
@@ -321,8 +325,12 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
             overridesReasoning: true,
             overridesServiceTier: true
         )
-        _ = try await service.startThread(runtimeOverride: override)
+        _ = try await service.startThread(
+            preferredProjectPath: "/tmp/project",
+            runtimeOverride: override
+        )
 
+        XCTAssertEqual(capturedThreadStartParams.first?.objectValue?["cwd"]?.stringValue, "/tmp/project")
         XCTAssertNil(capturedThreadStartParams.first?.objectValue?["serviceTier"]?.stringValue)
     }
 

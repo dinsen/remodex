@@ -12,6 +12,7 @@ private enum ThreadTurnStateSnapshotPolicy {
 }
 
 private enum ThreadListHydrationPolicy {
+    static let initialVisibleThreadLimit = 10
     static let requestTimeoutNanoseconds: UInt64 = 12_000_000_000
 }
 
@@ -55,7 +56,8 @@ struct CodexPreAppendedTurnMessage: Sendable {
 
 extension CodexService {
     // Sidebar loads stay capped so reconnect/bootstrap cannot pull an entire local history at once.
-    var recentActiveThreadListLimit: Int { 70 }
+    var recentActiveThreadListLimit: Int { ThreadListHydrationPolicy.initialVisibleThreadLimit }
+    var initialVisibleThreadListLimit: Int { ThreadListHydrationPolicy.initialVisibleThreadLimit }
 
     // Encodes manual approval replies using the app-server decision object shape.
     func approvalDecisionResult(_ decision: String) -> JSONValue {
@@ -126,14 +128,51 @@ extension CodexService {
             flushPendingRuntimeOptionRefreshIfPossible()
         }
 
-        let activeLimit = limit ?? recentActiveThreadListLimit
+        if let limit {
+            let activeThreads = try await fetchCoalescedServerThreads(limit: limit)
+            applyThreadListHydration(activeThreads)
+            return
+        }
 
-        let activeThreads = try await fetchCoalescedServerThreads(limit: activeLimit)
-        reconcileLocalThreadsWithServer(activeThreads)
+        if let existingFetch = threadListFullHydrationTask {
+            _ = try await existingFetch.task.value
+            return
+        }
+
+        let fetchID = UUID()
+        let task = Task { @MainActor in
+            try await self.fetchServerThreads(
+                limit: self.initialVisibleThreadListLimit,
+                paginateLimitedPages: true
+            ) { _, accumulatedThreads in
+                self.applyThreadListHydration(accumulatedThreads)
+            }
+        }
+        threadListFullHydrationTask = (id: fetchID, task: task)
+        defer {
+            if threadListFullHydrationTask?.id == fetchID {
+                threadListFullHydrationTask = nil
+            }
+        }
+
+        _ = try await task.value
+    }
+
+    private func applyThreadListHydration(_ threads: [CodexThread]) {
+        reconcileLocalThreadsWithServer(threads)
 
         if activeThreadId == nil {
             activeThreadId = firstLiveThreadID()
         }
+    }
+
+    func cancelThreadListHydrationForInteractiveRequest() {
+        completeThreadListHydrationTask?.cancel()
+        completeThreadListHydrationTask = nil
+        threadListFullHydrationTask?.task.cancel()
+        threadListFullHydrationTask = nil
+        threadListFetchTaskByLimit.values.forEach { $0.task.cancel() }
+        threadListFetchTaskByLimit.removeAll()
     }
 
     // Preserves the older startThread symbol used by most call sites and incremental builds.
@@ -167,7 +206,9 @@ extension CodexService {
         pendingComposerAction: CodexPendingThreadComposerAction? = nil,
         runtimeOverride: CodexThreadRuntimeOverride? = nil
     ) async throws -> CodexThread {
-        let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath)
+        guard let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath) else {
+            throw CodexServiceError.invalidInput("thread/start requires a project path or rootless chat path")
+        }
         // Brand-new chats start from app defaults; per-chat overrides are inherited only on continuation.
         let explicitServiceTier = runtimeOverride?.overridesServiceTier == true
             ? normalizedServiceTierForSelectedModel(runtimeOverride?.serviceTier)?.rawValue
@@ -208,8 +249,7 @@ extension CodexService {
                 hydratedThreadIDs.insert(thread.id)
                 initialTurnsLoadedByThreadID.insert(thread.id)
                 upsertThread(thread, treatAsServerState: true)
-                if let normalizedPreferredProjectPath,
-                   decodedThread.normalizedProjectPath != normalizedPreferredProjectPath {
+                if decodedThread.normalizedProjectPath != normalizedPreferredProjectPath {
                     beginAuthoritativeProjectPathTransition(
                         threadId: thread.id,
                         projectPath: normalizedPreferredProjectPath
@@ -292,8 +332,10 @@ extension CodexService {
                 || hasRenderableStructuredMentions(skillMentions: skillMentions, mentionMentions: mentionMentions) else {
             throw CodexServiceError.invalidInput("User input, images, and mentions cannot all be empty")
         }
+        cancelThreadListHydrationForInteractiveRequest()
 
         let initialThreadId = try await resolveThreadID(threadId)
+        let initialThreadProjectPath = thread(for: initialThreadId)?.gitWorkingDirectory
         let effectiveCollaborationMode = collaborationModeForOutgoingTurn(
             threadId: initialThreadId,
             requestedMode: collaborationMode,
@@ -347,19 +389,7 @@ extension CodexService {
             try await ensureThreadResumed(threadId: initialThreadId)
         } catch {
             if shouldTreatAsThreadNotFound(error) {
-                try await sendTurnToContinuationAfterMissingThread(
-                    archivedThreadId: initialThreadId,
-                    pendingMessageId: preResumePendingMessageId,
-                    automaticTitleSeed: preResumeTitleSeed,
-                    userInput: trimmedInput,
-                    attachments: attachments,
-                    skillMentions: skillMentions,
-                    mentionMentions: mentionMentions,
-                    fileMentions: fileMentions,
-                    shouldAppendUserMessage: shouldAppendOnContinuation,
-                    collaborationMode: effectiveCollaborationMode
-                )
-                return
+                debugSyncLog("thread/resume reported missing thread=\(initialThreadId); trying turn/start before continuation")
             }
         }
 
@@ -382,6 +412,7 @@ extension CodexService {
                 // Some server states can make thread/read flaky, so we avoid blocking on a second check.
                 try await sendTurnToContinuationAfterMissingThread(
                     archivedThreadId: initialThreadId,
+                    continuationProjectPath: initialThreadProjectPath,
                     pendingMessageId: preResumePendingMessageId,
                     automaticTitleSeed: preResumeTitleSeed,
                     userInput: trimmedInput,
@@ -403,6 +434,7 @@ extension CodexService {
     // Preserves the optimistic user row while recovering a send from an archived or missing thread.
     private func sendTurnToContinuationAfterMissingThread(
         archivedThreadId: String,
+        continuationProjectPath: String?,
         pendingMessageId: String,
         automaticTitleSeed: String?,
         userInput: String,
@@ -417,9 +449,10 @@ extension CodexService {
         var recoveryMessageId = pendingMessageId
 
         do {
-            handleMissingThread(archivedThreadId)
-
-            let continuationThread = try await createContinuationThread(from: archivedThreadId)
+            let continuationThread = try await createContinuationThread(
+                from: archivedThreadId,
+                preferredProjectPath: continuationProjectPath
+            )
             migratePlanSessionState(from: archivedThreadId, to: continuationThread.id)
 
             let movedMessage = movePreAppendedOutgoingUserMessage(
@@ -449,6 +482,7 @@ extension CodexService {
                 preAppendedUserMessageID: movedMessage?.messageID,
                 automaticTitleSeedOverride: movedMessage?.automaticTitleSeed ?? automaticTitleSeed
             )
+            handleMissingThread(archivedThreadId)
             activeThreadId = continuationThread.id
             lastErrorMessage = nil
         } catch {
@@ -1138,6 +1172,7 @@ extension CodexService {
 
     func fetchServerThreads(
         limit: Int? = nil,
+        paginateLimitedPages: Bool = false,
         onPage: ((_ page: [CodexThread], _ accumulatedThreads: [CodexThread]) -> Void)? = nil
     ) async throws -> [CodexThread] {
         var allThreads: [CodexThread] = []
@@ -1170,9 +1205,13 @@ extension CodexService {
             onPage?(pageResult.threads, allThreads)
             nextCursor = pageResult.nextCursor
             hasRequestedFirstPage = true
+            if paginateLimitedPages {
+                await Task.yield()
+            }
         } while shouldContinueThreadListPagination(
             nextCursor: nextCursor,
             limit: limit,
+            paginateLimitedPages: paginateLimitedPages,
             hasRequestedFirstPage: hasRequestedFirstPage
         )
 
@@ -1276,9 +1315,10 @@ extension CodexService {
     private func shouldContinueThreadListPagination(
         nextCursor: JSONValue,
         limit: Int?,
+        paginateLimitedPages: Bool,
         hasRequestedFirstPage: Bool
     ) -> Bool {
-        guard hasRequestedFirstPage, limit == nil else {
+        guard hasRequestedFirstPage, limit == nil || paginateLimitedPages else {
             return false
         }
 
@@ -1292,12 +1332,20 @@ extension CodexService {
         }
     }
 
-    func createContinuationThread(from archivedThreadId: String) async throws -> CodexThread {
+    func createContinuationThread(
+        from archivedThreadId: String,
+        preferredProjectPath: String? = nil
+    ) async throws -> CodexThread {
         let continuationRuntimeOverride = threadRuntimeOverride(for: archivedThreadId)
-        let continuationThread = try await startThread(runtimeOverride: continuationRuntimeOverride)
+        let continuationProjectPath = preferredProjectPath ?? thread(for: archivedThreadId)?.gitWorkingDirectory
+        let continuationThread = try await startThreadIfReady(
+            preferredProjectPath: continuationProjectPath,
+            rootlessChatPromptHint: "continued from \(archivedThreadId)",
+            runtimeOverride: continuationRuntimeOverride
+        )
         appendSystemMessage(
             threadId: continuationThread.id,
-            text: "Continued from archived thread `\(archivedThreadId)`"
+            text: "Continued from unavailable thread `\(archivedThreadId)`"
         )
         return continuationThread
     }
@@ -1390,6 +1438,10 @@ extension CodexService {
             if let threadValue = resultObject["thread"],
                var decodedThread = decodeModel(CodexThread.self, from: threadValue) {
                 decodedThread.syncState = .live
+                decodedThread = CodexThreadStartProjectBinding.applyPreferredProjectFallback(
+                    to: decodedThread,
+                    preferredProjectPath: requestedSignature.projectPath
+                )
                 upsertThread(decodedThread, treatAsServerState: true)
                 resumedThread = decodedThread
 
@@ -1595,6 +1647,7 @@ extension CodexService {
         preAppendedUserMessageID: String? = nil,
         automaticTitleSeedOverride: String? = nil
     ) async throws {
+        cancelThreadListHydrationForInteractiveRequest()
         let outgoingDisplayText = displayTextForOutgoingTurn(
             userInput: userInput,
             skillMentions: skillMentions,
@@ -1644,6 +1697,8 @@ extension CodexService {
         var effectiveCollaborationMode = supportsTurnCollaborationMode ? collaborationMode : nil
         var didDowngradePlanModeForRuntime = false
         var includesServiceTier = runtimeServiceTierForTurn(threadId: threadId) != nil
+        let turnStartProjectPath = thread(for: threadId)?.gitWorkingDirectory
+        var includesTurnStartProjectPath = turnStartProjectPath != nil
 
         if collaborationMode != nil, effectiveCollaborationMode == nil {
             debugRuntimeLog(
@@ -1663,7 +1718,9 @@ extension CodexService {
                     includeStructuredSkillItems: includeStructuredSkillItems,
                     includeStructuredMentionItems: includeStructuredMentionItems,
                     collaborationMode: effectiveCollaborationMode,
-                    includeServiceTier: includesServiceTier
+                    includeServiceTier: includesServiceTier,
+                    projectPath: turnStartProjectPath,
+                    includeProjectPath: includesTurnStartProjectPath
                 )
                 // The pre-turn snapshot must settle before the runtime can mutate files.
                 if let messageStartCheckpointTask {
@@ -1734,6 +1791,12 @@ extension CodexService {
                 }
 
                 if consumeUnsupportedServiceTier(error, includesServiceTier: &includesServiceTier) {
+                    continue
+                }
+
+                if includesTurnStartProjectPath,
+                   shouldRetryTurnStartWithoutProjectPath(error) {
+                    includesTurnStartProjectPath = false
                     continue
                 }
 
@@ -2518,7 +2581,9 @@ extension CodexService {
         includeStructuredSkillItems: Bool,
         includeStructuredMentionItems: Bool,
         collaborationMode: CodexCollaborationModeKind?,
-        includeServiceTier: Bool
+        includeServiceTier: Bool,
+        projectPath: String? = nil,
+        includeProjectPath: Bool = false
     ) throws -> RPCObject {
         var params: RPCObject = [
             "threadId": .string(threadId),
@@ -2545,6 +2610,10 @@ extension CodexService {
         if includeServiceTier,
            let serviceTier = runtimeServiceTierForTurn(threadId: threadId) {
             params["serviceTier"] = .string(serviceTier)
+        }
+        if includeProjectPath,
+           let projectPath {
+            params["cwd"] = .string(projectPath)
         }
         if let collaborationModePayload = try buildCollaborationModePayload(
             for: collaborationMode,
@@ -2899,6 +2968,37 @@ extension CodexService {
             || message.contains("unknown field")
             || message.contains("expected")
             || message.contains("invalid")
+    }
+
+    // Detects older runtimes that reject `cwd` on turn/start even though newer
+    // local runtimes need it to keep already-resumed replies in the right folder.
+    func shouldRetryTurnStartWithoutProjectPath(_ error: Error) -> Bool {
+        guard let serviceError = error as? CodexServiceError,
+              case .rpcError(let rpcError) = serviceError else {
+            return false
+        }
+
+        guard rpcError.code == -32600 || rpcError.code == -32602 || rpcError.code == -32000 else {
+            return false
+        }
+
+        let message = rpcError.message.lowercased()
+        let mentionsProjectPathField = message.contains("cwd")
+            || message.contains("currentworkingdirectory")
+            || message.contains("current_working_directory")
+            || message.contains("workingdirectory")
+            || message.contains("working_directory")
+            || message.contains("working directory")
+        guard mentionsProjectPathField else {
+            return false
+        }
+
+        return message.contains("unknown")
+            || message.contains("unsupported")
+            || message.contains("unexpected")
+            || message.contains("unrecognized")
+            || message.contains("invalid")
+            || message.contains("field")
     }
 
     // Detects legacy servers that reject input items with `type: "skill"`.

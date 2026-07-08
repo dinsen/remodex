@@ -26,7 +26,7 @@ function makeTempHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "remodex-project-handler-"));
 }
 
-test("project/quickLocations only returns existing allowed folders", async () => {
+test("project/quickLocations only returns existing allowed non-home folders", async () => {
   const homeDir = makeTempHome();
   fs.mkdirSync(path.join(homeDir, "Developer"));
 
@@ -34,7 +34,7 @@ test("project/quickLocations only returns existing allowed folders", async () =>
 
   assert.deepEqual(
     result.locations.map((location) => location.id),
-    ["home", "developer"]
+    ["developer"]
   );
 });
 

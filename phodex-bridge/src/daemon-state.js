@@ -74,11 +74,19 @@ function clearPairingSession({ fsImpl = fs, ...options } = {}) {
 }
 
 // Captures the last known service heartbeat so `remodex status` does not depend on launchctl output alone.
-function writeBridgeStatus(status, { now = () => Date.now(), ...options } = {}) {
-  writeJsonFile(resolveBridgeStatusPath(options), {
-    ...status,
-    updatedAt: new Date(now()).toISOString(),
-  }, options);
+function writeBridgeStatus(status, { now = () => Date.now(), onWriteError, ...options } = {}) {
+  try {
+    writeJsonFile(resolveBridgeStatusPath(options), {
+      ...status,
+      updatedAt: new Date(now()).toISOString(),
+    }, options);
+    return true;
+  } catch (error) {
+    if (typeof onWriteError === "function") {
+      onWriteError(error);
+    }
+    return false;
+  }
 }
 
 function readBridgeStatus(options = {}) {

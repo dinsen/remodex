@@ -72,6 +72,32 @@ test("daemon-state creates the logs directory and derived log paths inside the s
   });
 });
 
+test("daemon-state treats bridge status writes as best-effort", () => {
+  withTempDaemonEnv(() => {
+    const error = Object.assign(new Error("no space left on device"), {
+      code: "ENOSPC",
+    });
+    const errors = [];
+    const result = writeBridgeStatus(
+      { state: "running", connectionStatus: "connected" },
+      {
+        fsImpl: {
+          mkdirSync() {},
+          writeFileSync() {
+            throw error;
+          },
+        },
+        onWriteError(writeError) {
+          errors.push(writeError);
+        },
+      }
+    );
+
+    assert.equal(result, false);
+    assert.deepEqual(errors, [error]);
+  });
+});
+
 function withTempDaemonEnv(run) {
   const previousDir = process.env.REMODEX_DEVICE_STATE_DIR;
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-daemon-state-"));

@@ -5,6 +5,10 @@
 
 import SwiftUI
 
+private enum SidebarThreadListLayout {
+    static let projectThreadLeadingInset: CGFloat = 12
+}
+
 struct SidebarThreadListView: View {
     var isFiltering: Bool = false
     let isConnected: Bool
@@ -184,7 +188,8 @@ struct SidebarThreadListView: View {
                 ForEach(visibleRootThreads) { thread in
                     threadRowTree(
                         thread,
-                        childrenByParentID: hierarchy.childrenByParentID
+                        childrenByParentID: hierarchy.childrenByParentID,
+                        leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
                     )
                 }
 
@@ -247,7 +252,8 @@ struct SidebarThreadListView: View {
                         ForEach(hierarchy.rootThreads) { thread in
                             threadRowTree(
                                 thread,
-                                childrenByParentID: hierarchy.childrenByParentID
+                                childrenByParentID: hierarchy.childrenByParentID,
+                                leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
                             )
                         }
                     }
@@ -261,7 +267,8 @@ struct SidebarThreadListView: View {
         _ thread: CodexThread,
         childrenByParentID: [String: [CodexThread]],
         ancestorThreadIDs: Set<String> = [],
-        pinnedRootThreadIDs: Set<String> = []
+        pinnedRootThreadIDs: Set<String> = [],
+        leadingInset: CGFloat = 0
     ) -> AnyView {
         let childThreads = childrenByParentID[thread.id] ?? []
         let isExpanded = expandedSubagentParentIDs.contains(thread.id)
@@ -277,18 +284,20 @@ struct SidebarThreadListView: View {
                     toggleSubagentExpansion(parentThreadID: thread.id)
                 }
             )
+            .padding(.leading, leadingInset)
 
             if isExpanded, !childThreads.isEmpty {
                 VStack(spacing: 2) {
                     ForEach(childThreads) { childThread in
                         if nextAncestorThreadIDs.contains(childThread.id) {
-                            AnyView(threadRow(childThread))
+                            AnyView(threadRow(childThread).padding(.leading, leadingInset))
                         } else {
                             threadRowTree(
                                 childThread,
                                 childrenByParentID: childrenByParentID,
                                 ancestorThreadIDs: nextAncestorThreadIDs,
-                                pinnedRootThreadIDs: pinnedRootThreadIDs
+                                pinnedRootThreadIDs: pinnedRootThreadIDs,
+                                leadingInset: leadingInset
                             )
                         }
                     }
