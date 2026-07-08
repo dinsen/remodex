@@ -218,11 +218,10 @@ function createDesktopIpcActionFollower({
     }
 
     activeThreadIds.add(threadId);
-    return ipc.sendRequest("thread-follower-start-turn", {
-      ...params,
-      conversationId: threadId,
-      threadId,
-    });
+    return ipc.sendRequest(
+      "thread-follower-start-turn",
+      buildThreadFollowerStartTurnParams(threadId, requestId, params)
+    );
   }
 
   function stopAll() {
@@ -777,11 +776,7 @@ function createDesktopIpcActionFollower({
       return {
         threadId,
         method: "thread-follower-start-turn",
-        params: {
-          conversationId: threadId,
-          senderRequestId: requestId,
-          turnStartParams: params,
-        },
+        params: buildThreadFollowerStartTurnParams(threadId, requestId, params),
       };
     }
     if (method === "turn/steer") {
@@ -875,9 +870,24 @@ function createDesktopIpcActionFollower({
     const turnStartParams = normalized && typeof normalized === "object" && !Array.isArray(normalized)
       ? normalized
       : route.params.turnStartParams;
+    return buildThreadFollowerStartTurnParams(
+      route.threadId,
+      route.params.senderRequestId,
+      turnStartParams
+    );
+  }
+
+  function buildThreadFollowerStartTurnParams(threadId, senderRequestId, turnStartParams) {
+    const normalizedThreadId = readString(threadId);
+    const params = turnStartParams && typeof turnStartParams === "object" && !Array.isArray(turnStartParams)
+      ? turnStartParams
+      : {};
     return {
-      ...route.params,
-      turnStartParams,
+      ...params,
+      conversationId: normalizedThreadId,
+      threadId: normalizedThreadId,
+      senderRequestId,
+      turnStartParams: params,
     };
   }
 

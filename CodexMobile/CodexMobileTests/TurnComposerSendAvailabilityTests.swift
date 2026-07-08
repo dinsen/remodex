@@ -353,6 +353,39 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertTrue(secondViewModel.isSubagentsSelectionArmed)
     }
 
+    func testTypingLocalDraftSaveDebouncesServiceDraftMutation() async {
+        let service = makeService()
+        let viewModel = TurnViewModel()
+        let threadID = "thread-typing-draft"
+
+        viewModel.input = "H"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+
+        XCTAssertNil(service.composerDraft(for: threadID))
+
+        viewModel.input = "Hello"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+
+        XCTAssertNil(service.composerDraft(for: threadID))
+
+        let savedInput = await waitForDraftInput(service, threadID: threadID)
+        XCTAssertEqual(savedInput, "Hello")
+    }
+
+    func testLifecycleLocalDraftSaveFlushesPendingTypingDraftImmediately() {
+        let service = makeService()
+        let viewModel = TurnViewModel()
+        let threadID = "thread-typing-flush"
+
+        viewModel.input = "Pending"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+        viewModel.input = "Latest"
+
+        viewModel.saveLifecycleLocalDraft(codex: service, threadID: threadID)
+
+        XCTAssertEqual(service.composerDraft(for: threadID)?.input, "Latest")
+    }
+
     func testLocalDraftReflectsRemovedAttachment() {
         let service = makeService()
         let viewModel = TurnViewModel()
@@ -1134,6 +1167,20 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return service.composerDraft(for: threadID)?.attachments.first(where: { $0.id == attachmentID })
+    }
+
+    private func waitForDraftInput(
+        _ service: CodexService,
+        threadID: String,
+        maxPollCount: Int = 120
+    ) async -> String? {
+        for _ in 0..<maxPollCount {
+            if let input = service.composerDraft(for: threadID)?.input {
+                return input
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return service.composerDraft(for: threadID)?.input
     }
 
     private func textInput(from params: JSONValue?) -> String? {

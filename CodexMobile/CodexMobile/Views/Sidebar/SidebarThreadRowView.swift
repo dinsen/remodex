@@ -132,6 +132,10 @@ struct SidebarThreadRowView: View {
 
             SidebarThreadStatusIcon(thread: thread, pointSize: 12)
 
+            if thread.isUsingGoal {
+                SidebarThreadGoalBadgeView(pointSize: 12)
+            }
+
             if let pinnedProjectLabel, !pinnedProjectLabel.isEmpty {
                 Text(pinnedProjectLabel)
                     .font(AppFont.footnote())
@@ -176,6 +180,10 @@ struct SidebarThreadRowView: View {
             expansionToggleButton
 
             SidebarThreadStatusIcon(thread: thread, pointSize: 11)
+
+            if thread.isUsingGoal {
+                SidebarThreadGoalBadgeView(pointSize: 11)
+            }
 
             if showsTimestampRefreshIndicator {
                 SidebarTimestampRefreshIndicator(size: .subagent)

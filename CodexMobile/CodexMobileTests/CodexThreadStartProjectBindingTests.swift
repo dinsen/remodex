@@ -177,6 +177,49 @@ final class CodexThreadStartProjectBindingTests: XCTestCase {
         XCTAssertEqual(thread.modelDisplayLabel, "gpt-5.4-mini")
     }
 
+    func testDecodesActiveGoalStatusFromTopLevelThreadListField() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "threadGoalStatus": "active"
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .active)
+        XCTAssertTrue(thread.isUsingGoal)
+    }
+
+    func testDecodesGoalStatusFromMetadataFallback() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "metadata": {
+            "goal_status": "using"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .active)
+    }
+
+    func testIgnoresInactiveGoalStatusForCurrentGoalPresentation() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "threadGoalStatus": "completed"
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .completed)
+        XCTAssertFalse(thread.isUsingGoal)
+    }
+
     func testAgentDisplayLabelIgnoresCollabToolItemTypeNoise() throws {
         let payload = """
         {

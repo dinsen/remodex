@@ -1972,6 +1972,54 @@ test("sanitizeThreadHistoryImagesForRelay compacts thread/list rows for mobile",
   assert.equal(sanitized.result.data[0].metadata.bulky, undefined);
 });
 
+test("sanitizeThreadHistoryImagesForRelay preserves only compact goal status in thread/list rows", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-goal-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const sanitized = JSON.parse(sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "req-thread-list-goal",
+    result: {
+      data: [
+        {
+          id: "thread-goal",
+          title: "Goal thread",
+          threadGoal: {
+            objective: "secret implementation detail",
+            status: "active",
+          },
+          completedThreadGoal: {
+            objective: "old secret",
+            status: "complete",
+          },
+          metadata: {
+            goal_status: "active",
+            threadGoal: "secret metadata detail",
+          },
+        },
+      ],
+    },
+  }), "thread/list", {
+    cursor: null,
+    limit: 10,
+  }));
+
+  assert.equal(sanitized.result.remodexThreadListCompacted, true);
+  assert.equal(sanitized.result.data[0].threadGoalStatus, "active");
+  assert.equal(sanitized.result.data[0].threadGoal, undefined);
+  assert.equal(sanitized.result.data[0].completedThreadGoal, undefined);
+  assert.equal(sanitized.result.data[0].metadata.goal_status, "active");
+  assert.equal(sanitized.result.data[0].metadata.threadGoal, undefined);
+});
+
 test("sanitizeThreadHistoryImagesForRelay drops bulky nested values from compact thread/list rows", (t) => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-nested-"));
   const previousCodexHome = process.env.CODEX_HOME;

@@ -5,6 +5,7 @@
 //          keeps font and accessibility behavior in one place per size.
 // Layer: View Component
 // Exports: SidebarTimingLabel, SidebarTimestampRefreshIndicator,
+//          SidebarThreadGoalBadgeView,
 //          SidebarRowMetricsSize
 // Depends on: SwiftUI, RemodexIcon, AppFont
 
@@ -57,6 +58,17 @@ struct SidebarTimestampRefreshIndicator: View {
             .foregroundStyle(.secondary)
             .modifier(SidebarTrailingSlotWidth(size: size))
             .accessibilityLabel("Open chat to refresh timestamp")
+    }
+}
+
+struct SidebarThreadGoalBadgeView: View {
+    let pointSize: CGFloat
+
+    var body: some View {
+        RemodexIcon.image(systemName: "target", size: pointSize, weight: .semibold)
+            .foregroundStyle(Color.accentColor)
+            .frame(width: pointSize + 4, height: pointSize + 4)
+            .accessibilityLabel("Using goal")
     }
 }
 

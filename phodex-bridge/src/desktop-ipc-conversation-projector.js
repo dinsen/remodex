@@ -155,6 +155,7 @@ function projectConversationState(threadId, rawState, {
 } = {}) {
   const turns = projectTurns(threadId, rawState, { turnCache, itemCache });
   const activeTurnId = activeTurnIdFromTurns(turns);
+  const threadGoalStatus = projectThreadGoalStatus(rawState);
   const thread = {
     id: threadId,
     sessionId: threadId,
@@ -173,6 +174,7 @@ function projectConversationState(threadId, rawState, {
     gitInfo: cloneJSON(rawState?.gitInfo ?? rawState?.git_info ?? null),
     agentNickname: readString(rawState?.agentNickname) || readString(rawState?.agent_nickname) || null,
     agentRole: readString(rawState?.agentRole) || readString(rawState?.agent_role) || null,
+    ...(threadGoalStatus ? { threadGoalStatus } : {}),
     status: resolveThreadStatus(rawState, activeTurnId),
     tokenUsage: cloneJSON(rawState?.latestTokenUsageInfo ?? rawState?.latest_token_usage_info ?? null),
     turns,
@@ -701,6 +703,61 @@ function resolveThreadStatus(rawState, activeTurnId) {
   return {
     type: "idle",
   };
+}
+
+function projectThreadGoalStatus(rawState) {
+  const explicitStatus = normalizeThreadGoalStatus(
+    rawState?.threadGoalStatus
+      ?? rawState?.thread_goal_status
+      ?? rawState?.goalStatus
+      ?? rawState?.goal_status
+  );
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+
+  const activeGoalStatus = normalizeGoalPayloadStatus(rawState?.threadGoal);
+  if (activeGoalStatus) {
+    return activeGoalStatus;
+  }
+
+  return normalizeGoalPayloadStatus(rawState?.completedThreadGoal);
+}
+
+function normalizeGoalPayloadStatus(value) {
+  if (value == null || value === false) {
+    return "";
+  }
+  if (value === true) {
+    return "active";
+  }
+  if (typeof value === "string") {
+    return normalizeThreadGoalStatus(value) || "active";
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return "";
+  }
+
+  return normalizeThreadGoalStatus(
+    value.status
+      ?? value.state
+      ?? value.phase
+      ?? value.result
+  ) || "active";
+}
+
+function normalizeThreadGoalStatus(value) {
+  const token = normalizeToken(value);
+  if (!token) {
+    return "";
+  }
+  if (["active", "using", "inprogress", "running", "started"].includes(token)) {
+    return "active";
+  }
+  if (["completed", "complete", "done", "finished", "succeeded", "success"].includes(token)) {
+    return "completed";
+  }
+  return "";
 }
 
 function normalizeTurnStatus(value) {

@@ -67,6 +67,11 @@ enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case archivedLocal
 }
 
+enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable {
+    case active
+    case completed
+}
+
 struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var title: String?
@@ -83,6 +88,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var agentRole: String?
     var model: String?
     var modelProvider: String?
+    var goalStatus: CodexThreadGoalStatus?
     var syncState: CodexThreadSyncState
 
     // --- Public initializer ---------------------------------------------------
@@ -103,6 +109,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         agentRole: String? = nil,
         model: String? = nil,
         modelProvider: String? = nil,
+        goalStatus: CodexThreadGoalStatus? = nil,
         syncState: CodexThreadSyncState = .live
     ) {
         self.id = id
@@ -120,6 +127,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.agentRole = Self.normalizeIdentifier(agentRole)
         self.model = Self.normalizeIdentifier(model)
         self.modelProvider = Self.normalizeIdentifier(modelProvider)
+        self.goalStatus = goalStatus
         self.syncState = syncState
     }
 
@@ -153,6 +161,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case model
         case modelProvider
         case modelProviderSnake = "model_provider"
+        case goalStatus
+        case goalStatusSnake = "goal_status"
+        case threadGoalStatus
+        case threadGoalStatusSnake = "thread_goal_status"
         case syncState
     }
 
@@ -212,6 +224,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
             keys: [.modelProvider, .modelProviderSnake],
             metadataKeys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"]
         )
+        goalStatus = Self.decodeGoalStatus(from: container, metadata: metadata)
         syncState = try container.decodeIfPresent(CodexThreadSyncState.self, forKey: .syncState) ?? .live
     }
 
@@ -235,6 +248,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(Self.normalizeIdentifier(agentRole), forKey: .agentRole)
         try container.encodeIfPresent(Self.normalizeIdentifier(model), forKey: .model)
         try container.encodeIfPresent(Self.normalizeIdentifier(modelProvider), forKey: .modelProvider)
+        try container.encodeIfPresent(goalStatus, forKey: .threadGoalStatus)
         try container.encode(syncState, forKey: .syncState)
     }
 }
@@ -290,6 +304,10 @@ extension CodexThread {
 
     var isSubagent: Bool {
         parentThreadId != nil
+    }
+
+    var isUsingGoal: Bool {
+        goalStatus == .active
     }
 
     // App-server exposes the rollout session identifier as Thread.id.
@@ -524,6 +542,43 @@ extension CodexThread {
         }
 
         return nil
+    }
+
+    private static func decodeGoalStatus(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        metadata: [String: JSONValue]?
+    ) -> CodexThreadGoalStatus? {
+        for key in [CodingKeys.threadGoalStatus, .threadGoalStatusSnake, .goalStatus, .goalStatusSnake] {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key),
+               let status = normalizeGoalStatus(value) {
+                return status
+            }
+        }
+
+        for metadataKey in ["threadGoalStatus", "thread_goal_status", "goalStatus", "goal_status"] {
+            if let status = normalizeGoalStatus(metadata?[metadataKey]?.stringValue) {
+                return status
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizeGoalStatus(_ value: String?) -> CodexThreadGoalStatus? {
+        guard let value else { return nil }
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+
+        switch normalized {
+        case "active", "using", "inprogress", "running", "started":
+            return .active
+        case "completed", "complete", "done", "finished", "succeeded":
+            return .completed
+        default:
+            return nil
+        }
     }
 
     private static func sanitizedAgentIdentity(_ value: String?) -> String? {

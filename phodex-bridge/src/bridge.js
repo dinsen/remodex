@@ -2793,6 +2793,10 @@ const RELAY_THREAD_LIST_MOBILE_KEYS = [
   "model",
   "modelProvider",
   "model_provider",
+  "goalStatus",
+  "goal_status",
+  "threadGoalStatus",
+  "thread_goal_status",
   "source",
   "threadSource",
   "thread_source",
@@ -2836,6 +2840,10 @@ const RELAY_THREAD_LIST_MOBILE_METADATA_KEYS = new Set([
   "model_provider",
   "modelProviderId",
   "model_provider_id",
+  "goalStatus",
+  "goal_status",
+  "threadGoalStatus",
+  "thread_goal_status",
   "thread_source",
   "source",
   "remodexJsonlThreadListFallback",
@@ -2880,6 +2888,12 @@ function compactRelayThreadListItem(thread) {
       didCompact = true;
       break;
     }
+  }
+
+  const derivedGoalStatus = compactThreadGoalStatus(thread);
+  if (derivedGoalStatus && compacted.threadGoalStatus !== derivedGoalStatus) {
+    compacted.threadGoalStatus = derivedGoalStatus;
+    didCompact = true;
   }
 
   const { metadata: compactedMetadata, didCompact: didCompactMetadata } = compactRelayThreadListMetadata(thread.metadata);
@@ -2951,6 +2965,74 @@ function compactRelayThreadListMetadataValue(value) {
   }
 
   return compactRelayThreadListString(value);
+}
+
+function compactThreadGoalStatus(thread) {
+  const explicitStatus = normalizeThreadGoalStatus(
+    thread?.threadGoalStatus
+      ?? thread?.thread_goal_status
+      ?? thread?.goalStatus
+      ?? thread?.goal_status
+  );
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+
+  const activeGoalStatus = normalizeGoalPayloadStatus(thread?.threadGoal);
+  if (activeGoalStatus) {
+    return activeGoalStatus;
+  }
+
+  const metadata = thread?.metadata;
+  const metadataStatus = normalizeThreadGoalStatus(
+    metadata?.threadGoalStatus
+      ?? metadata?.thread_goal_status
+      ?? metadata?.goalStatus
+      ?? metadata?.goal_status
+  );
+  if (metadataStatus) {
+    return metadataStatus;
+  }
+
+  return normalizeGoalPayloadStatus(thread?.completedThreadGoal);
+}
+
+function normalizeGoalPayloadStatus(value) {
+  if (value == null || value === false) {
+    return "";
+  }
+  if (value === true) {
+    return "active";
+  }
+  if (typeof value === "string") {
+    return normalizeThreadGoalStatus(value) || "active";
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return "";
+  }
+
+  return normalizeThreadGoalStatus(
+    value.status
+      ?? value.state
+      ?? value.phase
+      ?? value.result
+  ) || "active";
+}
+
+function normalizeThreadGoalStatus(value) {
+  const token = typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[_-\s]+/g, "")
+    : "";
+  if (!token) {
+    return "";
+  }
+  if (["active", "using", "inprogress", "running", "started"].includes(token)) {
+    return "active";
+  }
+  if (["completed", "complete", "done", "finished", "succeeded", "success"].includes(token)) {
+    return "completed";
+  }
+  return "";
 }
 
 function augmentRelayThreadListWithJsonlThreads(threads, requestContext = {}) {

@@ -225,7 +225,7 @@ struct TurnComposerHostView: View {
                         text,
                         activeTurnID: activeTurnID
                     )
-                    viewModel.saveLocalDraft(codex: codex, threadID: thread.id)
+                    viewModel.scheduleTypingLocalDraftSave(codex: codex, threadID: thread.id)
                 }
             ),
             onSelectFileAutocomplete: { item in
