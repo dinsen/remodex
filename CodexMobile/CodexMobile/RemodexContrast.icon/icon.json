@@ -6,62 +6,24 @@
       "blur-material" : null,
       "hidden-specializations" : [
         {
-          "idiom" : "square",
-          "value" : false
+          "appearance" : "dark",
+          "value" : true
         }
       ],
       "layers" : [
         {
-          "image-name-specializations" : [
-            {
-              "value" : "Fixed-Rounding 2.svg"
-            },
-            {
-              "appearance" : "dark",
-              "value" : "Fixed-Roundingwhite.svg"
-            },
-            {
-              "appearance" : "tinted",
-              "value" : "Fixed-Roundingwhite.svg"
-            }
-          ],
-          "name" : "Contrast Remodex",
-          "position-specializations" : [
-            {
-              "value" : {
-                "scale" : 1,
-                "translation-in-points" : [
-                  0.16799999999983584,
-                  0.019967733251746722
-                ]
-              }
-            },
-            {
-              "idiom" : "square",
-              "value" : {
-                "scale" : 0.94,
-                "translation-in-points" : [
-                  0.16799999999983584,
-                  0.019967733251746722
-                ]
-              }
-            }
-          ]
-        }
-      ],
-      "lighting" : "individual",
-      "position-specializations" : [
-        {
-          "idiom" : "square",
-          "value" : {
-            "scale" : 0.99,
+          "image-name" : "VectorLight.svg",
+          "name" : "Remodex Light",
+          "position" : {
+            "scale" : 1,
             "translation-in-points" : [
-              0,
-              0
+              0.26439794274210726,
+              -27.3359375
             ]
           }
         }
       ],
+      "lighting" : "individual",
       "shadow" : {
         "kind" : "layer-color",
         "opacity" : 0.5
@@ -70,6 +32,40 @@
       "translucency" : {
         "enabled" : true,
         "value" : 0.4
+      }
+    },
+    {
+      "blur-material" : null,
+      "hidden-specializations" : [
+        {
+          "value" : true
+        },
+        {
+          "appearance" : "dark",
+          "value" : false
+        }
+      ],
+      "layers" : [
+        {
+          "image-name" : "VectorDark.svg",
+          "name" : "Remodex Dark",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              0.26439794274210726,
+              -27.3359375
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.05
       }
     }
   ],

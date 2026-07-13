@@ -36,8 +36,8 @@ enum TurnTimelineCacheKeyBuilder {
 
     // Avoid hashing message bodies while opening large threads; CodexMessage keeps a
     // tiny text revision that changes whenever row text is mutated.
-    static func blockInfoInputKey(
-        messages: [CodexMessage],
+    static func blockInfoInputKey<Messages: Collection>(
+        messages: Messages,
         isThreadRunning: Bool,
         isSendInFlight: Bool = false,
         activeTurnID: String?,
@@ -46,7 +46,7 @@ enum TurnTimelineCacheKeyBuilder {
         stoppedTurnIDs: Set<String>,
         assistantRevertStatesByMessageID: [String: AssistantRevertPresentation],
         suppressesLiveStreamingTextUpdates: Bool = false
-    ) -> Int {
+    ) -> Int where Messages.Element == CodexMessage {
         var hasher = Hasher()
         hasher.combine(messages.count)
         hasher.combine(isThreadRunning)
@@ -61,6 +61,7 @@ enum TurnTimelineCacheKeyBuilder {
             hasher.combine(message.id)
             hasher.combine(message.role)
             hasher.combine(message.kind)
+            hasher.combine(message.assistantPhase)
             hasher.combine(message.turnId)
             hasher.combine(message.isStreaming)
             if suppressesLiveStreamingTextUpdates,

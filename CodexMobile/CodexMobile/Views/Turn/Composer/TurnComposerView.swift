@@ -43,6 +43,11 @@ struct TurnComposerView: View, Equatable {
     let hasWorkingDirectory: Bool
     let isWorktreeProject: Bool
     var activeFileChangeStatus: FileChangeStatusSnapshot? = nil
+    var threadGoal: CodexThreadGoal? = nil
+    var onEditGoal: () -> Void = {}
+    var onRemoveGoal: () -> Void = {}
+    var onResumeGoal: () -> Void = {}
+    var onPauseGoal: () -> Void = {}
 
     let orderedModelOptions: [CodexModelOption]
     let selectedModelID: String?
@@ -82,7 +87,6 @@ struct TurnComposerView: View, Equatable {
     let onSelectForkDestination: (TurnComposerForkDestination) -> Void
     let onCloseSlashCommandPanel: () -> Void
     let onRemoveMentionedFile: (String) -> Void
-    let onRemoveMentionedSkill: (String) -> Void
     let onRemoveMentionedPlugin: (String) -> Void
     let onRemoveComposerReviewSelection: () -> Void
     let onRemoveComposerSubagentsSelection: () -> Void
@@ -104,9 +108,9 @@ struct TurnComposerView: View, Equatable {
     // with Dynamic Type so large accessibility sizes don't clip the placeholder.
     @ScaledMetric(relativeTo: .body) private var collapsedInputHeight: CGFloat = 22
 
-    // Square hit target for the resting capsule's "+" and mic controls, matched
-    // to the send button so they're just as easy to tap despite smaller glyphs.
-    private let collapsedControlTapTarget: CGFloat = 32
+    // Square hit target for the resting capsule's "+", mic, and send/stop
+    // controls. The extra 2pt keeps the closed capsule comfortable to tap.
+    private let collapsedControlTapTarget: CGFloat = 34
     private let expandedPlainTextMaxVisibleLines: CGFloat = 6
     private let expandedAccessoryTextMaxVisibleLines: CGFloat = 4
 
@@ -121,6 +125,7 @@ struct TurnComposerView: View, Equatable {
     private var hasSecondaryBarContent: Bool {
         hasWorkingDirectory
             || activeFileChangeStatus != nil
+            || threadGoal != nil
             || pinnedPlanAccessory != nil
             || !accessoryState.queuedDrafts.isEmpty
     }
@@ -201,6 +206,12 @@ struct TurnComposerView: View, Equatable {
                     hasWorkingDirectory: hasWorkingDirectory,
                     isWorktreeProject: isWorktreeProject,
                     activeFileChangeStatus: activeFileChangeStatus,
+                    threadGoal: threadGoal,
+                    isThreadRunning: isThreadRunning,
+                    onEditGoal: onEditGoal,
+                    onRemoveGoal: onRemoveGoal,
+                    onResumeGoal: onResumeGoal,
+                    onPauseGoal: onPauseGoal,
                     queuedDraftCount: accessoryState.queuedDrafts.count,
                     onTapQueuedDrafts: { isShowingQueuedDraftsSheet = true },
                     gitState: gitState,
@@ -214,7 +225,6 @@ struct TurnComposerView: View, Equatable {
                         state: accessoryState,
                         onRemoveAttachment: onRemoveAttachment,
                         onRemoveMentionedFile: onRemoveMentionedFile,
-                        onRemoveMentionedSkill: onRemoveMentionedSkill,
                         onRemoveMentionedPlugin: onRemoveMentionedPlugin,
                         onRemoveComposerReviewSelection: onRemoveComposerReviewSelection,
                         onRemoveComposerSubagentsSelection: onRemoveComposerSubagentsSelection,
@@ -267,6 +277,7 @@ struct TurnComposerView: View, Equatable {
                             isFocused: isInputFocused,
                             isEditable: !isComposerInteractionLocked,
                             dynamicHeight: $composerInputHeight,
+                            mentionedSkillNames: accessoryState.composerMentionedSkills.map(\.name),
                             runtimeState: runtimeState,
                             runtimeActions: runtimeActions,
                             isCollapsed: showsCollapsedComposer,
@@ -311,7 +322,7 @@ struct TurnComposerView: View, Equatable {
                         }
                     }
                 }
-                // Collapsed capsule: 6pt on every side so the 32pt inline controls
+                // Collapsed capsule: 6pt on every side so the 34pt inline controls
                 // sit at the same distance from the edges as the 6pt vertical rhythm.
                 .padding(.leading, showsCollapsedComposer ? 6 : 14)
                 .padding(.trailing, showsCollapsedComposer ? 6 : 16)
@@ -319,7 +330,7 @@ struct TurnComposerView: View, Equatable {
                 // `composerSurfaceCornerRadius` derived as half the resulting
                 // height so the surface reads as a true capsule. The expanded
                 // card keeps its own rhythm.
-                .padding(.top, showsCollapsedComposer ? 6 : accessoryState.topInputPadding + 6)
+                .padding(.top, showsCollapsedComposer ? 6 : accessoryState.topInputPadding + 4)
                 .padding(.bottom, showsCollapsedComposer ? 6 : 4)
                 .onChange(of: input) { _, newValue in
                     inputChangeTask?.cancel()
@@ -544,7 +555,6 @@ private struct TurnComposerAccessorySection: View {
     let state: TurnComposerAccessoryState
     let onRemoveAttachment: (String) -> Void
     let onRemoveMentionedFile: (String) -> Void
-    let onRemoveMentionedSkill: (String) -> Void
     let onRemoveMentionedPlugin: (String) -> Void
     let onRemoveComposerReviewSelection: () -> Void
     let onRemoveComposerSubagentsSelection: () -> Void
@@ -565,7 +575,6 @@ private struct TurnComposerAccessorySection: View {
             TurnComposerMentionChipSections(
                 state: state,
                 onRemoveMentionedFile: onRemoveMentionedFile,
-                onRemoveMentionedSkill: onRemoveMentionedSkill,
                 onRemoveMentionedPlugin: onRemoveMentionedPlugin,
                 onRemoveComposerReviewSelection: onRemoveComposerReviewSelection,
                 onRemoveComposerSubagentsSelection: onRemoveComposerSubagentsSelection,
@@ -866,7 +875,6 @@ private struct ComposerPreviewContent: View {
             onSelectForkDestination: { _ in },
             onCloseSlashCommandPanel: {},
             onRemoveMentionedFile: { _ in },
-            onRemoveMentionedSkill: { _ in },
             onRemoveMentionedPlugin: { _ in },
             onRemoveComposerReviewSelection: {},
             onRemoveComposerSubagentsSelection: {},

@@ -59,10 +59,6 @@ struct TurnComposerAccessoryState: Equatable {
         !showsVoiceRecordingCapsule && !composerMentionedFiles.isEmpty
     }
 
-    var showsMentionedSkills: Bool {
-        !showsVoiceRecordingCapsule && !composerMentionedSkills.isEmpty
-    }
-
     var showsMentionedPlugins: Bool {
         !showsVoiceRecordingCapsule && !composerMentionedPlugins.isEmpty
     }
@@ -90,7 +86,6 @@ struct TurnComposerAccessoryState: Equatable {
     var hasTopAccessoryContent: Bool {
         showsComposerAttachments
             || showsMentionedFiles
-            || showsMentionedSkills
             || showsMentionedPlugins
             || showsSubagentsSelection
             || showsPlanModeSelection

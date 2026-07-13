@@ -9,9 +9,7 @@ import Foundation
 // ─── Render Item Models ───────────────────────────────────────
 
 struct TurnTimelineToolBurstGroup: Identifiable, Equatable {
-    // Once a burst exceeds this threshold, collapse every prior call and reserve
-    // the only visible call row for the newest tool activity.
-    static let collapsedVisibleCount = 4
+    static let collapseThreshold = 4
 
     let id: String
     let messages: [CodexMessage]
@@ -26,25 +24,15 @@ struct TurnTimelineToolBurstGroup: Identifiable, Equatable {
     }
 
     var latestMessage: CodexMessage? {
-        return messages.last
+        messages.last
+    }
+
+    var visibleMessages: [CodexMessage] {
+        latestMessage.map { [$0] } ?? []
     }
 
     var hiddenCount: Int {
         overflowMessages.count
-    }
-}
-
-struct TurnTimelineCommandGroup: Identifiable, Equatable {
-    let id: String
-    let messages: [CodexMessage]
-
-    init(messages: [CodexMessage]) {
-        self.messages = messages
-        self.id = "command-group:\(messages.first?.id ?? "unknown")"
-    }
-
-    var commandCount: Int {
-        messages.count
     }
 }
 
@@ -61,6 +49,57 @@ struct TurnTimelinePreviousMessagesGroup: Identifiable, Equatable {
 
     var hiddenCount: Int {
         messages.count
+    }
+}
+
+struct TurnTimelineCommandGroup: Identifiable, Equatable {
+    let id: String
+    let messages: [CodexMessage]
+    let orderedMessages: [CodexMessage]
+
+    init(messages: [CodexMessage], orderedMessages: [CodexMessage]? = nil) {
+        self.messages = messages
+        self.orderedMessages = orderedMessages ?? messages
+        self.id = "command-group:\(messages.first?.id ?? "unknown")"
+    }
+
+    var commandCount: Int {
+        messages.count
+    }
+
+    var traceMessages: [CodexMessage] {
+        orderedMessages.filter { $0.role == .system && $0.kind == .thinking }
+    }
+
+    var collapsedDetailMessages: [CodexMessage] {
+        orderedMessages.filter { message in
+            guard message.role == .system else { return false }
+            return message.kind == .thinking || message.kind == .fileChange
+        }
+    }
+
+    var accessoryHostMessage: CodexMessage? {
+        orderedMessages.last
+    }
+
+    var failedCommandCount: Int {
+        messages.count { commandStatusWord(in: $0) == "failed" }
+    }
+
+    var stoppedCommandCount: Int {
+        messages.count { commandStatusWord(in: $0) == "stopped" }
+    }
+
+    var hasUnsuccessfulCommands: Bool {
+        failedCommandCount > 0 || stoppedCommandCount > 0
+    }
+
+    private func commandStatusWord(in message: CodexMessage) -> String? {
+        message.text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .first?
+            .lowercased()
     }
 }
 
@@ -91,6 +130,16 @@ enum TurnTimelineRenderProjection {
     private static let eagerFileChangeCollapseByteLimit = 96_000
     private static let smallWhitespaceScanByteLimit = 512
 
+    struct Result {
+        let renderItems: [TurnTimelineRenderItem]
+        let metadata: CollapseMetadata
+    }
+
+    struct CollapseMetadata {
+        let collapsedFinalMessageIDs: Set<String>
+        let collapsedPreviousMessageIDs: Set<String>
+    }
+
     // Groups tool runs and completed-turn preamble rows so the visible timeline stays compact.
     static func project(
         messages: [CodexMessage],
@@ -98,14 +147,71 @@ enum TurnTimelineRenderProjection {
         activeTurnID: String? = nil,
         isThreadRunning: Bool = false
     ) -> [TurnTimelineRenderItem] {
+        renderItems(
+            messages: messages,
+            finalCollapsePlan: resolvedPreviousMessagesCollapsePlan(
+                in: messages,
+                completedTurnIDs: completedTurnIDs,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning
+            ),
+            activeTurnID: activeTurnID,
+            isThreadRunning: isThreadRunning
+        )
+    }
+
+    static func result(
+        messages: [CodexMessage],
+        completedTurnIDs: Set<String> = [],
+        activeTurnID: String? = nil,
+        isThreadRunning: Bool = false
+    ) -> Result {
+        let plan = resolvedPreviousMessagesCollapsePlan(
+            in: messages,
+            completedTurnIDs: completedTurnIDs,
+            activeTurnID: activeTurnID,
+            isThreadRunning: isThreadRunning
+        )
+        return Result(
+            renderItems: renderItems(
+                messages: messages,
+                finalCollapsePlan: plan,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning
+            ),
+            metadata: collapseMetadata(from: plan, messages: messages)
+        )
+    }
+
+    static func collapseMetadata(
+        in messages: [CodexMessage],
+        completedTurnIDs: Set<String>,
+        activeTurnID: String? = nil,
+        isThreadRunning: Bool = false
+    ) -> CollapseMetadata {
+        collapseMetadata(
+            from: resolvedPreviousMessagesCollapsePlan(
+                in: messages,
+                completedTurnIDs: completedTurnIDs,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning
+            ),
+            messages: messages
+        )
+    }
+
+    private static func renderItems(
+        messages: [CodexMessage],
+        finalCollapsePlan: [Int: PreviousMessagesCollapse],
+        activeTurnID: String?,
+        isThreadRunning: Bool
+    ) -> [TurnTimelineRenderItem] {
         var items: [TurnTimelineRenderItem] = []
         var bufferedToolMessages: [CodexMessage] = []
         var bufferedCommandMessages: [CodexMessage] = []
+        var bufferedCommandOrderedMessages: [CodexMessage] = []
+        var bufferedCommandTrailingFileChanges: [CodexMessage] = []
         let fileChangePlan = fileChangeCollapsePlan(in: messages)
-        let finalCollapsePlan = previousMessagesCollapsePlan(
-            in: messages,
-            completedTurnIDs: completedTurnIDs
-        )
         let hiddenIndices = Set(finalCollapsePlan.values.flatMap(\.indices))
             .union(fileChangePlan.hiddenIndices)
         let groupByInsertionIndex = finalCollapsePlan.values.reduce(into: [Int: PreviousMessagesCollapse]()) { result, collapse in
@@ -119,7 +225,7 @@ enum TurnTimelineRenderProjection {
 
         func flushBufferedToolMessages() {
             guard !bufferedToolMessages.isEmpty else { return }
-            if bufferedToolMessages.count > TurnTimelineToolBurstGroup.collapsedVisibleCount {
+            if bufferedToolMessages.count > TurnTimelineToolBurstGroup.collapseThreshold {
                 items.append(.toolBurst(TurnTimelineToolBurstGroup(messages: bufferedToolMessages)))
             } else {
                 items.append(contentsOf: bufferedToolMessages.map(TurnTimelineRenderItem.message))
@@ -128,21 +234,41 @@ enum TurnTimelineRenderProjection {
         }
 
         func flushBufferedCommandMessages() {
-            guard !bufferedCommandMessages.isEmpty else { return }
-            items.append(.commandGroup(TurnTimelineCommandGroup(messages: bufferedCommandMessages)))
+            if !bufferedCommandMessages.isEmpty {
+                items.append(.commandGroup(TurnTimelineCommandGroup(
+                    messages: bufferedCommandMessages,
+                    orderedMessages: bufferedCommandOrderedMessages
+                )))
+            }
+            items.append(contentsOf: bufferedCommandTrailingFileChanges.map(TurnTimelineRenderItem.message))
             bufferedCommandMessages.removeAll(keepingCapacity: true)
+            bufferedCommandOrderedMessages.removeAll(keepingCapacity: true)
+            bufferedCommandTrailingFileChanges.removeAll(keepingCapacity: true)
+        }
+
+        func commitBufferedCommandTrailingFileChanges() {
+            guard !bufferedCommandTrailingFileChanges.isEmpty else { return }
+            bufferedCommandOrderedMessages.append(contentsOf: bufferedCommandTrailingFileChanges)
+            bufferedCommandTrailingFileChanges.removeAll(keepingCapacity: true)
         }
 
         for (index, message) in messages.enumerated() {
             if let group = groupByInsertionIndex[index] {
-                flushBufferedCommandMessages()
                 flushBufferedToolMessages()
+                flushBufferedCommandMessages()
                 if group.group.hiddenCount > 0 {
                     items.append(.previousMessages(group.group))
                 }
             }
 
             if hiddenIndices.contains(index) {
+                // Completed-turn collapsing must not erase real command boundaries.
+                // Reasoning and deduplicated file-change artifacts may sit inside an
+                // open command disclosure; hidden commentary still closes it first.
+                if !isCommandGroupingInterstitial(message) {
+                    flushBufferedToolMessages()
+                    flushBufferedCommandMessages()
+                }
                 continue
             }
 
@@ -154,19 +280,45 @@ enum TurnTimelineRenderProjection {
             ) {
                 continue
             }
-            if isFinishedCommandGroupCandidate(renderedMessage) {
+
+            // Reasoning and inline file changes are command interstitials. File changes
+            // remain pending until a later trace/command confirms that they bridge the
+            // run; otherwise flush places them back after the command disclosure.
+            if !bufferedCommandMessages.isEmpty,
+               isCommandGroupingInterstitial(renderedMessage) {
                 flushBufferedToolMessages()
                 if let previous = bufferedCommandMessages.last,
-                   !canShareCommandGroup(previous: previous, incoming: renderedMessage) {
+                   !canShareToolBurst(previous: previous, incoming: renderedMessage) {
                     flushBufferedCommandMessages()
+                    items.append(.message(renderedMessage))
+                } else if isCommandGroupingTrace(renderedMessage) {
+                    commitBufferedCommandTrailingFileChanges()
+                    bufferedCommandOrderedMessages.append(renderedMessage)
+                } else {
+                    bufferedCommandTrailingFileChanges.append(renderedMessage)
                 }
-                bufferedCommandMessages.append(renderedMessage)
                 continue
             }
+
             guard isToolBurstCandidate(message) else {
-                flushBufferedCommandMessages()
                 flushBufferedToolMessages()
+                flushBufferedCommandMessages()
                 items.append(.message(renderedMessage))
+                continue
+            }
+
+            // Command disclosures are derived only from terminal command-execution
+            // tool rows. Assistant commentary/reasoning remains governed by the
+            // completed-turn previous-message projection below.
+            guard !isFinishedCommandToolCall(renderedMessage) else {
+                flushBufferedToolMessages()
+                if let previous = bufferedCommandMessages.last,
+                   !canShareToolBurst(previous: previous, incoming: renderedMessage) {
+                    flushBufferedCommandMessages()
+                }
+                commitBufferedCommandTrailingFileChanges()
+                bufferedCommandMessages.append(renderedMessage)
+                bufferedCommandOrderedMessages.append(renderedMessage)
                 continue
             }
 
@@ -175,35 +327,40 @@ enum TurnTimelineRenderProjection {
                !canShareToolBurst(previous: previous, incoming: renderedMessage) {
                 flushBufferedToolMessages()
             }
-
             bufferedToolMessages.append(renderedMessage)
         }
 
-        flushBufferedCommandMessages()
         flushBufferedToolMessages()
+        flushBufferedCommandMessages()
         return mergeAdjacentFileChangeItems(items)
     }
 
     static func collapsedFinalMessageIDs(
         in messages: [CodexMessage],
-        completedTurnIDs: Set<String>
+        completedTurnIDs: Set<String>,
+        activeTurnID: String? = nil,
+        isThreadRunning: Bool = false
     ) -> Set<String> {
-        Set(previousMessagesCollapsePlan(
+        collapseMetadata(
             in: messages,
-            completedTurnIDs: completedTurnIDs
-        ).keys.map { messages[$0].id })
+            completedTurnIDs: completedTurnIDs,
+            activeTurnID: activeTurnID,
+            isThreadRunning: isThreadRunning
+        ).collapsedFinalMessageIDs
     }
 
     static func collapsedPreviousMessageIDs(
         in messages: [CodexMessage],
-        completedTurnIDs: Set<String>
+        completedTurnIDs: Set<String>,
+        activeTurnID: String? = nil,
+        isThreadRunning: Bool = false
     ) -> Set<String> {
-        Set(previousMessagesCollapsePlan(
+        collapseMetadata(
             in: messages,
-            completedTurnIDs: completedTurnIDs
-        ).values.flatMap { collapse in
-            collapse.indices.map { messages[$0].id }
-        })
+            completedTurnIDs: completedTurnIDs,
+            activeTurnID: activeTurnID,
+            isThreadRunning: isThreadRunning
+        ).collapsedPreviousMessageIDs
     }
 
     private struct PreviousMessagesCollapse {
@@ -236,6 +393,8 @@ enum TurnTimelineRenderProjection {
                 continue
             }
 
+            // Stable turn identities are authoritative. Only turnless snapshots
+            // fall back to the surrounding user-delimited block.
             let key = normalizedIdentifier(message.turnId)
                 .map { "turn:\($0)" }
                 ?? "block:\(blockStart)"
@@ -347,11 +506,27 @@ enum TurnTimelineRenderProjection {
             in: messages,
             completedTurnIDs: completedTurnIDs
         )
+        var messageIndicesByTurn: [String: [Int]] = [:]
+        var lastUserIndexBeforeFinalByTurn: [String: Int] = [:]
+        for index in messages.indices {
+            let message = messages[index]
+            guard let turnID = normalizedIdentifier(message.turnId) else {
+                continue
+            }
+            messageIndicesByTurn[turnID, default: []].append(index)
+            if message.role == .user,
+               let finalIndex = resolvedFinalAssistantIndexByTurn[turnID],
+               index < finalIndex {
+                lastUserIndexBeforeFinalByTurn[turnID] = index
+            }
+        }
+
         var plan: [Int: PreviousMessagesCollapse] = [:]
         for (turnID, finalIndex) in resolvedFinalAssistantIndexByTurn {
-            let lowerBound = lastUserIndexBefore(finalIndex, in: messages, turnID: turnID).map { $0 + 1 } ?? messages.startIndex
+            let lowerBound = lastUserIndexBeforeFinalByTurn[turnID].map { $0 + 1 } ?? messages.startIndex
             let hiddenSelection = previousMessageSelection(
                 in: messages,
+                messageIndices: messageIndicesByTurn[turnID] ?? [],
                 turnID: turnID,
                 finalIndex: finalIndex,
                 lowerBound: lowerBound
@@ -381,6 +556,65 @@ enum TurnTimelineRenderProjection {
         }
 
         return plan
+    }
+
+    private static func resolvedPreviousMessagesCollapsePlan(
+        in messages: [CodexMessage],
+        completedTurnIDs: Set<String>,
+        activeTurnID: String?,
+        isThreadRunning: Bool
+    ) -> [Int: PreviousMessagesCollapse] {
+        previousMessagesCollapsePlan(
+            in: messages,
+            completedTurnIDs: completedTurnIDsIncludingFinalAnswerEvidence(
+                in: messages,
+                completedTurnIDs: completedTurnIDs,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning
+            )
+        )
+    }
+
+    private static func collapseMetadata(
+        from plan: [Int: PreviousMessagesCollapse],
+        messages: [CodexMessage]
+    ) -> CollapseMetadata {
+        CollapseMetadata(
+            collapsedFinalMessageIDs: Set(plan.keys.map { messages[$0].id }),
+            collapsedPreviousMessageIDs: Set(plan.values.flatMap { collapse in
+                collapse.indices.map { messages[$0].id }
+            })
+        )
+    }
+
+    // Cold reopen can materialize old rows before turn terminal-state caches.
+    // A persisted non-streaming final_answer is safe completion evidence for an
+    // older turn, but never for the currently active (or unidentified running) turn.
+    private static func completedTurnIDsIncludingFinalAnswerEvidence(
+        in messages: [CodexMessage],
+        completedTurnIDs: Set<String>,
+        activeTurnID: String?,
+        isThreadRunning: Bool
+    ) -> Set<String> {
+        // turn/started can omit its id. In that case, protect the newest known
+        // turn while the thread is running and still infer older completed turns.
+        let protectedRunningTurnID = normalizedIdentifier(activeTurnID)
+            ?? (isThreadRunning
+                ? messages.reversed().compactMap { normalizedIdentifier($0.turnId) }.first
+                : nil)
+
+        var resolved = completedTurnIDs
+        for message in messages {
+            guard message.role == .assistant,
+                  !message.isStreaming,
+                  isFinalAnswerAssistantPhase(message.assistantPhase),
+                  let turnID = normalizedIdentifier(message.turnId),
+                  turnID != protectedRunningTurnID else {
+                continue
+            }
+            resolved.insert(turnID)
+        }
+        return resolved
     }
 
     private static func finalAssistantIndexByTurn(
@@ -437,6 +671,7 @@ enum TurnTimelineRenderProjection {
 
     private static func previousMessageSelection(
         in messages: [CodexMessage],
+        messageIndices: [Int],
         turnID: String,
         finalIndex: Int,
         lowerBound: Int
@@ -446,8 +681,8 @@ enum TurnTimelineRenderProjection {
         var groupIndices: [Int] = []
         var generatedImageArtifactIndices: [Int] = []
 
-        for index in messages.indices {
-            guard index >= lowerBound, index != finalIndex else {
+        for index in messageIndices.drop(while: { $0 < lowerBound }) {
+            guard index != finalIndex else {
                 continue
             }
             let candidate = messages[index]
@@ -470,10 +705,15 @@ enum TurnTimelineRenderProjection {
                 continue
             }
 
-            if !isPriorityVisibleMessage(candidate, finalMessage: finalMessage) {
-                hiddenIndices.append(index)
-                groupIndices.append(index)
+            if isPriorityVisibleMessage(candidate, finalMessage: finalMessage) {
+                continue
             }
+
+            // Tool calls and their traces stay compact while a turn is live, then
+            // move into the same closed history as the older tool rows once the
+            // final answer completes the turn.
+            hiddenIndices.append(index)
+            groupIndices.append(index)
         }
 
         return PreviousMessageSelection(
@@ -481,17 +721,6 @@ enum TurnTimelineRenderProjection {
             groupIndices: groupIndices,
             generatedImageArtifactIndices: generatedImageArtifactIndices
         )
-    }
-
-    private static func lastUserIndexBefore(_ index: Int, in messages: [CodexMessage], turnID: String) -> Int? {
-        messages.indices.reversed().first { candidateIndex in
-            guard candidateIndex < index else {
-                return false
-            }
-            let candidate = messages[candidateIndex]
-            return candidate.role == .user
-                && normalizedIdentifier(candidate.turnId) == turnID
-        }
     }
 
     // Keeps user-critical artifacts visible beside the final answer instead of burying them in the disclosure.
@@ -502,9 +731,7 @@ enum TurnTimelineRenderProjection {
                 return true
             case .plan:
                 return message.shouldDisplayInlinePlanResult
-            case .commandExecution:
-                return isFinishedCommandGroupCandidate(message)
-            case .thinking, .toolActivity, .chat:
+            case .thinking, .toolActivity, .commandExecution, .chat:
                 return false
             }
         }
@@ -747,23 +974,45 @@ enum TurnTimelineRenderProjection {
         }
     }
 
-    private static func isFinishedCommandGroupCandidate(_ message: CodexMessage) -> Bool {
+    private static func isFinishedCommandToolCall(_ message: CodexMessage) -> Bool {
         guard message.role == .system,
               message.kind == .commandExecution,
               !message.isStreaming else {
             return false
         }
 
-        switch commandExecutionStatusWord(from: message.text) {
-        case "completed", "failed", "stopped":
-            return true
-        default:
+        guard let firstWord = message.text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .first?
+            .lowercased() else {
             return false
         }
+
+        return firstWord == "completed"
+            || firstWord == "failed"
+            || firstWord == "stopped"
     }
 
-    private static func commandExecutionStatusWord(from text: String) -> String? {
-        text.split(whereSeparator: \.isWhitespace).first?.lowercased()
+    private static func isCommandGroupingTrace(_ message: CodexMessage) -> Bool {
+        message.role == .system && message.kind == .thinking
+    }
+
+    private static func isCommandGroupingInterstitial(_ message: CodexMessage) -> Bool {
+        guard message.role == .system else { return false }
+        return message.kind == .thinking || message.kind == .fileChange
+    }
+
+    // Late turn ids can arrive mid-stream, so split only when both rows already
+    // carry distinct stable identities. Commentary rows flush the buffer earlier.
+    private static func canShareToolBurst(previous: CodexMessage, incoming: CodexMessage) -> Bool {
+        let previousTurnID = normalizedIdentifier(previous.turnId)
+        let incomingTurnID = normalizedIdentifier(incoming.turnId)
+
+        guard let previousTurnID, let incomingTurnID else {
+            return true
+        }
+        return previousTurnID == incomingTurnID
     }
 
     // Drops placeholder-only rows before SwiftUI can reserve timeline spacing for them.
@@ -809,23 +1058,6 @@ enum TurnTimelineRenderProjection {
         return ThinkingDisclosureParser
             .normalizedThinkingContent(from: text)
             .isEmpty
-    }
-
-    // Late turn ids can arrive mid-stream, so only split when both rows already
-    // have distinct stable turn ids.
-    private static func canShareToolBurst(previous: CodexMessage, incoming: CodexMessage) -> Bool {
-        let previousTurnID = normalizedIdentifier(previous.turnId)
-        let incomingTurnID = normalizedIdentifier(incoming.turnId)
-
-        guard let previousTurnID, let incomingTurnID else {
-            return true
-        }
-
-        return previousTurnID == incomingTurnID
-    }
-
-    private static func canShareCommandGroup(previous: CodexMessage, incoming: CodexMessage) -> Bool {
-        canShareToolBurst(previous: previous, incoming: incoming)
     }
 
     private static func normalizedIdentifier(_ value: String?) -> String? {

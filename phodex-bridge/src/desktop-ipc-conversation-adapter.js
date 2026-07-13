@@ -8,6 +8,7 @@ const { randomUUID } = require("crypto");
 
 const {
   cloneJSON,
+  hasVisiblePlanUpdate,
   isContextualUserText,
   isUserRoleItem: isUserMessageItem,
   normalizeToken,
@@ -219,6 +220,34 @@ function applyAppServerMessageToConversationState({
       conversation.updatedAt = now();
       return { threadId, changed: true };
     }
+    case "thread/goal/updated": {
+      const threadId = readThreadIdFromParams(message.params);
+      const goal = normalizeThreadGoal(message.params?.goal, threadId);
+      if (!threadId || !shouldOwnThread(threadId) || !goal) {
+        return null;
+      }
+      const conversation = ensureConversationInMap(conversations, threadId, { hostId, now });
+      if (goal.status === "complete") {
+        conversation.threadGoal = null;
+        conversation.completedThreadGoal = goal;
+      } else {
+        conversation.threadGoal = goal;
+        conversation.completedThreadGoal = null;
+      }
+      conversation.updatedAt = now();
+      return { threadId, changed: true };
+    }
+    case "thread/goal/cleared": {
+      const threadId = readThreadIdFromParams(message.params);
+      if (!threadId || !shouldOwnThread(threadId)) {
+        return null;
+      }
+      const conversation = ensureConversationInMap(conversations, threadId, { hostId, now });
+      conversation.threadGoal = null;
+      conversation.completedThreadGoal = null;
+      conversation.updatedAt = now();
+      return { threadId, changed: true };
+    }
     case "turn/started":
     case "turn/completed": {
       const threadId = readThreadIdFromParams(message.params);
@@ -268,6 +297,11 @@ function applyAppServerMessageToConversationState({
       if (!threadId || !shouldOwnThread(threadId)) {
         return null;
       }
+      const explanation = readString(message.params?.explanation);
+      const plan = Array.isArray(message.params?.plan) ? cloneJSON(message.params.plan) : [];
+      if (!hasVisiblePlanUpdate(explanation, plan)) {
+        return { threadId, changed: false };
+      }
       const conversation = ensureConversationInMap(conversations, threadId, { hostId, now });
       const turn = ensureTurn(conversation, resolveTurnIdForParams({
         conversation,
@@ -279,8 +313,9 @@ function applyAppServerMessageToConversationState({
         upsertItem(turn, {
           id: `todo-list-${message.params?.turnId || now()}`,
           type: "todo-list",
-          explanation: message.params?.explanation ?? null,
-          plan: Array.isArray(message.params?.plan) ? cloneJSON(message.params.plan) : [],
+          explanation: explanation || null,
+          plan,
+          remodexProgressPlan: true,
         });
       }
       conversation.updatedAt = now();
@@ -405,6 +440,7 @@ function buildConversationStateFromThread(thread, {
     title: readString(thread?.name) || previous?.title || null,
     latestModel,
     latestReasoningEffort: previous?.latestReasoningEffort || null,
+    latestServiceTier: previous?.latestServiceTier || null,
     previousTurnModel: previous?.previousTurnModel || null,
     latestCollaborationMode: previous?.latestCollaborationMode || {
       mode: "default",
@@ -502,6 +538,7 @@ function createEmptyConversationState(threadId, {
     title: null,
     latestModel: "",
     latestReasoningEffort: null,
+    latestServiceTier: null,
     previousTurnModel: null,
     latestCollaborationMode: {
       mode: "default",
@@ -573,6 +610,7 @@ function buildConversationTurn(turn, {
   // Drop it here, position-independently, so no Desktop snapshot path leaks it
   // as a user bubble regardless of where the app-server placed it in the turn.
   builtTurn.items = builtTurn.items
+    .map(normalizeDesktopItemCompatibility)
     .map(sanitizeUserMessageItem)
     .filter(Boolean);
   // Hydrated turns from thread/read carry the prompt as an item with empty
@@ -635,6 +673,7 @@ function applyTurnRuntimeMetadata(conversation, turnParams) {
   }
   const model = readString(turnParams.model);
   const effort = readString(turnParams.effort);
+  const serviceTier = readString(turnParams.serviceTier) || null;
   if (model) {
     conversation.previousTurnModel = conversation.latestModel || null;
     conversation.latestModel = model;
@@ -642,6 +681,7 @@ function applyTurnRuntimeMetadata(conversation, turnParams) {
   if (effort) {
     conversation.latestReasoningEffort = effort;
   }
+  conversation.latestServiceTier = serviceTier;
   if (turnParams.collaborationMode && typeof turnParams.collaborationMode === "object") {
     conversation.latestCollaborationMode = cloneJSON(turnParams.collaborationMode);
     return;
@@ -717,6 +757,34 @@ function sanitizeUserMessageItem(item) {
   return {
     ...cloneJSON(item),
     content: sanitizedContent,
+  };
+}
+
+// Codex CLI 0.144.1 can omit receiverThreads from persisted collab tool calls,
+// while the matching Desktop renderer reads that collection without a fallback.
+// Keep the richer snapshots unchanged and synthesize lightweight references from
+// receiverThreadIds for older/CLI-owned rollouts so opening them cannot crash.
+function normalizeDesktopItemCompatibility(item) {
+  if (!item || typeof item !== "object" || normalizeToken(item.type) !== "collabagenttoolcall") {
+    return item;
+  }
+
+  const receiverThreads = Array.isArray(item.receiverThreads)
+    ? item.receiverThreads
+    : [];
+  const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+    ? item.receiverThreadIds.map(readString).filter(Boolean)
+    : receiverThreads.map((entry) => readString(entry?.threadId)).filter(Boolean);
+  if (Array.isArray(item.receiverThreads) && Array.isArray(item.receiverThreadIds)) {
+    return item;
+  }
+
+  return {
+    ...item,
+    receiverThreadIds,
+    receiverThreads: Array.isArray(item.receiverThreads)
+      ? receiverThreads
+      : receiverThreadIds.map((threadId) => ({ threadId })),
   };
 }
 
@@ -897,8 +965,10 @@ function upsertItem(turn, item) {
   // user items too; no Codex UI renders it, so it must not reach the stream.
   // Also evict any copy that slipped into the state before this filter existed.
   const index = turn.items.findIndex((candidate) => readString(candidate?.id) === itemId);
-  const sanitizedItem = sanitizeUserMessageItem(item);
-  const existingItem = index >= 0 ? sanitizeUserMessageItem(turn.items[index]) : null;
+  const sanitizedItem = sanitizeUserMessageItem(normalizeDesktopItemCompatibility(item));
+  const existingItem = index >= 0
+    ? sanitizeUserMessageItem(normalizeDesktopItemCompatibility(turn.items[index]))
+    : null;
   if (!sanitizedItem) {
     if (index >= 0) {
       turn.items.splice(index, 1);
@@ -1092,6 +1162,36 @@ function timestampSecondsToMs(value) {
   return Number.isFinite(value) && value > 0 ? Math.round(value * 1000) : 0;
 }
 
+function normalizeThreadGoal(value, fallbackThreadId = "") {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const threadId = readString(value.threadId) || readString(value.thread_id) || readString(fallbackThreadId);
+  const objective = readString(value.objective);
+  const statusByToken = {
+    active: "active",
+    paused: "paused",
+    blocked: "blocked",
+    usagelimited: "usageLimited",
+    budgetlimited: "budgetLimited",
+    complete: "complete",
+  };
+  const status = statusByToken[normalizeToken(value.status)] || "";
+  if (!threadId || !objective || !status) {
+    return null;
+  }
+  return {
+    threadId,
+    objective,
+    status,
+    tokenBudget: value.tokenBudget ?? value.token_budget ?? null,
+    tokensUsed: Number(value.tokensUsed ?? value.tokens_used) || 0,
+    timeUsedSeconds: Number(value.timeUsedSeconds ?? value.time_used_seconds) || 0,
+    createdAt: Number(value.createdAt ?? value.created_at) || 0,
+    updatedAt: Number(value.updatedAt ?? value.updated_at) || 0,
+  };
+}
+
 const REQUEST_METHODS_WITH_THREAD = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
@@ -1112,6 +1212,7 @@ module.exports = {
   createEmptyConversationState,
   ensureConversationInMap,
   mergeConversationTurnsFromThread,
+  normalizeThreadGoal,
   readThreadIdFromParams,
   readTurnIdFromParams,
   readTurnIdFromTurn,

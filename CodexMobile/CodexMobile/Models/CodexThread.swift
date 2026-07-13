@@ -67,11 +67,6 @@ enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case archivedLocal
 }
 
-enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable {
-    case active
-    case completed
-}
-
 struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var title: String?
@@ -89,6 +84,11 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var model: String?
     var modelProvider: String?
     var goalStatus: CodexThreadGoalStatus?
+    var reasoningEffort: String?
+    var serviceTier: String?
+    var runtimeSettingsRevision: Int?
+    var runtimeSettingsUpdatedAt: Double?
+    var runtimeSettingsSource: String?
     var syncState: CodexThreadSyncState
 
     // --- Public initializer ---------------------------------------------------
@@ -110,6 +110,11 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         model: String? = nil,
         modelProvider: String? = nil,
         goalStatus: CodexThreadGoalStatus? = nil,
+        reasoningEffort: String? = nil,
+        serviceTier: String? = nil,
+        runtimeSettingsRevision: Int? = nil,
+        runtimeSettingsUpdatedAt: Double? = nil,
+        runtimeSettingsSource: String? = nil,
         syncState: CodexThreadSyncState = .live
     ) {
         self.id = id
@@ -128,6 +133,11 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.model = Self.normalizeIdentifier(model)
         self.modelProvider = Self.normalizeIdentifier(modelProvider)
         self.goalStatus = goalStatus
+        self.reasoningEffort = Self.normalizeIdentifier(reasoningEffort)
+        self.serviceTier = Self.normalizeIdentifier(serviceTier)
+        self.runtimeSettingsRevision = runtimeSettingsRevision
+        self.runtimeSettingsUpdatedAt = runtimeSettingsUpdatedAt
+        self.runtimeSettingsSource = Self.normalizeIdentifier(runtimeSettingsSource)
         self.syncState = syncState
     }
 
@@ -165,6 +175,16 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case goalStatusSnake = "goal_status"
         case threadGoalStatus
         case threadGoalStatusSnake = "thread_goal_status"
+        case reasoningEffort
+        case reasoningEffortSnake = "reasoning_effort"
+        case serviceTier
+        case serviceTierSnake = "service_tier"
+        case runtimeSettingsRevision
+        case runtimeSettingsRevisionSnake = "runtime_settings_revision"
+        case runtimeSettingsUpdatedAt
+        case runtimeSettingsUpdatedAtSnake = "runtime_settings_updated_at"
+        case runtimeSettingsSource
+        case runtimeSettingsSourceSnake = "runtime_settings_source"
         case syncState
     }
 
@@ -225,6 +245,23 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
             metadataKeys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"]
         )
         goalStatus = Self.decodeGoalStatus(from: container, metadata: metadata)
+        reasoningEffort = Self.decodeIdentifierIfPresent(
+            from: container,
+            keys: [.reasoningEffort, .reasoningEffortSnake]
+        )
+        serviceTier = Self.decodeIdentifierIfPresent(from: container, keys: [.serviceTier, .serviceTierSnake])
+        runtimeSettingsRevision = Self.decodeIntegerIfPresent(
+            from: container,
+            keys: [.runtimeSettingsRevision, .runtimeSettingsRevisionSnake]
+        )
+        runtimeSettingsUpdatedAt = Self.decodeDoubleIfPresent(
+            from: container,
+            keys: [.runtimeSettingsUpdatedAt, .runtimeSettingsUpdatedAtSnake]
+        )
+        runtimeSettingsSource = Self.decodeIdentifierIfPresent(
+            from: container,
+            keys: [.runtimeSettingsSource, .runtimeSettingsSourceSnake]
+        )
         syncState = try container.decodeIfPresent(CodexThreadSyncState.self, forKey: .syncState) ?? .live
     }
 
@@ -249,6 +286,11 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(Self.normalizeIdentifier(model), forKey: .model)
         try container.encodeIfPresent(Self.normalizeIdentifier(modelProvider), forKey: .modelProvider)
         try container.encodeIfPresent(goalStatus, forKey: .threadGoalStatus)
+        try container.encodeIfPresent(Self.normalizeIdentifier(reasoningEffort), forKey: .reasoningEffort)
+        try container.encodeIfPresent(Self.normalizeIdentifier(serviceTier), forKey: .serviceTier)
+        try container.encodeIfPresent(runtimeSettingsRevision, forKey: .runtimeSettingsRevision)
+        try container.encodeIfPresent(runtimeSettingsUpdatedAt, forKey: .runtimeSettingsUpdatedAt)
+        try container.encodeIfPresent(Self.normalizeIdentifier(runtimeSettingsSource), forKey: .runtimeSettingsSource)
         try container.encode(syncState, forKey: .syncState)
     }
 }
@@ -522,6 +564,49 @@ extension CodexThread {
         return nil
     }
 
+    private static func decodeIdentifierIfPresent(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key),
+               let normalized = normalizeIdentifier(value) {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private static func decodeIntegerIfPresent(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        keys: [CodingKeys]
+    ) -> Int? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return Int(value)
+            }
+        }
+        return nil
+    }
+
+    private static func decodeDoubleIfPresent(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        keys: [CodingKeys]
+    ) -> Double? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return Double(value)
+            }
+        }
+        return nil
+    }
+
     private static func decodeThreadIdentity(
         from container: KeyedDecodingContainer<CodingKeys>,
         metadata: [String: JSONValue]?,
@@ -575,7 +660,7 @@ extension CodexThread {
         case "active", "using", "inprogress", "running", "started":
             return .active
         case "completed", "complete", "done", "finished", "succeeded":
-            return .completed
+            return .complete
         default:
             return nil
         }

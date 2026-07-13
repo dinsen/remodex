@@ -233,9 +233,11 @@ extension CodexService {
         var merged: [String: CodexThread] = [:]
         merged.reserveCapacity(max(threads.count, serverThreads.count))
         var snapshotOnlyPinnedIDs: Set<String> = []
+        var stillUnconfirmedSnapshotIDs: Set<String> = []
 
         // Merge active server threads.
         for serverThread in serverThreads {
+            applyRemoteRuntimeSettings(from: serverThread)
             if persistedDeletedIDs.contains(serverThread.id) {
                 continue
             }
@@ -260,6 +262,20 @@ extension CodexService {
         for localThread in threads where merged[localThread.id] == nil {
             if persistedDeletedIDs.contains(localThread.id) {
                 continue
+            }
+            if restoredThreadSnapshotIDs.contains(localThread.id),
+               !isThreadPinned(localThread.id),
+               !persistedArchivedIDs.contains(localThread.id) {
+                guard activeThreadId == localThread.id else {
+                    // The cache is only a first-paint placeholder. Once the
+                    // same capped server window arrives, absent cached rows
+                    // are stale rather than durable local-only threads.
+                    continue
+                }
+                // Keep a row the user opened, but leave it unconfirmed. A
+                // successful history read confirms it; otherwise the next
+                // list refresh prunes it after the user leaves the thread.
+                stillUnconfirmedSnapshotIDs.insert(localThread.id)
             }
             merged[localThread.id] = localThread
             if isThreadPinned(localThread.id), !serverThreadIDs.contains(localThread.id) {
@@ -302,6 +318,7 @@ extension CodexService {
         for threadId in timelineAffectedThreadIDs where threadTimelineStateByThread[threadId] != nil {
             refreshThreadTimelineState(for: threadId)
         }
+        restoredThreadSnapshotIDs = stillUnconfirmedSnapshotIDs
 
         if activeThreadId == nil {
             activeThreadId = firstLiveThreadID()
@@ -613,6 +630,8 @@ extension CodexService {
 
         if isArchived {
             addLocallyArchivedThreadID(threadId)
+            // Archived chats leave the live sidebar, so their goal badge must go too.
+            goalByThreadID.removeValue(forKey: threadId)
             if pinnedThreadIDs.contains(threadId) {
                 unpinThread(threadId)
             }
@@ -652,6 +671,7 @@ extension CodexService {
 
         clearOutcomeBadge(for: threadId)
         latestTurnTerminalStateByThread.removeValue(forKey: threadId)
+        goalByThreadID.removeValue(forKey: threadId)
         persistThreadRename(nil, for: threadId)
 
         // Drop local-only runtime overrides once a chat is fully removed from the device.

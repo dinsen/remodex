@@ -4,52 +4,20 @@
     {
       "blend-mode" : "normal",
       "blur-material" : null,
-      "hidden-specializations" : [
-        {
-          "idiom" : "square",
-          "value" : false
-        }
-      ],
       "layers" : [
         {
           "image-name" : "Fixed-Rounding 2.svg",
-          "name" : "Fixed-Rounding 2",
-          "position-specializations" : [
-            {
-              "value" : {
-                "scale" : 1,
-                "translation-in-points" : [
-                  0.16799999999983584,
-                  0.019967733251746722
-                ]
-              }
-            },
-            {
-              "idiom" : "square",
-              "value" : {
-                "scale" : 0.94,
-                "translation-in-points" : [
-                  0.16799999999983584,
-                  0.019967733251746722
-                ]
-              }
-            }
-          ]
-        }
-      ],
-      "lighting" : "individual",
-      "position-specializations" : [
-        {
-          "idiom" : "square",
-          "value" : {
-            "scale" : 0.99,
+          "name" : "Remodex Dark",
+          "position" : {
+            "scale" : 1,
             "translation-in-points" : [
-              0,
-              0
+              0.26439794274210726,
+              -27.3359375
             ]
           }
         }
       ],
+      "lighting" : "individual",
       "shadow" : {
         "kind" : "layer-color",
         "opacity" : 0.5

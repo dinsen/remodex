@@ -20,10 +20,10 @@ struct AssistantBlockAccessoryState: Equatable {
         copyText: String?,
         showsRunningIndicator: Bool,
         allowsCopy: Bool = false,
-        blockDiffText: String?,
-        blockDiffEntries: [TurnFileChangeSummaryEntry]?,
-        blockRevertPresentation: AssistantRevertPresentation?,
-        blockRevertMessage: CodexMessage?
+        blockDiffText: String? = nil,
+        blockDiffEntries: [TurnFileChangeSummaryEntry]? = nil,
+        blockRevertPresentation: AssistantRevertPresentation? = nil,
+        blockRevertMessage: CodexMessage? = nil
     ) {
         self.copyText = copyText
         self.showsRunningIndicator = showsRunningIndicator
@@ -68,6 +68,18 @@ struct AssistantBlockAccessoryState: Equatable {
         )
     }
 
+    func suppressingCopyAndRunningAccessory() -> AssistantBlockAccessoryState {
+        AssistantBlockAccessoryState(
+            copyText: nil,
+            showsRunningIndicator: false,
+            allowsCopy: false,
+            blockDiffText: blockDiffText,
+            blockDiffEntries: blockDiffEntries,
+            blockRevertPresentation: blockRevertPresentation,
+            blockRevertMessage: blockRevertMessage
+        )
+    }
+
     func mergingRehomedAccessoryState(_ state: AssistantBlockAccessoryState) -> AssistantBlockAccessoryState {
         AssistantBlockAccessoryState(
             copyText: copyText ?? state.copyText,
@@ -83,6 +95,50 @@ struct AssistantBlockAccessoryState: Equatable {
     private static func blockRevertMessageSignature(_ message: CodexMessage?) -> AssistantBlockRevertMessageSignature? {
         guard let message else { return nil }
         return AssistantBlockRevertMessageSignature(message)
+    }
+}
+
+enum TurnTimelineToolBurstAccessoryResolver {
+    static func copyFooterState(
+        for group: TurnTimelineToolBurstGroup,
+        statesByMessageID: [String: AssistantBlockAccessoryState],
+        suppressesRunningIndicator: Bool
+    ) -> AssistantBlockAccessoryState? {
+        guard let hostMessage = group.latestMessage,
+              let state = statesByMessageID[hostMessage.id] else {
+            return nil
+        }
+
+        let resolvedState = suppressesRunningIndicator
+            ? state.replacingRunningIndicator(false)
+            : state
+        guard resolvedState.showsRunningIndicator
+            || (resolvedState.allowsCopy && resolvedState.copyText != nil) else {
+            return nil
+        }
+        return resolvedState
+    }
+}
+
+enum TurnTimelineCommandGroupAccessoryResolver {
+    static func copyFooterState(
+        for group: TurnTimelineCommandGroup,
+        statesByMessageID: [String: AssistantBlockAccessoryState],
+        suppressesRunningIndicator: Bool
+    ) -> AssistantBlockAccessoryState? {
+        guard let hostMessage = group.accessoryHostMessage,
+              let state = statesByMessageID[hostMessage.id] else {
+            return nil
+        }
+
+        let resolvedState = suppressesRunningIndicator
+            ? state.replacingRunningIndicator(false)
+            : state
+        guard resolvedState.showsRunningIndicator
+            || (resolvedState.allowsCopy && resolvedState.copyText != nil) else {
+            return nil
+        }
+        return resolvedState
     }
 }
 
@@ -120,9 +176,10 @@ private struct TurnTimelineMessageRow: View {
     let currentWorkingDirectory: String?
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
-    let autoScrollMode: TurnAutoScrollMode
+    let autoScrollMode: TurnScrollOwnership
     let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
+    let movesCopyAndRunningToGroupFooter: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
     let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
@@ -140,7 +197,7 @@ private struct TurnTimelineMessageRow: View {
             currentWorkingDirectory: currentWorkingDirectory,
             planMatchingFingerprint: planMatchingFingerprint,
             showsStreamingAnimations: !prioritizesComposerInput
-                && autoScrollMode == .followBottom
+                && autoScrollMode.allowsStreamingAnimations
                 && message.id == newestStreamingMessageID,
             prioritizesComposerInput: prioritizesComposerInput,
             inlineCommitAndPushAction: inlineCommitAndPushAction,
@@ -154,9 +211,12 @@ private struct TurnTimelineMessageRow: View {
 
     private var assistantBlockAccessoryState: AssistantBlockAccessoryState? {
         let state = cachedBlockInfoByMessageID[message.id]
-        return showsGlobalRunningIndicator
+        let resolvedState = showsGlobalRunningIndicator
             ? state?.replacingRunningIndicator(false)
             : state
+        return movesCopyAndRunningToGroupFooter
+            ? resolvedState?.suppressingCopyAndRunningAccessory()
+            : resolvedState
     }
 }
 
@@ -171,7 +231,7 @@ private struct TurnTimelineToolBurstView: View {
     let currentWorkingDirectory: String?
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
-    let autoScrollMode: TurnAutoScrollMode
+    let autoScrollMode: TurnScrollOwnership
     let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
@@ -190,6 +250,18 @@ private struct TurnTimelineToolBurstView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if isExpanded {
+                ForEach(group.overflowMessages) { message in
+                    toolMessageRow(message)
+                }
+            }
+
+            // Keep the newest call immediately visible. The disclosure belongs
+            // below the tool rows in both collapsed and expanded states.
+            if let latestMessage = group.latestMessage {
+                toolMessageRow(latestMessage)
+            }
+
             if group.hiddenCount > 0 {
                 Button {
                     withAnimation(.easeInOut(duration: 0.18)) {
@@ -197,7 +269,7 @@ private struct TurnTimelineToolBurstView: View {
                     }
                 } label: {
                     HStack(spacing: 6) {
-                        RemodexIcon.image(systemName: "chevron.right", size: 17, relativeTo: .body)
+                        RemodexIcon.image(systemName: "chevron.right", size: 13, relativeTo: .body)
                             .foregroundStyle(.secondary)
                             .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         HStack(spacing: 0) {
@@ -215,129 +287,40 @@ private struct TurnTimelineToolBurstView: View {
                 .buttonStyle(.plain)
             }
 
-            if isExpanded {
-                ForEach(group.overflowMessages) { message in
-                    TurnTimelineMessageRow(
-                        message: message,
-                        isRetryAvailable: isRetryAvailable,
-                        cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
-                        planSessionSource: planSessionSource,
-                        allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
-                        completedTurnIDs: completedTurnIDs,
-                        threadMessagesForPlanMatching: threadMessagesForPlanMatching,
-                        currentWorkingDirectory: currentWorkingDirectory,
-                        planMatchingFingerprint: planMatchingFingerprint,
-                        newestStreamingMessageID: newestStreamingMessageID,
-                        autoScrollMode: autoScrollMode,
-                        prioritizesComposerInput: prioritizesComposerInput,
-                        showsGlobalRunningIndicator: showsGlobalRunningIndicator,
-                        onRetryUserMessage: onRetryUserMessage,
-                        onTapAssistantRevert: onTapAssistantRevert,
-                        onTapSubagent: onTapSubagent
-                    )
-                }
-            }
-
-            // This is the only call row while collapsed. It stays last when the
-            // history opens too, so it updates in place as the model advances.
-            if let latestMessage = group.latestMessage {
-                TurnTimelineMessageRow(
-                    message: latestMessage,
-                    isRetryAvailable: isRetryAvailable,
-                    cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
-                    planSessionSource: planSessionSource,
-                    allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
-                    completedTurnIDs: completedTurnIDs,
-                    threadMessagesForPlanMatching: threadMessagesForPlanMatching,
-                    currentWorkingDirectory: currentWorkingDirectory,
-                    planMatchingFingerprint: planMatchingFingerprint,
-                    newestStreamingMessageID: newestStreamingMessageID,
-                    autoScrollMode: autoScrollMode,
-                    prioritizesComposerInput: prioritizesComposerInput,
-                    showsGlobalRunningIndicator: showsGlobalRunningIndicator,
-                    onRetryUserMessage: onRetryUserMessage,
-                    onTapAssistantRevert: onTapAssistantRevert,
-                    onTapSubagent: onTapSubagent
+            if let footerState = TurnTimelineToolBurstAccessoryResolver.copyFooterState(
+                for: group,
+                statesByMessageID: cachedBlockInfoByMessageID,
+                suppressesRunningIndicator: showsGlobalRunningIndicator
+            ) {
+                CopyBlockButton(
+                    text: footerState.allowsCopy ? footerState.copyText : nil,
+                    isRunning: footerState.showsRunningIndicator
                 )
             }
         }
-    }
-}
-
-private struct TurnTimelineCommandGroupView: View {
-    let group: TurnTimelineCommandGroup
-    let isRetryAvailable: Bool
-    let cachedBlockInfoByMessageID: [String: AssistantBlockAccessoryState]
-    let planSessionSource: CodexPlanSessionSource?
-    let allowsAssistantPlanFallbackRecovery: Bool
-    let completedTurnIDs: Set<String>
-    let threadMessagesForPlanMatching: [CodexMessage]
-    let currentWorkingDirectory: String?
-    let planMatchingFingerprint: Int
-    let newestStreamingMessageID: String?
-    let autoScrollMode: TurnAutoScrollMode
-    let prioritizesComposerInput: Bool
-    let showsGlobalRunningIndicator: Bool
-    let onRetryUserMessage: (String) -> Void
-    let onTapAssistantRevert: (CodexMessage) -> Void
-    let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
-
-    @State private var isExpanded = false
-
-    private var title: String {
-        group.commandCount == 1 ? "Ran 1 command" : "Ran \(group.commandCount) commands"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    RemodexIcon.image(systemName: "terminal")
-                        .font(AppFont.system(size: 15, weight: .regular))
-                        .foregroundStyle(.secondary)
-                    Text(title)
-                        .font(AppFont.body(weight: .regular))
-                        .foregroundStyle(.secondary)
-                    RemodexIcon.image(systemName: "chevron.right")
-                        .font(AppFont.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(title)
-            .accessibilityHint(isExpanded ? "Collapse command details" : "Expand command details")
-
-            if isExpanded {
-                ForEach(group.messages) { message in
-                    TurnTimelineMessageRow(
-                        message: message,
-                        isRetryAvailable: isRetryAvailable,
-                        cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
-                        planSessionSource: planSessionSource,
-                        allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
-                        completedTurnIDs: completedTurnIDs,
-                        threadMessagesForPlanMatching: threadMessagesForPlanMatching,
-                        currentWorkingDirectory: currentWorkingDirectory,
-                        planMatchingFingerprint: planMatchingFingerprint,
-                        newestStreamingMessageID: newestStreamingMessageID,
-                        autoScrollMode: autoScrollMode,
-                        prioritizesComposerInput: prioritizesComposerInput,
-                        showsGlobalRunningIndicator: showsGlobalRunningIndicator,
-                        onRetryUserMessage: onRetryUserMessage,
-                        onTapAssistantRevert: onTapAssistantRevert,
-                        onTapSubagent: onTapSubagent
-                    )
-                }
-            }
-        }
         .id(group.id)
+    }
+
+    private func toolMessageRow(_ message: CodexMessage) -> some View {
+        TurnTimelineMessageRow(
+            message: message,
+            isRetryAvailable: isRetryAvailable,
+            cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
+            planSessionSource: planSessionSource,
+            allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
+            completedTurnIDs: completedTurnIDs,
+            threadMessagesForPlanMatching: threadMessagesForPlanMatching,
+            currentWorkingDirectory: currentWorkingDirectory,
+            planMatchingFingerprint: planMatchingFingerprint,
+            newestStreamingMessageID: newestStreamingMessageID,
+            autoScrollMode: autoScrollMode,
+            prioritizesComposerInput: prioritizesComposerInput,
+            showsGlobalRunningIndicator: showsGlobalRunningIndicator,
+            movesCopyAndRunningToGroupFooter: message.id == group.latestMessage?.id,
+            onRetryUserMessage: onRetryUserMessage,
+            onTapAssistantRevert: onTapAssistantRevert,
+            onTapSubagent: onTapSubagent
+        )
     }
 }
 
@@ -352,7 +335,7 @@ private struct TurnTimelinePreviousMessagesView: View {
     let currentWorkingDirectory: String?
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
-    let autoScrollMode: TurnAutoScrollMode
+    let autoScrollMode: TurnScrollOwnership
     let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
@@ -410,6 +393,7 @@ private struct TurnTimelinePreviousMessagesView: View {
                         autoScrollMode: autoScrollMode,
                         prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: showsGlobalRunningIndicator,
+                        movesCopyAndRunningToGroupFooter: false,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
                         onTapSubagent: onTapSubagent
@@ -420,6 +404,108 @@ private struct TurnTimelinePreviousMessagesView: View {
             divider
         }
         .id(group.id)
+    }
+}
+
+private struct TurnTimelineCommandGroupView: View {
+    let group: TurnTimelineCommandGroup
+    let isRetryAvailable: Bool
+    let cachedBlockInfoByMessageID: [String: AssistantBlockAccessoryState]
+    let planSessionSource: CodexPlanSessionSource?
+    let allowsAssistantPlanFallbackRecovery: Bool
+    let completedTurnIDs: Set<String>
+    let threadMessagesForPlanMatching: [CodexMessage]
+    let currentWorkingDirectory: String?
+    let planMatchingFingerprint: Int
+    let newestStreamingMessageID: String?
+    let autoScrollMode: TurnScrollOwnership
+    let prioritizesComposerInput: Bool
+    let showsGlobalRunningIndicator: Bool
+    let onRetryUserMessage: (String) -> Void
+    let onTapAssistantRevert: (CodexMessage) -> Void
+    let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
+
+    @State private var isExpanded = false
+
+    private var title: String {
+        var parts = [group.commandCount == 1 ? "Ran 1 command" : "Ran \(group.commandCount) commands"]
+        if group.failedCommandCount > 0 {
+            parts.append("\(group.failedCommandCount) failed")
+        }
+        if group.stoppedCommandCount > 0 {
+            parts.append("\(group.stoppedCommandCount) stopped")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    RemodexIcon.image(systemName: "terminal", size: 17, relativeTo: .body)
+                        .foregroundStyle(.secondary)
+                    Text(title)
+                        .font(AppFont.body(weight: .regular))
+                        .foregroundStyle(.secondary)
+                    RemodexIcon.image(systemName: "chevron.right", size: 13, relativeTo: .body)
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityHint(isExpanded ? "Collapse commands" : "Expand commands")
+
+            if isExpanded {
+                ForEach(group.orderedMessages) { message in
+                    groupedMessageRow(message)
+                }
+            } else {
+                ForEach(group.collapsedDetailMessages) { message in
+                    groupedMessageRow(message)
+                }
+            }
+
+            if let footerState = TurnTimelineCommandGroupAccessoryResolver.copyFooterState(
+                for: group,
+                statesByMessageID: cachedBlockInfoByMessageID,
+                suppressesRunningIndicator: showsGlobalRunningIndicator
+            ) {
+                CopyBlockButton(
+                    text: footerState.allowsCopy ? footerState.copyText : nil,
+                    isRunning: footerState.showsRunningIndicator
+                )
+            }
+        }
+        .id(group.id)
+    }
+
+    private func groupedMessageRow(_ message: CodexMessage) -> some View {
+        TurnTimelineMessageRow(
+            message: message,
+            isRetryAvailable: isRetryAvailable,
+            cachedBlockInfoByMessageID: cachedBlockInfoByMessageID,
+            planSessionSource: planSessionSource,
+            allowsAssistantPlanFallbackRecovery: allowsAssistantPlanFallbackRecovery,
+            completedTurnIDs: completedTurnIDs,
+            threadMessagesForPlanMatching: threadMessagesForPlanMatching,
+            currentWorkingDirectory: currentWorkingDirectory,
+            planMatchingFingerprint: planMatchingFingerprint,
+            newestStreamingMessageID: newestStreamingMessageID,
+            autoScrollMode: autoScrollMode,
+            prioritizesComposerInput: prioritizesComposerInput,
+            showsGlobalRunningIndicator: showsGlobalRunningIndicator,
+            movesCopyAndRunningToGroupFooter: message.id == group.accessoryHostMessage?.id,
+            onRetryUserMessage: onRetryUserMessage,
+            onTapAssistantRevert: onTapAssistantRevert,
+            onTapSubagent: onTapSubagent
+        )
     }
 }
 
@@ -439,13 +525,15 @@ struct TurnTimelineRowsSection: View {
     let currentWorkingDirectory: String?
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
-    let autoScrollMode: TurnAutoScrollMode
+    let autoScrollMode: TurnScrollOwnership
     let prioritizesComposerInput: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
     let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
     let onLoadEarlierMessages: () -> Void
     let pendingStreamingAssistantPlaceholderID: String?
+
+    private static let runningIndicatorRowID = "turn-timeline-running-indicator-row"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -495,6 +583,7 @@ struct TurnTimelineRowsSection: View {
                         autoScrollMode: autoScrollMode,
                         prioritizesComposerInput: prioritizesComposerInput,
                         showsGlobalRunningIndicator: shouldUseGlobalRunningIndicator,
+                        movesCopyAndRunningToGroupFooter: false,
                         onRetryUserMessage: onRetryUserMessage,
                         onTapAssistantRevert: onTapAssistantRevert,
                         onTapSubagent: onTapSubagent
@@ -559,9 +648,13 @@ struct TurnTimelineRowsSection: View {
                 }
             }
 
-            if let pendingStreamingAssistantPlaceholderID {
-                StreamingAssistantPlaceholderSlot()
-                    .id(pendingStreamingAssistantPlaceholderID)
+            if showsGlobalRunningIndicator {
+                // The running indicator is a real timeline row, not a floating overlay,
+                // so it can never draw over scrolled prose. It adopts the hidden empty
+                // streaming assistant row's ID so assistant-response scroll anchoring
+                // still resolves during the pre-first-delta gap.
+                TerminalRunningIndicator()
+                    .id(pendingStreamingAssistantPlaceholderID ?? Self.runningIndicatorRowID)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -199,8 +199,8 @@ final class TurnViewModel {
         pattern: #"[A-Z]+(?=$|[A-Z][a-z]|\d)|[A-Z]?[a-z]+|\d+"#
     )
 
-    init(shouldAnchorToAssistantResponse: Bool = false) {
-        self.shouldAnchorToAssistantResponse = shouldAnchorToAssistantResponse
+    init(isAwaitingAssistantResponse: Bool = false) {
+        self.isAwaitingAssistantResponse = isAwaitingAssistantResponse
     }
 
     var input = ""
@@ -208,7 +208,7 @@ final class TurnViewModel {
     var isHandlingApproval = false
     var isPlanModeArmed = false
     var steeringDraftID: String?
-    var shouldAnchorToAssistantResponse = false
+    var isAwaitingAssistantResponse = false
     var isPhotoPickerPresented = false
     var isCameraPresented = false
     var photoPickerItems: [PhotosPickerItem] = []
@@ -561,7 +561,7 @@ final class TurnViewModel {
         setQueuedDrafts(drafts, codex: codex, threadID: threadID)
         restoreComposerState(from: draft)
         clearComposerAutocomplete()
-        shouldAnchorToAssistantResponse = false
+        isAwaitingAssistantResponse = false
     }
 
     func isSteeringQueuedDraft(_ draftID: String) -> Bool {
@@ -1001,6 +1001,10 @@ final class TurnViewModel {
         thread: CodexThread,
         activeTurnID: String?
     ) {
+        composerMentionedSkills.removeAll { mention in
+            !Self.containsBoundedSkillToken(named: mention.name, in: text)
+        }
+
         guard !isComposerInteractionLocked(activeTurnID: activeTurnID),
               codex.isConnected,
               let token = Self.trailingSkillAutocompleteToken(in: text) else {
@@ -1354,6 +1358,9 @@ final class TurnViewModel {
             resetSlashCommandState(clearPendingSelection: true)
         case .fork:
             slashCommandPanelState = .forkDestinations(availableForkDestinations)
+        case .goal:
+            removeTrailingSlashCommandTokenFromInputIfNeeded()
+            resetSlashCommandState(clearPendingSelection: true)
         case .status:
             removeTrailingSlashCommandTokenFromInputIfNeeded()
             resetSlashCommandState(clearPendingSelection: true)
@@ -1714,7 +1721,7 @@ final class TurnViewModel {
         subscriptions?.consumeFreeSendAttemptIfNeeded()
         isSending = true
         isPlanModeArmed = false
-        shouldAnchorToAssistantResponse = true
+        isAwaitingAssistantResponse = true
         clearComposer()
 
         Task { @MainActor in
@@ -1766,7 +1773,7 @@ final class TurnViewModel {
         subscriptions?.consumeFreeSendAttemptIfNeeded()
         isSending = true
         isPlanModeArmed = false
-        shouldAnchorToAssistantResponse = true
+        isAwaitingAssistantResponse = true
         let draftPreAppendedMessage = preAppendNewThreadUserMessageIfNeeded(
             pendingSend,
             codex: codex,
@@ -1988,7 +1995,7 @@ final class TurnViewModel {
         codex: CodexService,
         draftThreadID: String
     ) {
-        shouldAnchorToAssistantResponse = false
+        isAwaitingAssistantResponse = false
         restoreComposerState(from: pendingSend)
         saveLocalDraft(codex: codex, threadID: draftThreadID, persistToDisk: true)
         if pendingSend.collaborationMode == .plan,
@@ -2016,7 +2023,7 @@ final class TurnViewModel {
             return
         }
         isSending = true
-        shouldAnchorToAssistantResponse = true
+        isAwaitingAssistantResponse = true
 
         Task { @MainActor in
             defer { isSending = false }
@@ -2033,7 +2040,7 @@ final class TurnViewModel {
                 )
                 codex.lastErrorMessage = nil
             } catch {
-                shouldAnchorToAssistantResponse = false
+                isAwaitingAssistantResponse = false
                 prependQueuedDraft(nextDraft, codex: codex, threadID: threadID)
                 let queueErrorMessage = codex.userFacingTurnErrorMessage(from: error)
                 setQueuePauseState(.paused(errorMessage: queueErrorMessage), codex: codex, threadID: threadID)
@@ -2068,7 +2075,7 @@ final class TurnViewModel {
         }
 
         steeringDraftID = id
-        shouldAnchorToAssistantResponse = true
+        isAwaitingAssistantResponse = true
 
         Task { @MainActor in
             defer { steeringDraftID = nil }
@@ -2105,7 +2112,7 @@ final class TurnViewModel {
                 )
                 removeQueuedDraft(id: id, codex: codex, threadID: threadID)
             } catch {
-                shouldAnchorToAssistantResponse = false
+                isAwaitingAssistantResponse = false
                 codex.removeLatestFailedUserMessage(
                     threadId: threadID,
                     matchingText: draft.text,
@@ -2886,19 +2893,19 @@ final class TurnViewModel {
     ) async {
         if pendingSend.rawReviewSelection != nil {
             restoreComposerState(from: pendingSend)
-            shouldAnchorToAssistantResponse = false
+            isAwaitingAssistantResponse = false
             codex.lastErrorMessage = "Wait for the current run to finish before starting a code review."
             return
         }
 
         guard let queuedDraft else {
             restoreComposerState(from: pendingSend)
-            shouldAnchorToAssistantResponse = false
+            isAwaitingAssistantResponse = false
             return
         }
 
         isPlanModeArmed = false
-        shouldAnchorToAssistantResponse = true
+        isAwaitingAssistantResponse = true
         appendQueuedDraft(queuedDraft, codex: codex, threadID: threadID)
         clearLocalDraft(codex: codex, threadID: threadID, persistToDisk: true)
     }
@@ -3209,6 +3216,22 @@ final class TurnViewModel {
         let matchRange = Range(match.range, in: text)!
         result.replaceSubrange(matchRange, with: "")
         return result
+    }
+
+    static func containsBoundedSkillToken(named name: String, in text: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let escaped = NSRegularExpression.escapedPattern(for: trimmed)
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<!\\S)[$/]" + escaped + "(?=[\\s,.;:!?)\\]}>]|$)",
+            options: [.caseInsensitive]
+        ) else {
+            return false
+        }
+        return regex.firstMatch(
+            in: text,
+            range: NSRange(location: 0, length: (text as NSString).length)
+        ) != nil
     }
 
     /// Replaces all boundary-safe occurrences of `token` with `replacement`.
