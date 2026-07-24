@@ -16,15 +16,24 @@ function createCodexTransport({
   platform = process.platform,
   spawnImpl = spawn,
   WebSocketImpl = WebSocket,
+  retryDelayMs,
+  setTimeoutImpl,
 } = {}) {
   if (endpoint) {
     return createWebSocketTransport({ endpoint, WebSocketImpl });
   }
 
-  return createSpawnTransport({ env, appPath, platform, spawnImpl });
+  return createSpawnTransport({ env, appPath, platform, spawnImpl, retryDelayMs, setTimeoutImpl });
 }
 
-function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
+function createSpawnTransport({
+  env,
+  appPath,
+  platform,
+  spawnImpl = spawn,
+  retryDelayMs = 1_500,
+  setTimeoutImpl = setTimeout,
+}) {
   const launchPlans = createCodexLaunchPlans({ env, appPath, platform });
   let launchIndex = -1;
   let activeLaunch = null;
@@ -33,6 +42,7 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
   let stderrBuffer = "";
   let didRequestShutdown = false;
   let didReportError = false;
+  let databaseLockedRetryCount = 0;
   const listeners = createListenerBag();
 
   spawnNextLaunch();
@@ -71,15 +81,29 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
   // `codex` command is unavailable in daemon environments like launchd.
   function spawnNextLaunch() {
     launchIndex += 1;
+    databaseLockedRetryCount = 0;
     activeLaunch = launchPlans[launchIndex] || null;
     if (!activeLaunch) {
       return;
     }
 
+    spawnActiveLaunch();
+  }
+
+  function spawnActiveLaunch() {
     stdoutBuffer = "";
     stderrBuffer = "";
     codex = spawnImpl(activeLaunch.command, activeLaunch.args, activeLaunch.options);
     attachChildListeners(codex, activeLaunch);
+  }
+
+  function retryActiveLaunchAfterDelay() {
+    databaseLockedRetryCount += 1;
+    setTimeoutImpl(() => {
+      if (!didRequestShutdown && !didReportError) {
+        spawnActiveLaunch();
+      }
+    }, retryDelayMs);
   }
 
   function attachChildListeners(child, launch) {
@@ -108,6 +132,11 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
     });
     child.on("close", (code, signal) => {
       if (child !== codex) {
+        return;
+      }
+
+      if (!didRequestShutdown && !didReportError && shouldRetryDatabaseLockedLaunch(stderrBuffer, databaseLockedRetryCount)) {
+        retryActiveLaunchAfterDelay();
         return;
       }
 
@@ -295,6 +324,10 @@ function shouldRetryLaunchError(error, launchIndex, launchPlans) {
   return error?.code === "ENOENT" && launchIndex < launchPlans.length - 1;
 }
 
+function shouldRetryDatabaseLockedLaunch(stderrBuffer, retryCount) {
+  return retryCount < 5 && /database is locked|sqlite.*locked/i.test(String(stderrBuffer || ""));
+}
+
 function createWebSocketTransport({ endpoint, WebSocketImpl = WebSocket }) {
   const socket = new WebSocketImpl(endpoint);
   const listeners = createListenerBag();
@@ -377,4 +410,5 @@ module.exports = {
   createCodexTransport,
   extractMissingEnvironmentVariable,
   formatCodexLaunchFailure,
+  shouldRetryDatabaseLockedLaunch,
 };

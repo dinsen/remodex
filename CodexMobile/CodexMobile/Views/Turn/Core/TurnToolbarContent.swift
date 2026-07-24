@@ -15,6 +15,7 @@ struct TurnThreadNavigationContext {
 
 struct TurnToolbarContent: ToolbarContent {
     let displayTitle: String
+    let sessionID: String?
     let navigationContext: TurnThreadNavigationContext?
     let showsThreadActions: Bool
     let isHandingOffToMac: Bool
@@ -191,6 +192,18 @@ struct TurnToolbarContent: ToolbarContent {
                 onTapTerminal?()
             },
         ])
+
+        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sessionID.isEmpty {
+            actions.append(
+                TurnThreadActionMenuItem(
+                    title: "Copy session ID",
+                    icon: .system("doc.on.doc")
+                ) {
+                    UIPasteboard.general.string = sessionID
+                }
+            )
+        }
 
         return actions
     }

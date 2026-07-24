@@ -72,13 +72,14 @@ struct ThinkingSystemBlock: View {
 
         let capitalised = leading.prefix(1).uppercased() + leading.dropFirst()
 
-        return Text(capitalised)
-            .font(AppFont.caption(weight: .medium))
-            .foregroundStyle(.secondary)
-        +
-        Text(remainder)
-            .font(AppFont.caption())
-            .foregroundStyle(.tertiary)
+        var text = AttributedString(capitalised)
+        text.font = AppFont.caption(weight: .medium)
+        text.foregroundColor = .secondary
+        var remainderText = AttributedString(remainder)
+        remainderText.font = AppFont.caption()
+        remainderText.foregroundColor = Color.secondary.opacity(0.65)
+        text.append(remainderText)
+        return Text(text)
     }
 }
 

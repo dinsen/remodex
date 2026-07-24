@@ -5,34 +5,116 @@
 // Depends on: Foundation, SwiftUI, UIKit, CodexImageAttachment, HapticFeedback
 
 import Foundation
+import ImageIO
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 @MainActor
 private enum UserAttachmentThumbnailCache {
     private static let cache = NSCache<NSString, UIImage>()
 
-    static func image(for attachment: CodexImageAttachment) -> UIImage? {
-        guard !attachment.thumbnailBase64JPEG.isEmpty else {
-            return nil
-        }
-
-        let key = cacheKey(for: attachment)
-        if let cached = cache.object(forKey: key as NSString) {
-            return cached
-        }
-
-        guard let data = Data(base64Encoded: attachment.thumbnailBase64JPEG),
-              let image = UIImage(data: data) else {
-            return nil
-        }
-        cache.setObject(image, forKey: key as NSString)
-        return image
+    static func image(forKey key: String) -> UIImage? {
+        cache.object(forKey: key as NSString)
     }
 
-    // Thumbnail decoding used to happen from the SwiftUI body on every row redraw.
-    private static func cacheKey(for attachment: CodexImageAttachment) -> String {
-        "\(attachment.id)|\(attachment.thumbnailContentFingerprint.cacheKey)"
+    static func insert(_ image: UIImage, forKey key: String) {
+        cache.setObject(image, forKey: key as NSString)
+    }
+
+    nonisolated static func cacheKey(for attachment: CodexImageAttachment) -> String {
+        [
+            attachment.id,
+            attachment.thumbnailContentFingerprint.cacheKey,
+            attachment.payloadContentFingerprint?.cacheKey ?? "no-payload",
+        ].joined(separator: "|")
+    }
+}
+
+private enum UserAttachmentThumbnailDecoder {
+    struct DecodedThumbnail: @unchecked Sendable {
+        let image: UIImage
+    }
+
+    nonisolated static func thumbnailImage(for attachment: CodexImageAttachment, maxPixelSize: Int) -> DecodedThumbnail? {
+        guard let thumbnailData = thumbnailJPEGData(for: attachment, maxPixelSize: maxPixelSize),
+              let image = UIImage(data: thumbnailData)
+        else {
+            return nil
+        }
+        return DecodedThumbnail(image: image)
+    }
+
+    nonisolated static func thumbnailJPEGData(for attachment: CodexImageAttachment, maxPixelSize: Int) -> Data? {
+        let thumbnailBase64 = attachment.thumbnailBase64JPEG.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !thumbnailBase64.isEmpty,
+           let thumbnailData = Data(base64Encoded: thumbnailBase64)
+        {
+            return thumbnailData
+        }
+
+        guard let payloadDataURL = attachment.payloadDataURL,
+              let imageData = decodeImageDataFromDataURL(payloadDataURL)
+        else {
+            return nil
+        }
+
+        return downsampledJPEGData(from: imageData, maxPixelSize: maxPixelSize)
+    }
+
+    private nonisolated static func decodeImageDataFromDataURL(_ dataURL: String) -> Data? {
+        guard let commaIndex = dataURL.firstIndex(of: ",") else {
+            return nil
+        }
+
+        let metadata = dataURL[..<commaIndex].lowercased()
+        guard metadata.hasPrefix("data:image"),
+              metadata.contains(";base64")
+        else {
+            return nil
+        }
+
+        let payloadStart = dataURL.index(after: commaIndex)
+        return Data(base64Encoded: String(dataURL[payloadStart...]))
+    }
+
+    private nonisolated static func downsampledJPEGData(from imageData: Data, maxPixelSize: Int) -> Data? {
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil) else {
+            return nil
+        }
+
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize),
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ) else {
+            return nil
+        }
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+
+        let destinationOptions: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: 0.75,
+        ]
+        CGImageDestinationAddImage(destination, thumbnail, destinationOptions as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+        return output as Data
     }
 }
 
@@ -40,35 +122,68 @@ private struct UserAttachmentThumbnailView: View {
     let attachment: CodexImageAttachment
     private let side = TurnAttachmentThumbnailMetrics.side
     private let cornerRadius = TurnAttachmentThumbnailMetrics.cornerRadius
+    @Environment(\.displayScale) private var displayScale
+    @State private var thumbnailUIImage: UIImage?
 
     var body: some View {
-        if let image = thumbnailUIImage {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: side, height: side)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(Color(.separator), lineWidth: 1)
-                )
-        } else {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(Color(.secondarySystemFill))
-                .frame(width: side, height: side)
-                .overlay(
-                    RemodexIcon.image(systemName: "photo")
-                        .foregroundStyle(.secondary)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(Color(.separator), lineWidth: 1)
-                )
+        Group {
+            if let image = thumbnailUIImage ?? UserAttachmentThumbnailCache.image(forKey: cacheKey) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: side, height: side)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .stroke(Color(.separator), lineWidth: 1)
+                    )
+            } else {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(Color(.secondarySystemFill))
+                    .frame(width: side, height: side)
+                    .overlay(
+                        RemodexIcon.image(systemName: "photo")
+                            .foregroundStyle(.secondary)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .stroke(Color(.separator), lineWidth: 1)
+                    )
+            }
+        }
+        .task(id: cacheKey) {
+            await loadThumbnailIfNeeded()
         }
     }
 
-    private var thumbnailUIImage: UIImage? {
-        UserAttachmentThumbnailCache.image(for: attachment)
+    private var cacheKey: String {
+        UserAttachmentThumbnailCache.cacheKey(for: attachment)
+    }
+
+    @MainActor
+    private func loadThumbnailIfNeeded() async {
+        if let cached = UserAttachmentThumbnailCache.image(forKey: cacheKey) {
+            thumbnailUIImage = cached
+            return
+        }
+
+        let cacheKey = cacheKey
+        let attachment = attachment
+        let maxPixelSize = Int(ceil(side * max(displayScale, 1)))
+        let decodedThumbnail = await Task.detached(priority: .utility) {
+            UserAttachmentThumbnailDecoder.thumbnailImage(
+                for: attachment,
+                maxPixelSize: maxPixelSize
+            )
+        }.value
+        guard !Task.isCancelled,
+              let image = decodedThumbnail?.image
+        else {
+            return
+        }
+
+        UserAttachmentThumbnailCache.insert(image, forKey: cacheKey)
+        thumbnailUIImage = image
     }
 }
 
@@ -97,11 +212,13 @@ enum AttachmentPreviewImageResolver {
     static func resolve(_ attachment: CodexImageAttachment) -> UIImage? {
         if let payloadDataURL = attachment.payloadDataURL,
            let imageData = decodeImageDataFromDataURL(payloadDataURL),
-           let image = UIImage(data: imageData) {
+           let image = UIImage(data: imageData)
+        {
             return image
         }
 
-        return UserAttachmentThumbnailCache.image(for: attachment)
+        let cacheKey = UserAttachmentThumbnailCache.cacheKey(for: attachment)
+        return UserAttachmentThumbnailCache.image(forKey: cacheKey)
     }
 
     private static func decodeImageDataFromDataURL(_ dataURL: String) -> Data? {
@@ -111,7 +228,8 @@ enum AttachmentPreviewImageResolver {
 
         let metadata = dataURL[..<commaIndex].lowercased()
         guard metadata.hasPrefix("data:image"),
-              metadata.contains(";base64") else {
+              metadata.contains(";base64")
+        else {
             return nil
         }
 

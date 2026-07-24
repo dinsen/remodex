@@ -1462,6 +1462,77 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertTrue(laterInactiveSnapshot.completedConversations.isEmpty)
     }
 
+    func testDisplayIslandTimelineFingerprintIgnoresStreamingTokenChurnWithinSameState() {
+        let service = makeService()
+        let coordinator = RemodexDisplayIslandCoordinator()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        service.threads = [
+            CodexThread(id: threadID, title: "Streaming chat", cwd: "/tmp/remodex"),
+        ]
+        service.runningThreadIDs.insert(threadID)
+
+        _ = service.timelineState(for: threadID)
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "final-answer",
+            assistantPhase: "final_answer",
+            delta: "First"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        let firstSnapshot = service.timelineState(for: threadID).renderSnapshot
+        let firstFingerprint = coordinator.timelineFingerprint(codex: service)
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "final-answer",
+            assistantPhase: "final_answer",
+            delta: " chunk"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        let secondSnapshot = service.timelineState(for: threadID).renderSnapshot
+        let secondFingerprint = coordinator.timelineFingerprint(codex: service)
+
+        XCTAssertGreaterThan(secondSnapshot.timelineChangeToken, firstSnapshot.timelineChangeToken)
+        XCTAssertEqual(firstFingerprint, secondFingerprint)
+    }
+
+    func testDisplayIslandTimelineFingerprintChangesWhenRunningStateChanges() {
+        let service = makeService()
+        let coordinator = RemodexDisplayIslandCoordinator()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        service.threads = [
+            CodexThread(id: threadID, title: "Streaming chat", cwd: "/tmp/remodex"),
+        ]
+        service.runningThreadIDs.insert(threadID)
+
+        _ = service.timelineState(for: threadID)
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "commentary",
+            assistantPhase: "commentary",
+            delta: "Working"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        let runningFingerprint = coordinator.timelineFingerprint(codex: service)
+
+        service.appendAssistantDelta(
+            threadId: threadID,
+            turnId: turnID,
+            itemId: "final-answer",
+            assistantPhase: "final_answer",
+            delta: "Answer"
+        )
+        service.flushPendingAssistantDeltas(for: threadID, turnId: turnID)
+        let finishingFingerprint = coordinator.timelineFingerprint(codex: service)
+
+        XCTAssertNotEqual(runningFingerprint, finishingFingerprint)
+    }
+
     func testThreadHasActiveOrRunningTurnUsesRunningFallback() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -2625,6 +2696,28 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
     func testMergeAssistantDeltaKeepsLongReplayOverlapWithoutDuplication() {
         let service = makeService()
         let overlap = String(repeating: "a", count: 300)
+        let existing = "prefix-" + overlap
+        let incoming = overlap + "-suffix"
+
+        let merged = service.mergeAssistantDelta(existingText: existing, incomingDelta: incoming)
+
+        XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
+    }
+
+    func testMergeAssistantDeltaKeepsLargeReplayOverlapWithoutDuplication() {
+        let service = makeService()
+        let overlap = String(repeating: "a", count: 20_000)
+        let existing = "prefix-" + overlap
+        let incoming = overlap + "-suffix"
+
+        let merged = service.mergeAssistantDelta(existingText: existing, incomingDelta: incoming)
+
+        XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
+    }
+
+    func testMergeAssistantDeltaPreservesUnicodeBoundaryWhenOverlappingReplay() {
+        let service = makeService()
+        let overlap = String(repeating: "å", count: 256)
         let existing = "prefix-" + overlap
         let incoming = overlap + "-suffix"
 

@@ -298,6 +298,8 @@ extension TurnTimelineView {
                 ids.formUnion(group.orderedMessages.map(\.id))
             case .previousMessages:
                 break
+            case .commandGroup:
+                break
             }
         }
         return ids

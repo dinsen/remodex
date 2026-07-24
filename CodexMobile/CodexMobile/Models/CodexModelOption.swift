@@ -26,13 +26,20 @@ struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
         supportedReasoningEfforts: [CodexReasoningEffortOption],
         defaultReasoningEffort: String?
     ) {
+        let normalizedEfforts = supportedReasoningEfforts.filter {
+            !$0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         self.id = id
         self.model = model
         self.displayName = displayName
         self.description = description
         self.isDefault = isDefault
         self.supportsFastMode = supportsFastMode
-        self.supportedReasoningEfforts = supportedReasoningEfforts
+        self.supportedReasoningEfforts = CodexModelCapabilityResolver.supportedReasoningEfforts(
+            model: model,
+            id: id,
+            advertised: normalizedEfforts
+        )
         self.defaultReasoningEffort = defaultReasoningEffort
     }
 
@@ -114,7 +121,11 @@ struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
             explicitFastMode: explicitFastMode,
             additionalSpeedTiers: additionalSpeedTiers
         )
-        supportedReasoningEfforts = normalizedEfforts
+        supportedReasoningEfforts = CodexModelCapabilityResolver.supportedReasoningEfforts(
+            model: normalizedModel,
+            id: normalizedID,
+            advertised: normalizedEfforts
+        )
 
         let normalizedDefault = defaultEffort?.trimmingCharacters(in: .whitespacesAndNewlines)
         defaultReasoningEffort = (normalizedDefault?.isEmpty == true) ? nil : normalizedDefault
@@ -179,6 +190,10 @@ private enum CodexModelCapabilityResolver {
         "gpt-5.2-codex",
         "gpt-5.2",
     ]
+    // Older model/list payloads can omit GPT-5.5's full reasoning menu even though desktop supports it.
+    private static let staticReasoningEffortsByModelIdentifier: [String: [String]] = [
+        "gpt-5.5": ["low", "medium", "high", "xhigh"],
+    ]
 
     static func supportsFastMode(
         model: String,
@@ -193,6 +208,33 @@ private enum CodexModelCapabilityResolver {
             return true
         }
         return staticFastModeFallback(for: [model, id])
+    }
+
+    static func supportedReasoningEfforts(
+        model: String,
+        id: String,
+        advertised: [CodexReasoningEffortOption]
+    ) -> [CodexReasoningEffortOption] {
+        let identifiers = [model, id].map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let fallbackEfforts = identifiers.compactMap {
+            staticReasoningEffortsByModelIdentifier[$0]
+        }.first
+        guard let fallbackEfforts else {
+            return advertised
+        }
+
+        var result = advertised
+        var seen = Set(
+            advertised.map {
+                $0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        )
+        for effort in fallbackEfforts where seen.insert(effort).inserted {
+            result.append(CodexReasoningEffortOption(reasoningEffort: effort, description: ""))
+        }
+        return result
     }
 
     private static func supportsServiceTier(

@@ -8,7 +8,7 @@ These Terms of Use ("Terms") govern your access to and use of the Remodex mobile
 
 ## 1. Description of the App
 
-Remodex is an iOS companion app for controlling a Codex runtime on your Mac. The App can connect to your Mac directly or through a developer-operated hosted relay. Core features include real-time chat, git actions, photo attachments, voice transcription, pairing, trusted reconnect, and subscription-gated functionality.
+Remodex is an iOS companion app for controlling a Codex runtime on your Mac. The App can connect to your Mac directly or through a developer-operated hosted relay. Core features include real-time chat, git actions, photo attachments, voice transcription, pairing, trusted reconnect, and local-first companion functionality.
 
 Most coding, repository, and workspace operations run on your paired Mac, not on our hosted relay.
 
@@ -20,31 +20,9 @@ You must be at least 13 years old, or the minimum age required in your jurisdict
 
 The App does not require a Remodex user account. Instead, it pairs with your Mac through a QR code flow and secure cryptographic session setup. You are responsible for keeping your paired devices secure and for activity performed through your paired environment.
 
-## 4. Pro Subscription
+## 4. App Access
 
-### 4.1 Subscription Features
-
-The App offers an optional Pro subscription. Pro may include features such as:
-
-- faster service tiers or related runtime defaults
-- git actions from iPhone
-- voice transcription
-- subagents and slash-command workflows
-- access to developer-operated hosted relay/connectivity features
-
-Feature availability can vary based on the connected runtime, platform limitations, and your current build/configuration.
-
-### 4.2 Billing
-
-- Payment is charged to your Apple ID account at confirmation of purchase.
-- Subscriptions renew automatically unless cancelled at least 24 hours before the end of the billing period.
-- Renewal is charged by Apple within 24 hours before the current period ends.
-- You can manage or cancel subscriptions in your Apple account settings.
-
-### 4.3 Trials and Refunds
-
-- If a free trial is offered, any unused portion is forfeited when you purchase a subscription.
-- Refunds are handled by Apple under App Store rules.
+The public local-first build does not include external subscription or entitlement handling. Feature availability can vary based on the connected runtime, platform limitations, and your current build/configuration.
 
 ## 5. Developer-Operated Services
 
@@ -59,8 +37,7 @@ These services are part of the Remodex product offering. They do not run Codex f
 
 The App also relies on third-party services, including:
 
-- **Apple** for App Store billing, subscriptions, and platform services
-- **RevenueCat** for subscription/entitlement handling
+- **Apple** for App Store distribution and platform services
 - **OpenAI / ChatGPT** for voice transcription when you use voice mode
 
 Your use of those services may also be subject to their own terms and privacy policies.
@@ -72,7 +49,7 @@ You agree not to:
 - use the App for unlawful purposes
 - interfere with or abuse the App, bridge, relay, or connected runtime
 - transmit malware, harmful payloads, or abusive traffic
-- attempt to bypass security, entitlement, or pairing protections
+- attempt to bypass security or pairing protections
 - use the App to infringe the rights of others
 
 ## 8. Open Source
@@ -85,7 +62,7 @@ The Remodex name, branding, and app presentation are owned by the Developer, exc
 
 ## 10. Availability and Changes
 
-We may update, change, suspend, or discontinue features of the App, hosted relay, pricing, or subscription offerings at any time. We may also update these Terms, and your continued use after an update constitutes acceptance of the revised Terms.
+We may update, change, suspend, or discontinue features of the App or hosted relay at any time. We may also update these Terms, and your continued use after an update constitutes acceptance of the revised Terms.
 
 ## 11. Disclaimer of Warranties
 
@@ -95,7 +72,7 @@ THE APP AND ANY RELATED SERVICES ARE PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT
 
 TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE DEVELOPER WILL NOT BE LIABLE FOR INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, PROFITS, REVENUE, OR BUSINESS OPPORTUNITY, ARISING FROM OR RELATED TO YOUR USE OF THE APP OR RELATED SERVICES.
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE DEVELOPER'S TOTAL LIABILITY FOR ANY CLAIM ARISING OUT OF OR RELATING TO THE APP OR RELATED SERVICES WILL NOT EXCEED THE AMOUNT YOU PAID FOR THE APP'S SUBSCRIPTIONS IN THE TWELVE (12) MONTHS BEFORE THE CLAIM.
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE DEVELOPER'S TOTAL LIABILITY FOR ANY CLAIM ARISING OUT OF OR RELATING TO THE APP OR RELATED SERVICES WILL NOT EXCEED THE AMOUNT YOU PAID FOR THE APP OR RELATED SERVICES IN THE TWELVE (12) MONTHS BEFORE THE CLAIM.
 
 ## 13. Suspension and Termination
 

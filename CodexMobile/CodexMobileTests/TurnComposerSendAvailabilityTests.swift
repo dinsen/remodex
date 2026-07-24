@@ -192,6 +192,130 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertEqual(service.thread(for: "thread-new")?.displayTitle, "First message")
     }
 
+    func testSendTurnKeepsSelectedThreadWhenResumeTemporarilyReportsMissing() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.upsertThread(CodexThread(id: "thread-selected", title: "Selected"))
+
+        var recordedMethods: [String] = []
+        var turnStartThreadID: String?
+        service.requestTransportOverride = { method, params in
+            recordedMethods.append(method)
+            switch method {
+            case "thread/resume":
+                throw CodexServiceError.rpcError(
+                    RPCError(code: -32000, message: "thread not found")
+                )
+            case "turn/start":
+                turnStartThreadID = params?.objectValue?["threadId"]?.stringValue
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["turnId": .string("turn-selected")]),
+                    includeJSONRPC: false
+                )
+            case "thread/generateTitle":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["title": .string("Follow up")]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        let viewModel = TurnViewModel()
+        viewModel.input = "Follow up"
+
+        viewModel.sendTurn(codex: service, threadID: "thread-selected")
+        await waitForSendCompletion(viewModel)
+
+        XCTAssertEqual(recordedMethods.filter { $0 == "thread/start" }.count, 0)
+        XCTAssertEqual(recordedMethods.filter { $0 == "turn/start" }.count, 1)
+        XCTAssertEqual(turnStartThreadID, "thread-selected")
+        XCTAssertEqual(service.activeThreadId, "thread-selected")
+        XCTAssertEqual(service.thread(for: "thread-selected")?.syncState, .live)
+        XCTAssertEqual(service.messages(for: "thread-selected").filter { $0.role == .user }.count, 1)
+        XCTAssertEqual(service.messages(for: "thread-selected").first?.turnId, "turn-selected")
+    }
+
+    func testSendTurnMovesPendingMessageToContinuationWhenOriginalThreadIsMissing() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        var recordedMethods: [String] = []
+        var turnStartThreadIDs: [String] = []
+        service.requestTransportOverride = { method, params in
+            recordedMethods.append(method)
+            switch method {
+            case "thread/resume":
+                throw CodexServiceError.rpcError(
+                    RPCError(code: -32000, message: "thread not found")
+                )
+            case "thread/start":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "thread": .object([
+                            "id": .string("thread-continuation"),
+                            "title": .string(CodexThread.defaultDisplayTitle),
+                            "cwd": .string("/tmp/remodex-local"),
+                        ]),
+                    ]),
+                    includeJSONRPC: false
+                )
+            case "workspace/checkpointCapture":
+                return self.workspaceCheckpointResponse(threadID: "thread-continuation", kind: "messageStart")
+            case "workspace/checkpointCopy":
+                return self.workspaceCheckpointResponse(threadID: "thread-continuation", kind: "turnStart", copied: true)
+            case "turn/start":
+                let threadID = params?.objectValue?["threadId"]?.stringValue
+                turnStartThreadIDs.append(threadID ?? "")
+                if threadID == "thread-missing" {
+                    throw CodexServiceError.rpcError(
+                        RPCError(code: -32000, message: "thread not found")
+                    )
+                }
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["turnId": .string("turn-continuation")]),
+                    includeJSONRPC: false
+                )
+            case "thread/generateTitle":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["title": .string("Continue this")]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        let viewModel = TurnViewModel()
+        viewModel.input = "Continue this"
+
+        viewModel.sendTurn(codex: service, threadID: "thread-missing")
+        await waitForSendCompletion(viewModel)
+
+        let continuationUserMessages = service.messages(for: "thread-continuation").filter { $0.role == .user }
+
+        XCTAssertEqual(service.activeThreadId, "thread-continuation")
+        XCTAssertTrue(service.messages(for: "thread-missing").isEmpty)
+        XCTAssertEqual(continuationUserMessages.count, 1)
+        XCTAssertEqual(continuationUserMessages.first?.text, "Continue this")
+        XCTAssertEqual(continuationUserMessages.first?.deliveryState, .confirmed)
+        XCTAssertEqual(continuationUserMessages.first?.turnId, "turn-continuation")
+        XCTAssertEqual(recordedMethods.filter { $0 == "thread/resume" }.count, 1)
+        XCTAssertEqual(recordedMethods.filter { $0 == "thread/start" }.count, 1)
+        XCTAssertEqual(recordedMethods.filter { $0 == "turn/start" }.count, 2)
+        XCTAssertEqual(turnStartThreadIDs, ["thread-missing", "thread-continuation"])
+    }
+
     func testLocalDraftRestoresComposerStateForSameThread() {
         let service = makeService()
         let firstViewModel = TurnViewModel()
@@ -227,6 +351,39 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertEqual(secondViewModel.readyComposerAttachments, [attachment])
         XCTAssertTrue(secondViewModel.isPlanModeArmed)
         XCTAssertTrue(secondViewModel.isSubagentsSelectionArmed)
+    }
+
+    func testTypingLocalDraftSaveDebouncesServiceDraftMutation() async {
+        let service = makeService()
+        let viewModel = TurnViewModel()
+        let threadID = "thread-typing-draft"
+
+        viewModel.input = "H"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+
+        XCTAssertNil(service.composerDraft(for: threadID))
+
+        viewModel.input = "Hello"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+
+        XCTAssertNil(service.composerDraft(for: threadID))
+
+        let savedInput = await waitForDraftInput(service, threadID: threadID)
+        XCTAssertEqual(savedInput, "Hello")
+    }
+
+    func testLifecycleLocalDraftSaveFlushesPendingTypingDraftImmediately() {
+        let service = makeService()
+        let viewModel = TurnViewModel()
+        let threadID = "thread-typing-flush"
+
+        viewModel.input = "Pending"
+        viewModel.scheduleTypingLocalDraftSave(codex: service, threadID: threadID)
+        viewModel.input = "Latest"
+
+        viewModel.saveLifecycleLocalDraft(codex: service, threadID: threadID)
+
+        XCTAssertEqual(service.composerDraft(for: threadID)?.input, "Latest")
     }
 
     func testLocalDraftReflectsRemovedAttachment() {
@@ -1012,6 +1169,20 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         return service.composerDraft(for: threadID)?.attachments.first(where: { $0.id == attachmentID })
     }
 
+    private func waitForDraftInput(
+        _ service: CodexService,
+        threadID: String,
+        maxPollCount: Int = 120
+    ) async -> String? {
+        for _ in 0..<maxPollCount {
+            if let input = service.composerDraft(for: threadID)?.input {
+                return input
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return service.composerDraft(for: threadID)?.input
+    }
+
     private func textInput(from params: JSONValue?) -> String? {
         params?
             .objectValue?["input"]?
@@ -1021,12 +1192,16 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             .stringValue
     }
 
-    private func workspaceCheckpointResponse(kind: String, copied: Bool? = nil) -> RPCMessage {
+    private func workspaceCheckpointResponse(
+        threadID: String = "thread-new",
+        kind: String,
+        copied: Bool? = nil
+    ) -> RPCMessage {
         var result: RPCObject = [
             "repoRoot": .string("/tmp/remodex-local"),
             "checkpointRef": .string("refs/remodex/checkpoints/test"),
             "checkpointKind": .string(kind),
-            "threadId": .string("thread-new"),
+            "threadId": .string(threadID),
         ]
         if let copied {
             result["copied"] = .bool(copied)

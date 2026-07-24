@@ -494,6 +494,7 @@ function collectRecentRolloutFiles(
       candidates.push({
         filePath: fullPath,
         mtimeMs: stat.mtimeMs,
+        size: stat.size,
       });
     }
   }
@@ -830,6 +831,7 @@ function isRetryableFilesystemError(error) {
 module.exports = {
   watchThreadRollout,
   createThreadRolloutActivityWatcher,
+  collectRecentRolloutFiles,
   contextUsageFromTokenCountPayload,
   readLatestContextWindowUsage,
   resolveSessionsRoot,

@@ -1,5 +1,5 @@
 // FILE: SubscriptionServiceAccessTests.swift
-// Purpose: Verifies the local free-send gate allows 5 attempts before the hard paywall path.
+// Purpose: Verifies local-first subscription access never blocks app sends.
 // Layer: Unit Test
 // Exports: SubscriptionServiceAccessTests
 // Depends on: XCTest, CodexMobile
@@ -9,8 +9,22 @@ import XCTest
 
 @MainActor
 final class SubscriptionServiceAccessTests: XCTestCase {
-    func testFreshFreeUserStartsWithFiveAttempts() {
+    func testFreshInstallStartsWithLocalProAccess() {
         let service = makeService()
+
+        XCTAssertTrue(service.hasProAccess)
+        XCTAssertTrue(service.hasAppAccess)
+        XCTAssertEqual(service.freeSendCount, 0)
+        XCTAssertEqual(service.remainingFreeSendAttempts, 5)
+        XCTAssertTrue(service.hasFreeSendAccess)
+    }
+
+    func testFreeSendAttemptsAreNotConsumedForLocalFirstAccess() {
+        let service = makeService()
+
+        for _ in 0..<7 {
+            service.consumeFreeSendAttemptIfNeeded()
+        }
 
         XCTAssertEqual(service.freeSendCount, 0)
         XCTAssertEqual(service.remainingFreeSendAttempts, 5)
@@ -18,17 +32,17 @@ final class SubscriptionServiceAccessTests: XCTestCase {
         XCTAssertTrue(service.hasAppAccess)
     }
 
-    func testFreeSendAttemptsStopAtLimit() {
-        let service = makeService()
+    func testStoredFreeSendLimitDoesNotBlockLocalFirstAccess() {
+        let suiteName = "SubscriptionServiceAccessTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName) ?? .standard
+        defaults.removePersistentDomain(forName: suiteName)
+        defaults.set(99, forKey: "codex.subscription.freeSendCount")
 
-        for _ in 0..<7 {
-            service.consumeFreeSendAttemptIfNeeded()
-        }
+        let service = SubscriptionService(defaults: defaults)
 
-        XCTAssertEqual(service.freeSendCount, 5)
-        XCTAssertEqual(service.remainingFreeSendAttempts, 0)
+        XCTAssertEqual(service.freeSendCount, 99)
         XCTAssertFalse(service.hasFreeSendAccess)
-        XCTAssertFalse(service.hasAppAccess)
+        XCTAssertTrue(service.hasAppAccess)
     }
 
     private func makeService() -> SubscriptionService {

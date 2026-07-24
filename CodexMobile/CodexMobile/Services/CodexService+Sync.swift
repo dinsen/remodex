@@ -42,8 +42,10 @@ extension CodexService {
 
         threadListSyncTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                await self.syncThreadsList()
-                await self.refreshInactiveRunningBadgeThreads()
+                if !self.isBootstrappingConnectionSync {
+                    await self.syncThreadsList()
+                    await self.refreshInactiveRunningBadgeThreads()
+                }
                 let interval = self.isAppInForeground ? listIntervalForegroundNs : listIntervalBackgroundNs
                 try? await Task.sleep(nanoseconds: interval)
             }
@@ -106,7 +108,8 @@ extension CodexService {
                 startWebSocketKeepAliveLoop()
                 startSyncLoop()
                 requestImmediateSync(threadId: activeThreadId)
-                // Re-check bridge-managed state when the app becomes active again.
+                // Re-check bridge-managed state and runtime defaults when the app becomes active again.
+                requestRuntimeOptionRefresh()
                 Task { @MainActor [weak self] in
                     await self?.refreshBridgeManagedState(allowAvailableBridgeUpdatePrompt: true)
                 }
@@ -133,8 +136,10 @@ extension CodexService {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.syncThreadsList()
-            await self.refreshInactiveRunningBadgeThreads()
+            if !self.isBootstrappingConnectionSync {
+                await self.syncThreadsList()
+                await self.refreshInactiveRunningBadgeThreads()
+            }
             if let threadId = threadId ?? self.activeThreadId {
                 await self.syncActiveThreadState(threadId: threadId)
             }
@@ -173,17 +178,20 @@ extension CodexService {
         }
     }
 
-    func syncThreadsList() async {
+    func syncThreadsList(limit: Int? = nil) async {
         guard isConnected, isInitialized else {
             return
         }
 
         do {
-            // Poll recent metadata only; listThreads() uses the same cap during reconnect/refresh.
-            let activeThreads = try await fetchCoalescedServerThreads(limit: recentActiveThreadListLimit)
+            // Poll only the newest page; full sidebar hydration runs as cursor pages in the background.
+            let activeLimit = limit ?? initialVisibleThreadListLimit
+            let activeThreads = try await fetchCoalescedServerThreads(limit: activeLimit)
 
             reconcileLocalThreadsWithServer(activeThreads)
             debugSyncLog("sync thread/list active=\(activeThreads.count) local=\(threads.count)")
+        } catch is CancellationError {
+            return
         } catch {
             presentConnectionErrorIfNeeded(error)
         }
@@ -214,6 +222,10 @@ extension CodexService {
 
     func reconcileLocalThreadsWithServer(_ serverThreads: [CodexThread]) {
         let localByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+        var serverByID: [String: CodexThread] = [:]
+        for serverThread in serverThreads {
+            serverByID[serverThread.id] = serverThread
+        }
         let serverThreadIDs = Set(serverThreads.map(\.id))
         let persistedArchivedIDs = locallyArchivedThreadIDs
         let persistedDeletedIDs = locallyDeletedThreadIDs
@@ -234,7 +246,7 @@ extension CodexService {
 
             if let localThread = localByID[liveThread.id] {
                 liveThread = mergedThread(liveThread, with: localThread, treatAsServerState: true)
-                liveThread.syncState = localThread.syncState
+                liveThread.syncState = persistedArchivedIDs.contains(liveThread.id) ? .archivedLocal : .live
             } else if persistedArchivedIDs.contains(liveThread.id) {
                 liveThread.syncState = .archivedLocal
             } else {
@@ -271,6 +283,7 @@ extension CodexService {
             }
         }
 
+        let previousSnapshotOnlyPinnedThreadIDs = snapshotOnlyPinnedThreadIDs
         snapshotOnlyPinnedIDs.formUnion(injectPinnedSnapshotThreads(
             into: &merged,
             deletedThreadIDs: persistedDeletedIDs
@@ -279,26 +292,31 @@ extension CodexService {
             snapshotOnlyPinnedThreadIDs = snapshotOnlyPinnedIDs
         }
 
-        // Local rename intent wins over stale thread/list data, especially for pinned snapshots.
+        // Local rename intent only wins while the server title is still generic/stale.
         for threadID in Array(merged.keys) {
             guard var thread = merged[threadID] else { continue }
-            applyPersistedThreadRename(to: &thread)
+            applyPersistedThreadRename(
+                to: &thread,
+                respectingAuthoritativeTitle: serverByID[threadID].map(hasAuthoritativeThreadTitle) ?? false
+            )
             merged[threadID] = thread
         }
 
-        // Steady-state polls usually reconcile to an identical list; skip the observable
-        // reassignment and full timeline refresh cascade when nothing actually changed.
-        // Revert-state caches are revision-keyed, so they self-invalidate on real changes.
-        let reconciledThreads = sortThreads(Array(merged.values))
-        let didChangeThreads = reconciledThreads != threads
-        if didChangeThreads {
-            threads = reconciledThreads
-            assistantRevertStateCacheByThread.removeAll()
+        let previousThreads = threads
+        let sortedThreads = sortThreads(Array(merged.values))
+        let timelineAffectedThreadIDs = timelineAffectedByThreadMetadataChange(
+            previous: previousThreads,
+            next: sortedThreads
+        )
+        if sortedThreads != previousThreads || snapshotOnlyPinnedThreadIDs != previousSnapshotOnlyPinnedThreadIDs {
+            threads = sortedThreads
+        }
+        for threadId in timelineAffectedThreadIDs {
+            assistantRevertStateCacheByThread.removeValue(forKey: threadId)
         }
         refreshBusyRepoRootsAndDependentTimelineStates()
-        if didChangeThreads {
-            // Full reconciliation — always refresh all threads even if busy-roots already hit some.
-            refreshAllThreadTimelineStates()
+        for threadId in timelineAffectedThreadIDs where threadTimelineStateByThread[threadId] != nil {
+            refreshThreadTimelineState(for: threadId)
         }
         restoredThreadSnapshotIDs = stillUnconfirmedSnapshotIDs
 
@@ -313,6 +331,27 @@ extension CodexService {
                 _ = await self?.routePendingNotificationOpenIfPossible(refreshIfNeeded: false)
             }
         }
+    }
+
+    private func timelineAffectedByThreadMetadataChange(
+        previous: [CodexThread],
+        next: [CodexThread]
+    ) -> Set<String> {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        var affectedThreadIDs: Set<String> = []
+
+        for thread in next {
+            guard let previousThread = previousByID[thread.id] else {
+                continue
+            }
+
+            if previousThread.gitWorkingDirectory != thread.gitWorkingDirectory
+                || previousThread.syncState != thread.syncState {
+                affectedThreadIDs.insert(thread.id)
+            }
+        }
+
+        return affectedThreadIDs
     }
 
     func handleMissingThread(_ threadId: String) {
@@ -483,9 +522,8 @@ extension CodexService {
             return false
         }
 
-        threads[index].name = trimmedName
         threads[index].title = trimmedName
-        persistThreadRename(trimmedName, for: threadId)
+        threads[index].name = trimmedName
         debugSyncLog("thread renamed automatically: \(threadId) → \(trimmedName)")
         sendThreadNameSetRPC(threadId: threadId, name: trimmedName)
         return true

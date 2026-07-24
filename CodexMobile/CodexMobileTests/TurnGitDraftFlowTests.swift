@@ -57,6 +57,14 @@ final class TurnGitDraftFlowTests: XCTestCase {
 
         XCTAssertEqual(recordedMethods, ["turn/start", "thread/generateTitle"])
         XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Fix Thread Naming")
+        XCTAssertEqual(service.thread(for: "thread-1")?.name, "Fix Thread Naming")
+        XCTAssertNil(service.persistedThreadRename(for: "thread-1"))
+
+        service.reconcileLocalThreadsWithServer([
+            CodexThread(id: "thread-1", title: "Desktop Thread Title"),
+        ])
+
+        XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Desktop Thread Title")
     }
 
     func testAutomaticThreadTitleDoesNotOverwriteUserRename() {
@@ -74,6 +82,7 @@ final class TurnGitDraftFlowTests: XCTestCase {
 
         XCTAssertFalse(didApply)
         XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Manual Title")
+        XCTAssertEqual(service.thread(for: "thread-1")?.name, "Manual Title")
     }
 
     func testAutomaticThreadTitleOnlyReplacesExpectedFallbackTitles() {
@@ -90,6 +99,7 @@ final class TurnGitDraftFlowTests: XCTestCase {
 
         XCTAssertFalse(didApply)
         XCTAssertEqual(service.thread(for: "thread-1")?.displayTitle, "Fallback Title")
+        XCTAssertEqual(service.thread(for: "thread-1")?.name, "Fallback Title")
     }
 
     func testCommitActionGeneratesDraftBeforeCommitting() async throws {

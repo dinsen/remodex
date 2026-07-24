@@ -34,6 +34,7 @@ private enum StreamingDeltaCoalescingPolicy {
     static let assistantLargeStreamingFlushDelayNanoseconds: UInt64 = 100_000_000
     static let assistantLargePendingDeltaByteCount = 12_000
     static let assistantLargeVisibleTextByteCount = 32_000
+    static let assistantReplayOverlapSearchByteLimit = 32_768
     // System/tool rows still rebuild heavier timeline content; back them off while
     // gestures/typing own the main thread. Assistant prose uses a lighter fast path.
     static let interactionFlushDelayNanoseconds: UInt64 = 250_000_000
@@ -222,6 +223,18 @@ extension CodexService {
         messageRevisionByThread[threadId] ?? 0
     }
 
+    func setComposerInputFocused(_ isFocused: Bool, for threadId: String) {
+        if isFocused {
+            composerFocusedThreadIDs.insert(threadId)
+            return
+        }
+
+        composerFocusedThreadIDs.remove(threadId)
+        if deferredStreamingTimelineRefreshThreadIDs.remove(threadId) != nil {
+            refreshThreadTimelineState(for: threadId)
+        }
+    }
+
     // Returns the service-owned timeline state for a single thread.
     func timelineState(for threadId: String) -> ThreadTimelineState {
         if let existing = threadTimelineStateByThread[threadId] {
@@ -238,6 +251,8 @@ extension CodexService {
     func removeThreadTimelineState(for threadId: String) {
         threadTimelineStateByThread.removeValue(forKey: threadId)
         stoppedTurnIDsByThread.removeValue(forKey: threadId)
+        composerFocusedThreadIDs.remove(threadId)
+        deferredStreamingTimelineRefreshThreadIDs.remove(threadId)
         projectedTerminalStateByThreadID.removeValue(forKey: threadId)
         messageIndexCacheByThread.removeValue(forKey: threadId)
         latestAssistantOutputByThread.removeValue(forKey: threadId)
@@ -322,6 +337,7 @@ extension CodexService {
     // Refreshes the derived output cache and bumps the thread timeline revision.
     func updateCurrentOutput(for threadId: String) {
         noteMessagesChanged(for: threadId)
+        deferredStreamingTimelineRefreshThreadIDs.remove(threadId)
 
         // During a replay burst every replayed event lands here through its append
         // path; the O(messages) latest-output scan and the snapshot rebuild are
@@ -382,6 +398,11 @@ extension CodexService {
             return
         }
         let updatedMessage = rawMessages[updatedMessageIndex]
+        if shouldDeferStreamingTimelineRefresh(threadId: threadId, message: updatedMessage) {
+            deferredStreamingTimelineRefreshThreadIDs.insert(threadId)
+            return
+        }
+
         if updatedMessage.role == .assistant,
            let terminalMessageId = assistantReplayTargetMessageId(
                in: rawMessages,
@@ -431,6 +452,13 @@ extension CodexService {
             initialTurnsLoaded: state.renderSnapshot.initialTurnsLoaded,
             olderHistoryLoadErrorMessage: state.renderSnapshot.olderHistoryLoadErrorMessage
         )
+    }
+
+    private func shouldDeferStreamingTimelineRefresh(threadId: String, message: CodexMessage) -> Bool {
+        activeThreadId == threadId
+            && composerFocusedThreadIDs.contains(threadId)
+            && message.role == .assistant
+            && message.isStreaming
     }
 
     // Patches an already-projected streaming system row without rerunning the reducer.
@@ -810,20 +838,32 @@ extension CodexService {
 
     // Marks thread as actively running while ensuring stale outcomes are cleared.
     func markThreadAsRunning(_ threadId: String) {
+        let needsRunningFlag = !runningThreadIDs.contains(threadId)
+        let hadTerminalState = latestTurnTerminalStateByThread[threadId] != nil
+        let hadOutcomeBadge = readyThreadIDs.contains(threadId) || failedThreadIDs.contains(threadId)
+
         // Streaming deltas re-assert running on every chunk; when nothing would
         // change, skip the busy-roots rebuild and timeline refresh entirely so
         // token streaming stays O(1) instead of O(threads) per delta.
-        if runningThreadIDs.contains(threadId),
+        if !needsRunningFlag,
            threadsPendingCompletionHaptic.contains(threadId),
-           latestTurnTerminalStateByThread[threadId] == nil,
-           !readyThreadIDs.contains(threadId),
-           !failedThreadIDs.contains(threadId) {
+           !hadTerminalState,
+           !hadOutcomeBadge {
             return
         }
-        runningThreadIDs.insert(threadId)
         threadsPendingCompletionHaptic.insert(threadId)
-        latestTurnTerminalStateByThread.removeValue(forKey: threadId)
-        clearOutcomeBadge(for: threadId)
+        guard needsRunningFlag || hadTerminalState || hadOutcomeBadge else {
+            return
+        }
+
+        runningThreadIDs.insert(threadId)
+        if hadTerminalState {
+            latestTurnTerminalStateByThread.removeValue(forKey: threadId)
+        }
+        if hadOutcomeBadge {
+            clearOutcomeBadge(for: threadId)
+        }
+
         refreshBusyRepoRootsAndDependentTimelineStates()
         refreshThreadTimelineState(for: threadId)
         updateBackgroundRunGraceTask()
@@ -928,6 +968,8 @@ extension CodexService {
             return true
         }
 
+        requestRuntimeOptionRefresh()
+
         // Freshly created empty chats do not need an immediate resume/read pass.
         // Skipping that first hydration avoids extra RPC contention when another
         // thread is already running and the user simply wants a blank composer.
@@ -960,7 +1002,7 @@ extension CodexService {
             try await ensureThreadResumed(threadId: threadId)
         } catch {
             if shouldTreatAsThreadNotFound(error) {
-                handleMissingThread(threadId)
+                debugSyncLog("display thread/resume reported missing thread=\(threadId); waiting for send-time confirmation")
             }
             return false
         }
@@ -6756,25 +6798,105 @@ extension CodexService {
             return existingText
         }
 
-        if incomingDelta.count > existingText.count, incomingDelta.hasPrefix(existingText) {
+        let existingByteCount = existingText.utf8.count
+        let incomingByteCount = incomingDelta.utf8.count
+
+        if incomingByteCount > existingByteCount, incomingDelta.hasPrefix(existingText) {
             return incomingDelta
         }
 
-        if existingText.count > incomingDelta.count, existingText.hasPrefix(incomingDelta) {
+        if existingByteCount > incomingByteCount, existingText.hasPrefix(incomingDelta) {
             return existingText
         }
 
-        // Preserve reconnect/replay correctness by checking the full overlap window.
-        let maxOverlap = min(existingText.count, incomingDelta.count)
-        if maxOverlap > 0 {
-            for overlap in stride(from: maxOverlap, through: 1, by: -1) {
-                if existingText.suffix(overlap) == incomingDelta.prefix(overlap) {
-                    return existingText + incomingDelta.dropFirst(overlap)
+        // Preserve reconnect/replay correctness without doing an unbounded
+        // character-by-character overlap scan on MainActor while deltas stream.
+        if let overlap = assistantDeltaUTF8Overlap(
+            existingText: existingText,
+            existingByteCount: existingByteCount,
+            incomingDelta: incomingDelta,
+            incomingByteCount: incomingByteCount
+        ),
+        overlap > 0,
+        let incomingRemainderIndex = stringIndex(in: incomingDelta, utf8Offset: overlap) {
+            return existingText + String(incomingDelta[incomingRemainderIndex...])
+        }
+
+        return existingText + incomingDelta
+    }
+
+    private func assistantDeltaUTF8Overlap(
+        existingText: String,
+        existingByteCount: Int,
+        incomingDelta: String,
+        incomingByteCount: Int
+    ) -> Int? {
+        let maxOverlap = min(
+            existingByteCount,
+            incomingByteCount,
+            StreamingDeltaCoalescingPolicy.assistantReplayOverlapSearchByteLimit
+        )
+        guard maxOverlap > 0 else {
+            return nil
+        }
+
+        let incomingPrefixBytes = Array(incomingDelta.utf8.prefix(maxOverlap))
+        guard !incomingPrefixBytes.isEmpty else {
+            return nil
+        }
+        let existingSuffixBytes = Array(existingText.utf8.suffix(maxOverlap))
+        let prefixTable = utf8PrefixTable(for: incomingPrefixBytes)
+
+        var matched = 0
+        for (offset, byte) in existingSuffixBytes.enumerated() {
+            while matched > 0, byte != incomingPrefixBytes[matched] {
+                matched = prefixTable[matched - 1]
+            }
+            if byte == incomingPrefixBytes[matched] {
+                matched += 1
+                if matched == incomingPrefixBytes.count, offset < existingSuffixBytes.count - 1 {
+                    matched = prefixTable[matched - 1]
                 }
             }
         }
 
-        return existingText + incomingDelta
+        var candidate = matched
+        while candidate > 0 {
+            if stringIndex(in: incomingDelta, utf8Offset: candidate) != nil,
+               stringIndex(in: existingText, utf8Offset: existingByteCount - candidate) != nil {
+                return candidate
+            }
+            candidate = prefixTable[candidate - 1]
+        }
+
+        return nil
+    }
+
+    private func utf8PrefixTable(for bytes: [UInt8]) -> [Int] {
+        guard bytes.count > 1 else {
+            return Array(repeating: 0, count: bytes.count)
+        }
+
+        var table = Array(repeating: 0, count: bytes.count)
+        var length = 0
+        for index in 1..<bytes.count {
+            while length > 0, bytes[index] != bytes[length] {
+                length = table[length - 1]
+            }
+            if bytes[index] == bytes[length] {
+                length += 1
+                table[index] = length
+            }
+        }
+        return table
+    }
+
+    private func stringIndex(in text: String, utf8Offset: Int) -> String.Index? {
+        guard utf8Offset >= 0, utf8Offset <= text.utf8.count else {
+            return nil
+        }
+        let utf8Index = text.utf8.index(text.utf8.startIndex, offsetBy: utf8Offset)
+        return utf8Index.samePosition(in: text)
     }
 
 }

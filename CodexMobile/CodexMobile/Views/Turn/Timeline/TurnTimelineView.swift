@@ -273,7 +273,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             messages: messages,
             activeTurnID: activeTurnID,
             isThreadRunning: isThreadRunning,
-            completedTurnIDs: completedTurnIDs
+            completedTurnIDs: completedTurnIDs,
+            suppressesLiveStreamingTextUpdates: isComposerFocused
         )
     }
 
@@ -323,6 +324,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                             planMatchingFingerprint: planMatchingFingerprint,
                             newestStreamingMessageID: renderCacheState.newestStreamingMessageID,
                             autoScrollMode: autoScrollMode,
+                            prioritizesComposerInput: isComposerFocused,
                             onRetryUserMessage: onRetryUserMessage,
                             onTapAssistantRevert: onTapAssistantRevert,
                             onTapSubagent: onTapSubagent,
@@ -526,7 +528,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             latestTurnTerminalState: latestTurnTerminalState,
             completedTurnIDs: completedTurnIDs,
             stoppedTurnIDs: stoppedTurnIDs,
-            assistantRevertStatesByMessageID: assistantRevertStatesByMessageID
+            assistantRevertStatesByMessageID: assistantRevertStatesByMessageID,
+            suppressesLiveStreamingTextUpdates: isComposerFocused
         )
     }
     @ViewBuilder
@@ -1237,12 +1240,20 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             isAutomaticScrollingPaused: shouldPauseAutomaticScrolling
         )
             && !isSuppressingBottomCorrectionsForWarmup
+        let shouldPinToBottom = shouldPinTimelineToBottomDuringGeometryChange
+        let shouldCorrectForContentHeight = !isSuppressingBottomCorrectionsForWarmup
+            && TurnScrollStateTracker.shouldCorrectBottomAfterContentHeightChange(
+                previousHeight: old.contentHeight,
+                newHeight: new.contentHeight,
+                isPinnedToBottom: shouldPinToBottom
+            )
         let bottomChanged = TurnScrollStateTracker.shouldReconcileBottomState(
             observedIsAtBottom: new.isAtBottom,
             committedIsAtBottom: isScrolledToBottom,
             isSuppressingNotBottom: isSuppressingBottomCorrectionsForWarmup
         )
-        if shouldScheduleFollowBottom {
+
+        if shouldScheduleFollowBottom || shouldCorrectForContentHeight {
             scheduleFollowBottomScroll(using: proxy)
         }
         if bottomChanged {

@@ -73,7 +73,6 @@
 | CLN-116 | P1 | TODO | M | 506 | Turn UI | `CodexMobile/CodexMobile/Views/Turn/Composer/ComposerBottomBar.swift` | [plan](plans/codexmobile-codexmobile-views-turn-composer-composerbottombar-swift.md) | needs cleanup pass |
 | CLN-129 | P2 | TODO | S | 491 | Turn UI | `CodexMobile/CodexMobile/Views/Turn/Messages/SubagentViews.swift` | [plan](plans/codexmobile-codexmobile-views-turn-messages-subagentviews-swift.md) | needs cleanup pass |
 | CLN-236 | P2 | TODO | S | 487 | Menu bar | `CodexMobile/RemodexMenuBar/BridgeMenuBarViews.swift` | [plan](plans/codexmobile-remodexmenubar-bridgemenubarviews-swift.md) | needs cleanup pass |
-| CLN-084 | P2 | TODO | S | 484 | SwiftUI | `CodexMobile/CodexMobile/Views/Payments/RevenueCatPaywallView.swift` | [plan](plans/codexmobile-codexmobile-views-payments-revenuecatpaywallview-swift.md) | needs cleanup pass |
 | CLN-148 | P2 | TODO | S | 481 | Turn UI | `CodexMobile/CodexMobile/Views/Turn/Diff/TurnFileChangeSummaryParser.swift` | [plan](plans/codexmobile-codexmobile-views-turn-diff-turnfilechangesummaryparser-swift.md) | needs cleanup pass |
 | CLN-207 | P2 | TODO | S | 465 | Tests | `CodexMobile/CodexMobileTests/SidebarThreadGroupingTests.swift` | [plan](plans/codexmobile-codexmobiletests-sidebarthreadgroupingtests-swift.md) | needs cleanup pass |
 | CLN-004 | P2 | TODO | S | 447 | Models | `CodexMobile/CodexMobile/Models/AIChangeSetModels.swift` | [plan](plans/codexmobile-codexmobile-models-aichangesetmodels-swift.md) | needs cleanup pass |
@@ -261,7 +260,6 @@
 | CLN-180 | P3 | DONE | S | 44 | Tests | `CodexMobile/CodexMobileTests/CodexFuzzyFileSearchDecodeTests.swift` | [plan](plans/codexmobile-codexmobiletests-codexfuzzyfilesearchdecodetests-swift.md) | reviewed; no action currently required |
 | CLN-097 | P3 | DONE | S | 42 | Sidebar UI | `CodexMobile/CodexMobile/Views/Sidebar/SidebarFloatingSettingsButton.swift` | [plan](plans/codexmobile-codexmobile-views-sidebar-sidebarfloatingsettingsbutton-swift.md) | reviewed; no action currently required |
 | CLN-231 | P3 | DONE | S | 42 | Tests | `CodexMobile/CodexMobileTests/UserMessageParserTests.swift` | [plan](plans/codexmobile-codexmobiletests-usermessageparsertests-swift.md) | reviewed; no action currently required |
-| CLN-068 | P3 | DONE | S | 39 | Services | `CodexMobile/CodexMobile/Services/Payments/RevenueCatDisplayExtensions.swift` | [plan](plans/codexmobile-codexmobile-services-payments-revenuecatdisplayextensions-swift.md) | reviewed; no action currently required |
 | CLN-014 | P3 | DONE | S | 38 | Models | `CodexMobile/CodexMobile/Models/CodexReasoningEffortOption.swift` | [plan](plans/codexmobile-codexmobile-models-codexreasoningeffortoption-swift.md) | reviewed; no action currently required |
 | CLN-006 | P3 | DONE | S | 37 | Models | `CodexMobile/CodexMobile/Models/CodexAccessMode.swift` | [plan](plans/codexmobile-codexmobile-models-codexaccessmode-swift.md) | reviewed; no action currently required |
 | CLN-019 | P3 | DONE | S | 37 | Models | `CodexMobile/CodexMobile/Models/ContextWindowUsage.swift` | [plan](plans/codexmobile-codexmobile-models-contextwindowusage-swift.md) | reviewed; no action currently required |

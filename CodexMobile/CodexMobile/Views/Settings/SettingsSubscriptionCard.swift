@@ -2,22 +2,17 @@
 // Purpose: Presents Remodex Pro subscription status and purchase actions.
 // Layer: Settings UI component
 // Exports: SettingsSubscriptionCard
-// Depends on: SwiftUI, StoreKit, SubscriptionService, RevenueCatPaywallView
+// Depends on: SwiftUI, SubscriptionService
 
-import StoreKit
 import SwiftUI
 
 struct SettingsSubscriptionCard: View {
     @Environment(SubscriptionService.self) private var subscriptions
-    let onShowPaywall: () -> Void
-    let onRedeemCode: () -> Void
 
     var body: some View {
         SettingsCard(
             title: "Remodex Pro",
-            footer: subscriptions.hasProAccess
-                ? "Manage billing through your Apple ID subscription settings."
-                : "Unlock voice mode, unlimited threads, and more."
+            footer: "Local-first builds include app access without external purchase services."
         ) {
             SettingsValueRow(
                 title: "Plan",
@@ -25,30 +20,15 @@ struct SettingsSubscriptionCard: View {
                 valueColor: subscriptions.hasProAccess ? .green : .secondary
             )
 
-            SettingsButton(subscriptions.hasProAccess ? "View Pro Benefits" : "Upgrade to Pro") {
-                onShowPaywall()
-            }
-
-            SettingsButton("Redeem Code") {
-                onRedeemCode()
-            }
-            .disabled(subscriptions.isPurchasing || subscriptions.isRestoring)
-
-            SettingsButton(
-                subscriptions.isRestoring ? "Restoring…" : "Restore Purchases",
-                isLoading: subscriptions.isRestoring
-            ) {
-                Task {
-                    await subscriptions.restorePurchases()
-                }
-            }
-            .disabled(subscriptions.isPurchasing)
-
-            if let error = subscriptions.lastErrorMessage, !error.isEmpty {
-                SettingsInlineMessage(text: error, tint: .red)
-            }
+            SettingsInlineMessage(
+                text: "Access is enabled locally; no purchase restore or account sync is required.",
+                tint: .secondary
+            )
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             guard subscriptions.bootstrapState == .idle else {
                 return
             }

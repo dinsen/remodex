@@ -24,6 +24,7 @@ const {
 const { createCodexTransport } = require("./codex-transport");
 const {
   createThreadRolloutActivityWatcher,
+  collectRecentRolloutFiles,
   findRecentRolloutFileForContextRead,
   resolveSessionsRoot,
 } = require("./rollout-watch");
@@ -36,6 +37,8 @@ const { handleThreadContextRequest } = require("./thread-context-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
 const { handleProjectRequest } = require("./project-handler");
 const { handlePetRequest } = require("./pet-handler");
+const { handleAutomationRequest } = require("./automation-handler");
+const { handleRuntimeDefaultsRequest } = require("./runtime-defaults-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
 const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
 const {
@@ -76,6 +79,9 @@ const {
 const { createShortPairingCode, SHORT_PAIRING_CODE_LENGTH } = require("./qr");
 const {
   JSONL_OLDER_HANDOFF_CURSOR,
+  parseSessionIndexThreadNames,
+  parseSessionJsonlMetadata,
+  parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
   readRecentSessionJsonlTurns,
   readSessionJsonlMetadataFromFile,
@@ -100,6 +106,7 @@ const RELAY_TURNS_LIST_SAFE_RETRY_LIMIT = 5;
 const RELAY_JSONL_TURNS_LIST_CACHE_TTL_MS = 30_000;
 const RELAY_JSONL_ARTIFACT_CACHE_TTL_MS = 2_000;
 const RELAY_JSONL_ARTIFACT_CACHE_MAX_ENTRIES = 128;
+const RELAY_THREAD_LIST_JSONL_SUMMARY_READ_BYTES = 256 * 1024;
 // Session cwd is stable for a rollout file, but the same thread can later get a
 // newer rollout with a different cwd; cache entries are validated against file identity.
 const RELAY_JSONL_THREAD_CWD_CACHE_TTL_MS = 5 * 60_000;
@@ -122,6 +129,7 @@ const MODELS_WITHOUT_REASONING_SUMMARY = new Set([
   "gpt-5.3-codex-spark",
 ]);
 const RELAY_TURNS_LIST_RESULT_KEYS = ["data", "items", "turns"];
+const RELAY_THREAD_LIST_RESULT_KEYS = ["data", "items", "threads"];
 const RELAY_TURNS_LIST_PAGINATION_RESULT_KEYS = [
   "nextCursor",
   "next_cursor",
@@ -1211,6 +1219,12 @@ function startBridge({
     if (handleProjectRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
+    if (handleAutomationRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
+    if (handleRuntimeDefaultsRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (handlePetRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
@@ -1239,6 +1253,9 @@ function startBridge({
     // sanitize/trim budget as app-server responses, or heavy threads ship as
     // one oversized frame and kill the phone's websocket (EMSGSIZE).
     rememberForwardedRequestMethod(rawMessage);
+    if (handleBridgeManagedDesktopTurnStart(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (desktopIpcActionFollower?.observeInbound(rawMessage, parsedMessage)) {
       return;
     }
@@ -1377,6 +1394,72 @@ function startBridge({
     })();
 
     return true;
+  }
+
+  function handleBridgeManagedDesktopTurnStart(rawMessage, sendResponse = sendApplicationResponse) {
+    const request = parseDesktopJsonlTurnStartRequest(rawMessage);
+    if (!request || !desktopIpcActionFollower) {
+      return false;
+    }
+
+    rememberThreadFromMessage("phone", rawMessage);
+    (async () => {
+      try {
+        const result = await desktopIpcActionFollower.startTurn(request);
+        sendResponse(JSON.stringify({
+          id: request.id,
+          result: result || {},
+        }));
+      } catch (error) {
+        sendResponse(createJsonRpcErrorResponse(
+          request.id,
+          error,
+          "desktop_turn_start_failed"
+        ));
+      }
+    })();
+
+    return true;
+  }
+
+  function parseDesktopJsonlTurnStartRequest(rawMessage) {
+    const parsed = parseBridgeJSON(rawMessage);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    if (parsed.method !== "turn/start" || parsed.id == null) {
+      return null;
+    }
+
+    const params = parsed.params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      return null;
+    }
+
+    const threadId = threadIdFromRequestParams(params);
+    if (!threadId || !isDesktopOwnedJsonlThread(threadId)) {
+      return null;
+    }
+
+    return parsed;
+  }
+
+  function isDesktopOwnedJsonlThread(threadId) {
+    try {
+      const rolloutPath = findRecentRolloutFileForContextRead(resolveSessionsRoot(), { threadId });
+      if (!rolloutPath) {
+        return false;
+      }
+
+      const summary = parseSessionJsonlThreadSummary(readFilePrefix(
+        rolloutPath,
+        RELAY_THREAD_LIST_JSONL_SUMMARY_READ_BYTES
+      ));
+      const source = normalizeNonEmptyString(summary?.source).toLowerCase();
+      return source === "vscode" || source === "codex_desktop" || source === "codex-desktop";
+    } catch {
+      return false;
+    }
   }
 
   function sendBridgeManagedThreadTurnsListResponse(request, response, sendResponse, {
@@ -1652,6 +1735,9 @@ function startBridge({
         threadId: method === "thread/turns/list" || method === "thread/read" || method === "thread/resume"
           ? threadIdFromRequestParams(parsed.params)
           : "",
+        sourceKinds: method === "thread/list" ? sourceKindsFromThreadListParams(parsed.params) : [],
+        cursor: method === "thread/list" ? parsed.params?.cursor : undefined,
+        limit: method === "thread/list" ? threadListLimitFromParams(parsed.params) : undefined,
         createdAt: Date.now(),
       };
       if (method === "thread/turns/list") {
@@ -1704,7 +1790,17 @@ function startBridge({
       normalizedMessage = JSON.stringify(parsed);
     }
 
-    return sanitizeThreadHistoryImagesForRelay(normalizedMessage, trackedRequest.method, trackedRequest);
+    const sanitizeStartedAt = Date.now();
+    const sanitizedMessage = sanitizeThreadHistoryImagesForRelay(normalizedMessage, trackedRequest.method, trackedRequest);
+    if (trackedRequest.method === "thread/list") {
+      logThreadListPerformance({
+        requestContext: trackedRequest,
+        rawMessage: normalizedMessage,
+        sanitizedMessage,
+        sanitizeStartedAt,
+      });
+    }
+    return sanitizedMessage;
   }
 
   function updatePendingAuthLoginFromCodexMessage(rawMessage, parsedMessage = null) {
@@ -2614,6 +2710,21 @@ function threadIdFromRequestParams(params) {
     || "";
 }
 
+function sourceKindsFromThreadListParams(params) {
+  if (!params || typeof params !== "object" || !Array.isArray(params.sourceKinds)) {
+    return [];
+  }
+
+  return params.sourceKinds
+    .map(normalizeNonEmptyString)
+    .filter(Boolean);
+}
+
+function threadListLimitFromParams(params) {
+  const limit = Number(params?.limit);
+  return Number.isInteger(limit) && limit > 0 ? limit : undefined;
+}
+
 function buildThreadTurnsListRelaySanitizeContext(request, {
   skipJsonlArtifactAugmentation = false,
 } = {}) {
@@ -3278,6 +3389,10 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod, requestC
     return sanitizeThreadTurnsListForRelay(rawMessage, requestContext);
   }
 
+  if (requestMethod === "thread/list") {
+    return sanitizeThreadListForRelay(rawMessage, requestContext);
+  }
+
   if (requestMethod !== "thread/read" && requestMethod !== "thread/resume") {
     return rawMessage;
   }
@@ -3372,6 +3487,549 @@ function sanitizeThreadTurnsListForRelay(rawMessage, requestContext = {}) {
     : parsed;
 
   return trimTurnsListPayloadForRelay(sanitizedParsed, turnsKey, didChange ? null : rawMessage);
+}
+
+function sanitizeThreadListForRelay(rawMessage, requestContext = {}) {
+  if (hasRelayCursor(requestContext?.cursor)) {
+    return rawMessage;
+  }
+
+  const parsed = parseBridgeJSON(rawMessage);
+  const result = parsed?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return rawMessage;
+  }
+
+  const threadsKey = RELAY_THREAD_LIST_RESULT_KEYS.find((key) => Array.isArray(result[key]));
+  if (!threadsKey) {
+    return rawMessage;
+  }
+
+  const { threads, didAugment } = augmentRelayThreadListWithJsonlThreads(result[threadsKey], requestContext);
+  const { threads: compactedThreads, didCompact } = compactRelayThreadListItems(threads);
+  if (!didAugment && !didCompact) {
+    return rawMessage;
+  }
+
+  return JSON.stringify({
+    ...parsed,
+    result: {
+      ...result,
+      [threadsKey]: compactedThreads,
+      ...(didAugment ? { remodexJsonlThreadListAugmented: true } : {}),
+      ...(didCompact ? { remodexThreadListCompacted: true } : {}),
+    },
+  });
+}
+
+const RELAY_THREAD_LIST_MOBILE_KEYS = [
+  "id",
+  "title",
+  "name",
+  "preview",
+  "createdAt",
+  "created_at",
+  "updatedAt",
+  "updated_at",
+  "cwd",
+  "current_working_directory",
+  "working_directory",
+  "forkedFromThreadId",
+  "forkedFromId",
+  "forked_from_thread_id",
+  "forked_from_id",
+  "parentThreadId",
+  "parent_thread_id",
+  "agentId",
+  "agent_id",
+  "agentNickname",
+  "agent_nickname",
+  "agentRole",
+  "agent_role",
+  "model",
+  "modelProvider",
+  "model_provider",
+  "goalStatus",
+  "goal_status",
+  "threadGoalStatus",
+  "thread_goal_status",
+  "source",
+  "threadSource",
+  "thread_source",
+  "syncState",
+];
+const RELAY_THREAD_LIST_MOBILE_KEY_SET = new Set(RELAY_THREAD_LIST_MOBILE_KEYS);
+const RELAY_THREAD_LIST_STRING_VALUE_MAX_CHARS = 2_048;
+const RELAY_THREAD_LIST_DATE_KEYS = new Set([
+  "createdAt",
+  "created_at",
+  "updatedAt",
+  "updated_at",
+]);
+
+const RELAY_THREAD_LIST_MOBILE_METADATA_KEYS = new Set([
+  "cwd",
+  "current_working_directory",
+  "working_directory",
+  "projectPath",
+  "project_path",
+  "forkedFromThreadId",
+  "forked_from_thread_id",
+  "forkedFromId",
+  "forked_from_id",
+  "parentThreadId",
+  "parent_thread_id",
+  "agentId",
+  "agent_id",
+  "agentNickname",
+  "agent_nickname",
+  "nickname",
+  "name",
+  "agentRole",
+  "agent_role",
+  "agentType",
+  "agent_type",
+  "model",
+  "modelName",
+  "model_name",
+  "modelProvider",
+  "model_provider",
+  "modelProviderId",
+  "model_provider_id",
+  "goalStatus",
+  "goal_status",
+  "threadGoalStatus",
+  "thread_goal_status",
+  "thread_source",
+  "source",
+  "remodexJsonlThreadListFallback",
+]);
+
+function compactRelayThreadListItems(threads) {
+  if (!Array.isArray(threads)) {
+    return { threads, didCompact: false };
+  }
+
+  let didCompact = false;
+  const compactedThreads = threads.map((thread) => {
+    const { thread: compactedThread, didCompact: didCompactThread } = compactRelayThreadListItem(thread);
+    didCompact = didCompact || didCompactThread;
+    return compactedThread;
+  });
+
+  return { threads: compactedThreads, didCompact };
+}
+
+function compactRelayThreadListItem(thread) {
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)) {
+    return { thread, didCompact: false };
+  }
+
+  const compacted = {};
+  let didCompact = false;
+  for (const key of RELAY_THREAD_LIST_MOBILE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(thread, key) && thread[key] !== undefined) {
+      const { value, didCompact: didCompactValue } = compactRelayThreadListValue(key, thread[key]);
+      didCompact = didCompact || didCompactValue;
+      if (value !== undefined) {
+        compacted[key] = value;
+      }
+    }
+  }
+  for (const key of Object.keys(thread)) {
+    if (key === "metadata") {
+      continue;
+    }
+    if (!RELAY_THREAD_LIST_MOBILE_KEY_SET.has(key)) {
+      didCompact = true;
+      break;
+    }
+  }
+
+  const derivedGoalStatus = compactThreadGoalStatus(thread);
+  if (derivedGoalStatus && compacted.threadGoalStatus !== derivedGoalStatus) {
+    compacted.threadGoalStatus = derivedGoalStatus;
+    didCompact = true;
+  }
+
+  const { metadata: compactedMetadata, didCompact: didCompactMetadata } = compactRelayThreadListMetadata(thread.metadata);
+  didCompact = didCompact || didCompactMetadata;
+  if (compactedMetadata) {
+    compacted.metadata = compactedMetadata;
+  }
+
+  return {
+    thread: compacted,
+    didCompact,
+  };
+}
+
+function compactRelayThreadListValue(key, value) {
+  if (value === null) {
+    return { value, didCompact: false };
+  }
+
+  if (typeof value === "string") {
+    return compactRelayThreadListString(value);
+  }
+
+  if (RELAY_THREAD_LIST_DATE_KEYS.has(key) && typeof value === "number" && Number.isFinite(value)) {
+    return { value, didCompact: false };
+  }
+
+  return { value: undefined, didCompact: true };
+}
+
+function compactRelayThreadListString(value) {
+  if (value.length <= RELAY_THREAD_LIST_STRING_VALUE_MAX_CHARS) {
+    return { value, didCompact: false };
+  }
+
+  return {
+    value: value.slice(0, RELAY_THREAD_LIST_STRING_VALUE_MAX_CHARS),
+    didCompact: true,
+  };
+}
+
+function compactRelayThreadListMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return { metadata: undefined, didCompact: metadata !== undefined };
+  }
+
+  const compacted = {};
+  let didCompact = false;
+  for (const key of RELAY_THREAD_LIST_MOBILE_METADATA_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(metadata, key) && metadata[key] !== undefined) {
+      const { value, didCompact: didCompactValue } = compactRelayThreadListMetadataValue(metadata[key]);
+      didCompact = didCompact || didCompactValue;
+      if (value !== undefined) {
+        compacted[key] = value;
+      }
+    }
+  }
+  didCompact = didCompact || Object.keys(metadata).some((key) => !RELAY_THREAD_LIST_MOBILE_METADATA_KEYS.has(key));
+
+  return {
+    metadata: Object.keys(compacted).length > 0 ? compacted : undefined,
+    didCompact,
+  };
+}
+
+function compactRelayThreadListMetadataValue(value) {
+  if (typeof value !== "string") {
+    return { value: undefined, didCompact: true };
+  }
+
+  return compactRelayThreadListString(value);
+}
+
+function compactThreadGoalStatus(thread) {
+  const explicitStatus = normalizeThreadGoalStatus(
+    thread?.threadGoalStatus
+      ?? thread?.thread_goal_status
+      ?? thread?.goalStatus
+      ?? thread?.goal_status
+  );
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+
+  const activeGoalStatus = normalizeGoalPayloadStatus(thread?.threadGoal);
+  if (activeGoalStatus) {
+    return activeGoalStatus;
+  }
+
+  const metadata = thread?.metadata;
+  const metadataStatus = normalizeThreadGoalStatus(
+    metadata?.threadGoalStatus
+      ?? metadata?.thread_goal_status
+      ?? metadata?.goalStatus
+      ?? metadata?.goal_status
+  );
+  if (metadataStatus) {
+    return metadataStatus;
+  }
+
+  return normalizeGoalPayloadStatus(thread?.completedThreadGoal);
+}
+
+function normalizeGoalPayloadStatus(value) {
+  if (value == null || value === false) {
+    return "";
+  }
+  if (value === true) {
+    return "active";
+  }
+  if (typeof value === "string") {
+    return normalizeThreadGoalStatus(value) || "active";
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return "";
+  }
+
+  return normalizeThreadGoalStatus(
+    value.status
+      ?? value.state
+      ?? value.phase
+      ?? value.result
+  ) || "active";
+}
+
+function normalizeThreadGoalStatus(value) {
+  const token = typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[_-\s]+/g, "")
+    : "";
+  if (!token) {
+    return "";
+  }
+  if (["active", "using", "inprogress", "running", "started"].includes(token)) {
+    return "active";
+  }
+  if (["completed", "complete", "done", "finished", "succeeded", "success"].includes(token)) {
+    return "completed";
+  }
+  return "";
+}
+
+function augmentRelayThreadListWithJsonlThreads(threads, requestContext = {}) {
+  if (!Array.isArray(threads)) {
+    return { threads, didAugment: false };
+  }
+
+  const requestedLimit = threadListLimitFromParams(requestContext);
+  const existingThreadIds = new Set(
+    threads
+      .map(threadListThreadId)
+      .filter(Boolean)
+  );
+  const additions = readRecentJsonlThreadListItems({
+    existingThreadIds,
+    sourceKinds: requestContext?.sourceKinds,
+    limit: requestedLimit,
+  });
+  if (additions.length === 0) {
+    return { threads, didAugment: false };
+  }
+
+  const mergedThreads = [...additions, ...threads].sort(compareThreadListItemsByRecentActivity);
+  return {
+    threads: requestedLimit ? mergedThreads.slice(0, requestedLimit) : mergedThreads,
+    didAugment: true,
+  };
+}
+
+function readRecentJsonlThreadListItems({
+  existingThreadIds = new Set(),
+  sourceKinds = [],
+  limit,
+} = {}) {
+  const sessionsRoot = resolveSessionsRoot();
+  let candidates = [];
+  try {
+    candidates = collectRecentRolloutFiles(sessionsRoot, {
+      candidateLimit: limit ?? Number.POSITIVE_INFINITY,
+    });
+  } catch {
+    return [];
+  }
+
+  const indexedThreadNames = readSessionIndexThreadNamesForSessionsRoot(sessionsRoot);
+  const additionsById = new Map();
+  for (const candidate of candidates) {
+    const fallbackUpdatedAt = new Date(candidate.mtimeMs).toISOString();
+    let summary;
+    try {
+      summary = parseSessionJsonlThreadSummary(readFilePrefix(
+        candidate.filePath,
+        RELAY_THREAD_LIST_JSONL_SUMMARY_READ_BYTES
+      ), {
+        fallbackUpdatedAt,
+      });
+      if (candidate.size > RELAY_THREAD_LIST_JSONL_SUMMARY_READ_BYTES) {
+        summary.updatedAt = fallbackUpdatedAt;
+      }
+    } catch {
+      continue;
+    }
+
+    const threadId = normalizeNonEmptyString(summary?.threadId);
+    const cwd = normalizeNonEmptyString(summary?.cwd);
+    if (!threadId || !cwd || !path.isAbsolute(cwd) || existingThreadIds.has(threadId)) {
+      continue;
+    }
+    if (!threadListSummaryMatchesSourceKinds(summary, sourceKinds)) {
+      continue;
+    }
+
+    const indexedThreadName = indexedThreadNames.get(threadId);
+    if (indexedThreadName) {
+      summary = {
+        ...summary,
+        title: indexedThreadName,
+        name: indexedThreadName,
+      };
+    }
+
+    additionsById.set(threadId, buildJsonlThreadListItem(summary));
+    if (limit && additionsById.size >= limit) {
+      break;
+    }
+  }
+
+  return Array.from(additionsById.values());
+}
+
+function readFilePrefix(filePath, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    if (fd !== undefined) {
+      fs.closeSync(fd);
+    }
+  }
+}
+
+function readSessionIndexThreadNamesForSessionsRoot(sessionsRoot) {
+  try {
+    const codexHome = path.dirname(path.resolve(sessionsRoot));
+    const indexPath = path.join(codexHome, "session_index.jsonl");
+    return parseSessionIndexThreadNames(fs.readFileSync(indexPath, "utf8"));
+  } catch {
+    return new Map();
+  }
+}
+
+function buildJsonlThreadListItem(summary) {
+  const threadId = normalizeNonEmptyString(summary.threadId);
+  const cwd = normalizeNonEmptyString(summary.cwd);
+  const title = normalizeNonEmptyString(summary.name)
+    || normalizeNonEmptyString(summary.title)
+    || normalizeNonEmptyString(summary.threadName)
+    || normalizeNonEmptyString(summary.thread_name);
+  const source = normalizeNonEmptyString(summary.source) || "unknown";
+  const threadSource = normalizeNonEmptyString(summary.threadSource);
+  const createdAt = normalizeNonEmptyString(summary.createdAt) || normalizeNonEmptyString(summary.updatedAt);
+  const updatedAt = normalizeNonEmptyString(summary.updatedAt) || createdAt;
+  const preview = normalizeNonEmptyString(summary.preview);
+  const parentThreadId = normalizeNonEmptyString(summary.parentThreadId);
+  const modelProvider = normalizeNonEmptyString(summary.modelProvider);
+  const metadata = {
+    remodexJsonlThreadListFallback: true,
+  };
+  if (threadSource) {
+    metadata.thread_source = threadSource;
+  }
+
+  return {
+    id: threadId,
+    cwd,
+    current_working_directory: cwd,
+    working_directory: cwd,
+    createdAt,
+    created_at: createdAt,
+    updatedAt,
+    updated_at: updatedAt,
+    title: title || undefined,
+    name: title || undefined,
+    preview: preview || undefined,
+    source,
+    thread_source: threadSource || undefined,
+    parentThreadId: parentThreadId || undefined,
+    parent_thread_id: parentThreadId || undefined,
+    modelProvider: modelProvider || undefined,
+    model_provider: modelProvider || undefined,
+    metadata,
+  };
+}
+
+function logThreadListPerformance({
+  requestContext,
+  rawMessage,
+  sanitizedMessage,
+  sanitizeStartedAt,
+  nowMs = Date.now(),
+} = {}) {
+  const createdAt = Number(requestContext?.createdAt) || sanitizeStartedAt || nowMs;
+  const upstreamMs = Math.max(0, sanitizeStartedAt - createdAt);
+  const sanitizeMs = Math.max(0, nowMs - sanitizeStartedAt);
+  const totalMs = Math.max(0, nowMs - createdAt);
+  const parsed = parseBridgeJSON(sanitizedMessage) || parseBridgeJSON(rawMessage);
+  const result = parsed?.result && typeof parsed.result === "object" ? parsed.result : {};
+  const threads =
+    Array.isArray(result.data) ? result.data
+      : Array.isArray(result.items) ? result.items
+        : Array.isArray(result.threads) ? result.threads
+          : [];
+  const augmented = Boolean(result.remodexJsonlThreadListAugmented);
+  const limit = Number.isFinite(requestContext?.limit) ? requestContext.limit : "none";
+  const cursor = hasRelayCursor(requestContext?.cursor) ? "yes" : "no";
+  const rawBytes = Buffer.byteLength(String(rawMessage || ""), "utf8");
+  const sanitizedBytes = Buffer.byteLength(String(sanitizedMessage || ""), "utf8");
+
+  console.log(
+    `[remodex][perf] thread/list limit=${limit} cursor=${cursor} `
+      + `threads=${threads.length} upstreamMs=${upstreamMs} sanitizeMs=${sanitizeMs} `
+      + `totalMs=${totalMs} augmented=${augmented} rawBytes=${rawBytes} sanitizedBytes=${sanitizedBytes}`
+  );
+}
+
+function threadListSummaryMatchesSourceKinds(summary, sourceKinds) {
+  const requestedKinds = normalizeSourceKinds(sourceKinds);
+  if (requestedKinds.size === 0) {
+    return true;
+  }
+
+  const source = normalizeNonEmptyString(summary?.source).toLowerCase() || "unknown";
+  return requestedKinds.has(source) || (source === "unknown" && requestedKinds.has("unknown"));
+}
+
+function normalizeSourceKinds(sourceKinds) {
+  if (!Array.isArray(sourceKinds)) {
+    return new Set();
+  }
+
+  return new Set(
+    sourceKinds
+      .map((value) => normalizeNonEmptyString(value).toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function threadListThreadId(thread) {
+  return normalizeNonEmptyString(thread?.id)
+    || normalizeNonEmptyString(thread?.threadId)
+    || normalizeNonEmptyString(thread?.thread_id);
+}
+
+function compareThreadListItemsByRecentActivity(lhs, rhs) {
+  const lhsTime = threadListItemTimestamp(lhs);
+  const rhsTime = threadListItemTimestamp(rhs);
+  if (lhsTime !== rhsTime) {
+    return rhsTime - lhsTime;
+  }
+
+  return threadListThreadId(lhs).localeCompare(threadListThreadId(rhs));
+}
+
+function threadListItemTimestamp(thread) {
+  const value = thread?.updatedAt
+    ?? thread?.updated_at
+    ?? thread?.lastActivityAt
+    ?? thread?.last_activity_at
+    ?? thread?.createdAt
+    ?? thread?.created_at;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 10_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
 }
 
 function augmentRelayThreadWithJsonlMetadata(thread, threadId = "") {

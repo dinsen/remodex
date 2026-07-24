@@ -43,6 +43,7 @@ enum TurnScrollEvent: Equatable {
 
 struct TurnScrollStateTracker {
     static let bottomThreshold: CGFloat = 12
+    static let contentHeightCorrectionThreshold: CGFloat = 1
 
     static func shouldShowScrollToLatestButton(
         messageCount: Int,
@@ -123,6 +124,24 @@ struct TurnScrollStateTracker {
                 ownership: ownership,
                 isAutomaticScrollingPaused: isAutomaticScrollingPaused
             )
+    }
+
+    // Re-anchor whenever pinned content meaningfully grows or shrinks so
+    // completion-time row removal cannot leave blank space below the timeline.
+    static func shouldCorrectBottomAfterContentHeightChange(
+        previousHeight: CGFloat,
+        newHeight: CGFloat,
+        isPinnedToBottom: Bool
+    ) -> Bool {
+        guard isPinnedToBottom else {
+            return false
+        }
+
+        guard previousHeight > 0, newHeight > 0 else {
+            return false
+        }
+
+        return abs(newHeight - previousHeight) > contentHeightCorrectionThreshold
     }
 
     // A local send keeps the full live tail rendered even before explicit running

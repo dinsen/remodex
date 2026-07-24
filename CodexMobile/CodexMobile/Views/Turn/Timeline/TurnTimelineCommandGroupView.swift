@@ -18,6 +18,7 @@ struct TurnTimelineCommandGroupView: View {
     let planMatchingFingerprint: Int
     let newestStreamingMessageID: String?
     let autoScrollMode: TurnScrollOwnership
+    let prioritizesComposerInput: Bool
     let showsGlobalRunningIndicator: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
@@ -93,6 +94,7 @@ struct TurnTimelineCommandGroupView: View {
             planMatchingFingerprint: planMatchingFingerprint,
             newestStreamingMessageID: newestStreamingMessageID,
             autoScrollMode: autoScrollMode,
+            prioritizesComposerInput: prioritizesComposerInput,
             showsGlobalRunningIndicator: showsGlobalRunningIndicator,
             movesCopyAndRunningToGroupFooter: message.id == group.accessoryHostMessage?.id,
             onRetryUserMessage: onRetryUserMessage,

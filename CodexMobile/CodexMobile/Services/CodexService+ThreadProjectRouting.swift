@@ -20,7 +20,7 @@ extension CodexService {
     ) async throws -> CodexThread {
         try await awaitRuntimeInitializedIfNeeded()
 
-        let resolvedProjectPath = await resolvedPreferredProjectPath(
+        let resolvedProjectPath = try await resolvedPreferredProjectPath(
             preferredProjectPath: preferredProjectPath,
             rootlessChatPromptHint: rootlessChatPromptHint
         )
@@ -39,23 +39,18 @@ extension CodexService {
         )
     }
 
-    // Best-effort rootless cwd minting. If the bridge call fails (older bridge build or
-    // filesystem problem) we fall back to sending `thread/start` without a cwd, preserving
-    // the pre-existing behaviour rather than blocking the user from starting a chat.
+    // Rootless chats must still have an explicit local cwd so `thread/start` never
+    // falls back to the app-server process cwd, which is often the user's home.
     private func resolvedPreferredProjectPath(
         preferredProjectPath: String?,
         rootlessChatPromptHint: String?
-    ) async -> String? {
+    ) async throws -> String? {
         if let preferredProjectPath,
            !preferredProjectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return preferredProjectPath
         }
 
-        do {
-            return try await createRootlessChatRoot(promptHint: rootlessChatPromptHint)
-        } catch {
-            return nil
-        }
+        return try await createRootlessChatRoot(promptHint: rootlessChatPromptHint)
     }
 
     // Rebinds the existing chat to a new local project path so worktree handoff keeps the same thread id.

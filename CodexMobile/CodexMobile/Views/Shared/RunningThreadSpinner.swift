@@ -38,4 +38,3 @@ struct RunningThreadSpinner: View {
         .accessibilityHidden(true)
     }
 }
-

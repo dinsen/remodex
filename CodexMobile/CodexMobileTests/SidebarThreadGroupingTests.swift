@@ -140,6 +140,29 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(projectGroups.map(\.id), ["project:/Users/me/work/app"])
     }
 
+    func testMakeGroupsTreatsBareMacHomeFallbackAsRootlessChat() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "project-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/app"),
+            makeThread(id: "home-fallback-thread", updatedAt: now, cwd: "/Users/me"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/app"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .all,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/app", "chats:rootless"])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["project-thread"])
+        XCTAssertEqual(groups[1].threads.map(\.id), ["home-fallback-thread"])
+    }
+
     func testMakeGroupsWithChatScopeUsesDynamicProjectlessRoots() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let customRoot = "/Volumes/Fast/CodexChats"
@@ -347,6 +370,210 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(labelsByPath["/Users/me/work/Remodex"]?.iconSystemName, "folder")
         XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.label, "Remodex 15")
         XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.iconSystemName, "remodex.worktree")
+    }
+
+    func testMakeGroupsIncludesConfiguredProjectsWithoutThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/app"),
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/helper",
+        ])
+        XCTAssertEqual(groups[1].label, "helper")
+        XCTAssertEqual(groups[1].projectPath, "/Users/me/work/helper")
+        XCTAssertEqual(groups[1].threads.map(\.id), [])
+    }
+
+    func testMakeGroupsMergesConfiguredProjectsWithMatchingRecentThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "helper-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/helper"])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["helper-thread"])
+    }
+
+    func testConfiguredProjectSourceUsesConfiguredProjectOrder() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(id: "helper-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/helper"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/empty"),
+            makeProjectChoice(path: "/Users/me/work/app"),
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/empty",
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/helper",
+        ])
+    }
+
+    func testConfiguredProjectSourceMergesDescendantThreadsIntoMostSpecificConfiguredProject() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "work-child-thread", updatedAt: now, cwd: "/Users/me/work/tools"),
+            makeThread(id: "helper-child-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/helper/ios"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work"),
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work",
+            "project:/Users/me/work/helper",
+        ])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["work-child-thread"])
+        XCTAssertEqual(groups[1].projectPath, "/Users/me/work/helper")
+        XCTAssertEqual(groups[1].threads.map(\.id), ["helper-child-thread"])
+    }
+
+    func testConfiguredProjectSourceMergesCodexManagedWorktreeThreadsByProjectTail() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(
+                id: "worktree-thread",
+                updatedAt: now,
+                cwd: "/Users/me/.codex/worktrees/9a40/finn-ios-vertical"
+            ),
+            makeThread(
+                id: "nested-worktree-thread",
+                updatedAt: now.addingTimeInterval(-60),
+                cwd: "/Users/me/.codex/worktrees/d3de/projects/tai"
+            ),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/projects/finn-ios-vertical"),
+            makeProjectChoice(path: "/Users/me/projects/tai"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/projects/finn-ios-vertical",
+            "project:/Users/me/projects/tai",
+        ])
+        XCTAssertEqual(groups[0].threads.map(\.id), ["worktree-thread"])
+        XCTAssertEqual(groups[1].threads.map(\.id), ["nested-worktree-thread"])
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[0], in: threads),
+            ["worktree-thread"]
+        )
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[1], in: threads),
+            ["nested-worktree-thread"]
+        )
+    }
+
+    func testConfiguredProjectSourceExcludesRecentThreadProjectsOutsideConfig() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "configured-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+            makeThread(id: "recent-only-thread", updatedAt: now.addingTimeInterval(60), cwd: "/Users/me/work/recent-only"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+
+        let configuredGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+        let recentGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .recentThreadProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(configuredGroups.map(\.id), ["project:/Users/me/work/helper"])
+        XCTAssertEqual(configuredGroups[0].threads.map(\.id), ["configured-thread"])
+        XCTAssertEqual(recentGroups.map(\.id), [
+            "project:/Users/me/work/recent-only",
+            "project:/Users/me/work/helper",
+        ])
+    }
+
+    func testLiveThreadIDsForConfiguredProjectGroupIncludesDescendantThreads() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "root-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
+            makeThread(id: "child-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/helper/ios"),
+            makeThread(id: "sibling-thread", updatedAt: now.addingTimeInterval(-120), cwd: "/Users/me/work/other"),
+        ]
+        let configuredProjects = [
+            makeProjectChoice(path: "/Users/me/work/helper"),
+        ]
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: configuredProjects,
+            now: now
+        )
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[0], in: threads),
+            ["root-thread", "child-thread"]
+        )
     }
 
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {
@@ -676,6 +903,16 @@ final class SidebarThreadGroupingTests: XCTestCase {
             sortDate: .distantPast,
             projectPath: id.replacingOccurrences(of: "project:", with: ""),
             threads: []
+        )
+    }
+
+    private func makeProjectChoice(path: String) -> SidebarProjectChoice {
+        SidebarProjectChoice(
+            id: "project:\(path)",
+            label: path.pathDisplayName,
+            iconSystemName: CodexThread.projectIconSystemName(for: path),
+            projectPath: path,
+            sortDate: .distantPast
         )
     }
 

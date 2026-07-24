@@ -47,6 +47,7 @@ final class RemodexDisplayIslandCoordinator {
     private var lastTerminalStatesByThread: [String: CodexTurnTerminalState] = [:]
     private var runningStartedAtByThread: [String: Date] = [:]
     private var runningLastSeenAtByThread: [String: Date] = [:]
+    private var didHydrateRunningStartsFromActivity = false
 
     func rememberCompletion(from banner: CodexThreadCompletionBanner?, codex: CodexService) {
         guard let banner else {
@@ -332,7 +333,7 @@ final class RemodexDisplayIslandCoordinator {
                 && message.kind == .chat
                 && message.isStreaming
                 && message.assistantPhase == "final_answer"
-                && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && message.text.contains { !$0.isWhitespace }
         }
         return isFinalAnswerStreaming ? .finishing : .running
     }
@@ -432,6 +433,11 @@ final class RemodexDisplayIslandCoordinator {
     }
 
     private func hydrateRunningStartsFromCurrentActivity(now: Date) {
+        guard !didHydrateRunningStartsFromActivity else {
+            return
+        }
+        didHydrateRunningStartsFromActivity = true
+
         guard let activity = currentActivity else {
             return
         }
@@ -467,6 +473,9 @@ final class RemodexDisplayIslandCoordinator {
         // progress when the app is suspended and updates stop.
         let staleDate = activityStaleDate(for: snapshot, now: now)
         let activity = currentActivity
+        if snapshot == lastSnapshot, activityID == nil, let activity {
+            activityID = activity.id
+        }
         guard snapshot != lastSnapshot
                 || activity == nil
                 || shouldRefreshActivityStaleDate(staleDate, now: now) else {

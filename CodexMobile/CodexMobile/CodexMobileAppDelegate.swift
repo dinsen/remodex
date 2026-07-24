@@ -30,12 +30,6 @@ final class CodexMobileAppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        if let shortcutItem = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem {
-            Task { @MainActor in
-                RemodexQuickActionCenter.handleShortcutItem(shortcutItem)
-            }
-        }
-
         return true
     }
 

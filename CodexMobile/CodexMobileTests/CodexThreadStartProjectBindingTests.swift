@@ -120,6 +120,15 @@ final class CodexThreadStartProjectBindingTests: XCTestCase {
         XCTAssertNil(thread.gitWorkingDirectory)
     }
 
+    func testManagedWorktreeProjectUsesWorktreePresentation() {
+        let path = "/Users/me/project/.codex/worktrees/fix-lag/remodex"
+        let thread = CodexThread(id: "thread-worktree", cwd: path)
+
+        XCTAssertTrue(thread.isManagedWorktreeProject)
+        XCTAssertEqual(thread.projectDisplayName, "remodex [fix-lag]")
+        XCTAssertEqual(CodexThread.projectIconSystemName(for: path), "arrow.triangle.branch")
+    }
+
     func testPseudoProjectBucketDoesNotBecomeGitWorkingDirectory() {
         let thread = CodexThread(id: "thread-1", cwd: "_default")
 
@@ -166,6 +175,49 @@ final class CodexThreadStartProjectBindingTests: XCTestCase {
         )
 
         XCTAssertEqual(thread.modelDisplayLabel, "gpt-5.4-mini")
+    }
+
+    func testDecodesActiveGoalStatusFromTopLevelThreadListField() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "threadGoalStatus": "active"
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .active)
+        XCTAssertTrue(thread.isUsingGoal)
+    }
+
+    func testDecodesGoalStatusFromMetadataFallback() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "metadata": {
+            "goal_status": "using"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .active)
+    }
+
+    func testIgnoresInactiveGoalStatusForCurrentGoalPresentation() throws {
+        let payload = """
+        {
+          "id": "thread-goal",
+          "threadGoalStatus": "completed"
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
+
+        XCTAssertEqual(thread.goalStatus, .completed)
+        XCTAssertFalse(thread.isUsingGoal)
     }
 
     func testAgentDisplayLabelIgnoresCollabToolItemTypeNoise() throws {

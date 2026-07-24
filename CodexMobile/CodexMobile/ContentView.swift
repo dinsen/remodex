@@ -1006,7 +1006,7 @@ struct ContentView: View {
     }
 
     private var fallbackSidebarWidth: CGFloat {
-        effectiveSidebarWidth(for: UIScreen.main.bounds.width)
+        sidebarWidth
     }
 
     private func sidebarRevealWidth(for targetWidth: CGFloat) -> CGFloat {
@@ -1991,7 +1991,7 @@ struct ContentView: View {
 
     private func startNewThreadFromMissingNotificationAlert() async {
         do {
-            let thread = try await codex.startThread()
+            let thread = try await codex.startThreadIfReady(rootlessChatPromptHint: "new chat")
             selectedThread = thread
         } catch {
             codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)

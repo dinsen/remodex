@@ -27,18 +27,87 @@ private let timelineStreamingPlaceholderTexts: Set<String> = [
 private let timelinePlaceholderCheckByteLimit = 128
 private let timelineFullTrimByteLimit = 64_000
 private let timelineActionTextTrimByteLimit = 64_000
+private let streamingAssistantAccessibilityPreviewCharacterLimit = 600
 
-private func messageRowTextSignature(_ text: String) -> String {
-    return TurnTextCacheKey.stableFingerprint(for: text)
+private nonisolated func messageRowTextSignature(_ text: String) -> String {
+    return CodexTextContentFingerprint.cacheKey(for: text)
 }
 
-private struct MessageRowMessageSignature: Equatable {
+private nonisolated func messageRowJSONSignature(_ value: JSONValue) -> String {
+    switch value {
+    case .string(let string):
+        return "s:\(messageRowTextSignature(string))"
+    case .integer(let integer):
+        return "i:\(integer)"
+    case .double(let double):
+        return "d:\(double.bitPattern)"
+    case .bool(let bool):
+        return "b:\(bool)"
+    case .object(let object):
+        return object
+            .keys
+            .sorted()
+            .map { key in
+                "\(messageRowTextSignature(key)):\(messageRowJSONSignature(object[key] ?? .null))"
+            }
+            .joined(separator: ",")
+    case .array(let array):
+        return array
+            .map(messageRowJSONSignature)
+            .joined(separator: ",")
+    case .null:
+        return "n"
+    }
+}
+
+private enum AssistantGitActionMarkerSanitizer {
+    private static let markerOnlyLineRegex = try? NSRegularExpression(
+        pattern: #"(?m)^[ \t]*(?:(?:::git-(?:stage|commit|push)\{(?:[^"\\}]|\\.|"(?:[^"\\]|\\.)*")*\})[ \t]*)+$"#
+    )
+
+    static func visibleText(from rawText: String) -> String {
+        guard rawText.contains("::git-"),
+              let markerOnlyLineRegex else {
+            return rawText
+        }
+
+        let fullRange = NSRange(location: 0, length: (rawText as NSString).length)
+        guard markerOnlyLineRegex.firstMatch(in: rawText, range: fullRange) != nil else {
+            return rawText
+        }
+
+        let stripped = markerOnlyLineRegex.stringByReplacingMatches(
+            in: rawText,
+            range: fullRange,
+            withTemplate: ""
+        )
+        return collapseMarkerWhitespace(in: stripped)
+    }
+
+    private static func collapseMarkerWhitespace(in text: String) -> String {
+        let collapsedNewlines = text.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        let cleanedLines = collapsedNewlines
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "\n")
+        return cleanedLines.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+nonisolated private struct MessageRowMessageSignature: Equatable {
+    private static let focusedComposerStreamingTextByteLimit = 512
+
     let id: String
     let threadId: String
     let role: CodexMessageRole
     let kind: CodexMessageKind
     let assistantPhase: String?
-    let textFingerprint: CodexMessageTextRenderSignature
+    let textByteCount: Int?
+    let textRevision: Int?
     let fileMentions: [String]
     let skillMentions: [String]
     let pluginMentions: [String]
@@ -57,13 +126,22 @@ private struct MessageRowMessageSignature: Equatable {
     let autoApprovalReview: MessageRowAutoApprovalReviewSignature?
     let orderIndex: Int
 
-    init(_ message: CodexMessage) {
+    init(_ message: CodexMessage, prioritizesComposerInput: Bool) {
         self.id = message.id
         self.threadId = message.threadId
         self.role = message.role
         self.kind = message.kind
         self.assistantPhase = message.assistantPhase
-        self.textFingerprint = message.textRenderSignature
+        if Self.shouldSuppressStreamingTextInvalidation(
+            for: message,
+            prioritizesComposerInput: prioritizesComposerInput
+        ) {
+            self.textByteCount = nil
+            self.textRevision = nil
+        } else {
+            self.textByteCount = message.textRenderSignature.byteCount
+            self.textRevision = message.textRenderSignature.revision
+        }
         self.fileMentions = message.fileMentions
         self.skillMentions = message.skillMentions
         self.pluginMentions = message.pluginMentions
@@ -83,9 +161,19 @@ private struct MessageRowMessageSignature: Equatable {
         self.autoApprovalReview = message.autoApprovalReview.map(MessageRowAutoApprovalReviewSignature.init)
         self.orderIndex = message.orderIndex
     }
+
+    private static func shouldSuppressStreamingTextInvalidation(
+        for message: CodexMessage,
+        prioritizesComposerInput: Bool
+    ) -> Bool {
+        prioritizesComposerInput
+            && message.role == .assistant
+            && message.isStreaming
+            && message.textRenderSignature.byteCount > focusedComposerStreamingTextByteLimit
+    }
 }
 
-private struct MessageRowAutoApprovalReviewSignature: Equatable {
+nonisolated private struct MessageRowAutoApprovalReviewSignature: Equatable {
     let reviewId: String
     let status: CodexAutoApprovalReviewStatus
     let riskLevel: String?
@@ -105,7 +193,7 @@ private struct MessageRowAutoApprovalReviewSignature: Equatable {
     }
 }
 
-private struct MessageRowAttachmentSignature: Equatable {
+nonisolated private struct MessageRowAttachmentSignature: Equatable {
     let id: String
     let thumbnailFingerprint: CodexTextContentFingerprint
     let payloadFingerprint: CodexTextContentFingerprint?
@@ -119,7 +207,7 @@ private struct MessageRowAttachmentSignature: Equatable {
     }
 }
 
-private struct MessageRowProposedPlanSignature: Equatable {
+nonisolated private struct MessageRowProposedPlanSignature: Equatable {
     let bodyFingerprint: String
     let summaryFingerprint: String?
 
@@ -129,7 +217,7 @@ private struct MessageRowProposedPlanSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStateSignature: Equatable {
+nonisolated private struct MessageRowPlanStateSignature: Equatable {
     let explanationFingerprint: String?
     let steps: [MessageRowPlanStepSignature]
 
@@ -139,7 +227,7 @@ private struct MessageRowPlanStateSignature: Equatable {
     }
 }
 
-private struct MessageRowPlanStepSignature: Equatable {
+nonisolated private struct MessageRowPlanStepSignature: Equatable {
     let id: String
     let stepFingerprint: String
     let status: CodexPlanStepStatus
@@ -151,7 +239,7 @@ private struct MessageRowPlanStepSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentActionSignature: Equatable {
+nonisolated private struct MessageRowSubagentActionSignature: Equatable {
     let tool: String
     let status: String
     let promptFingerprint: String?
@@ -174,7 +262,7 @@ private struct MessageRowSubagentActionSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentRefSignature: Equatable {
+nonisolated private struct MessageRowSubagentRefSignature: Equatable {
     let threadId: String
     let agentId: String?
     let nickname: String?
@@ -192,7 +280,7 @@ private struct MessageRowSubagentRefSignature: Equatable {
     }
 }
 
-private struct MessageRowSubagentStateSignature: Equatable {
+nonisolated private struct MessageRowSubagentStateSignature: Equatable {
     let threadId: String
     let status: String
     let messageFingerprint: String?
@@ -204,17 +292,17 @@ private struct MessageRowSubagentStateSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputRequestSignature: Equatable {
-    let requestID: JSONValue
+nonisolated private struct MessageRowStructuredInputRequestSignature: Equatable {
+    let requestIDFingerprint: String
     let questions: [MessageRowStructuredInputQuestionSignature]
 
     init(_ request: CodexStructuredUserInputRequest) {
-        self.requestID = request.requestID
+        self.requestIDFingerprint = messageRowJSONSignature(request.requestID)
         self.questions = request.questions.map(MessageRowStructuredInputQuestionSignature.init)
     }
 }
 
-private struct MessageRowStructuredInputQuestionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputQuestionSignature: Equatable {
     let id: String
     let headerFingerprint: String
     let questionFingerprint: String
@@ -234,7 +322,7 @@ private struct MessageRowStructuredInputQuestionSignature: Equatable {
     }
 }
 
-private struct MessageRowStructuredInputOptionSignature: Equatable {
+nonisolated private struct MessageRowStructuredInputOptionSignature: Equatable {
     let id: String
     let labelFingerprint: String
     let descriptionFingerprint: String
@@ -292,7 +380,7 @@ func timelineDisplayWindow(
     if message.isStreaming, isTimelineStreamingPlaceholder(rawText) {
         return TimelineTextClippingPolicy.DisplayWindow(text: "", isPartial: false, hiddenByteCount: 0)
     }
-    let displaySource = timelineTrimmedDisplaySource(rawText)
+    let displaySource = timelineTrimmedDisplaySource(timelineDisplaySource(for: message))
     guard !displaySource.isEmpty else {
         return TimelineTextClippingPolicy.DisplayWindow(text: "", isPartial: false, hiddenByteCount: 0)
     }
@@ -322,12 +410,19 @@ private func timelineTrimmedDisplaySource(_ text: String) -> String {
     return text
 }
 
-// Keeps user actions faithful to the underlying message even when display text is clipped.
+private func timelineDisplaySource(for message: CodexMessage) -> String {
+    guard message.role == .assistant else {
+        return message.text
+    }
+    return AssistantGitActionMarkerSanitizer.visibleText(from: message.text)
+}
+
+// Keeps user actions faithful to the visible row text even when display text is clipped.
 func timelineActionText(for message: CodexMessage) -> String {
     if message.isStreaming, isTimelineStreamingPlaceholder(message.text) {
         return ""
     }
-    return message.text
+    return timelineDisplaySource(for: message)
 }
 
 // Context-menu actions may receive the full unclipped row. Avoid trimming huge strings while
@@ -359,6 +454,8 @@ struct MessageRow: View, Equatable {
     var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
+    // Gives composer edits priority over live assistant prose updates during streaming.
+    var prioritizesComposerInput: Bool = false
     // Passed as init params so .equatable() can invalidate only for row-visible action state.
     var inlineCommitAndPushAction: (() -> Void)? = nil
     var inlineCommitAndPushPhase: InlineCommitAndPushPhase? = nil
@@ -373,7 +470,13 @@ struct MessageRow: View, Equatable {
     @State private var previewImage: PreviewImagePayload?
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
-        MessageRowMessageSignature(lhs.message) == MessageRowMessageSignature(rhs.message)
+        MessageRowMessageSignature(
+            lhs.message,
+            prioritizesComposerInput: lhs.prioritizesComposerInput
+        ) == MessageRowMessageSignature(
+            rhs.message,
+            prioritizesComposerInput: rhs.prioritizesComposerInput
+        )
             && lhs.isRetryAvailable == rhs.isRetryAvailable
             && lhs.assistantBlockAccessoryState == rhs.assistantBlockAccessoryState
             && lhs.planSessionSource == rhs.planSessionSource
@@ -382,6 +485,7 @@ struct MessageRow: View, Equatable {
             && lhs.currentWorkingDirectory == rhs.currentWorkingDirectory
             && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
+            && lhs.prioritizesComposerInput == rhs.prioritizesComposerInput
             && (lhs.inlineCommitAndPushAction != nil) == (rhs.inlineCommitAndPushAction != nil)
             && lhs.inlineCommitAndPushPhase == rhs.inlineCommitAndPushPhase
     }
@@ -416,11 +520,15 @@ struct MessageRow: View, Equatable {
 
     private func shouldSynchronizeAssistantDisplayImmediately() -> Bool {
         guard message.isStreaming else { return true }
+        let nextText = timelineDisplayWindow(for: message, expansionLevel: textExpansionLevel).text
+        if prioritizesComposerInput {
+            return throttledAssistantDisplayText == nil
+                && shouldShowInitialStreamingText(nextText)
+        }
         if showsStreamingAnimations {
             return true
         }
 
-        let nextText = timelineDisplayWindow(for: message, expansionLevel: textExpansionLevel).text
         return shouldShowInitialStreamingText(nextText)
     }
 
@@ -496,6 +604,9 @@ struct MessageRow: View, Equatable {
         }
         .onChange(of: message.isStreaming) { _, isStreaming in
             synchronizeAssistantDisplayText(immediate: !isStreaming)
+        }
+        .onChange(of: prioritizesComposerInput) { _, prioritizesComposerInput in
+            synchronizeAssistantDisplayText(immediate: !prioritizesComposerInput)
         }
         .onChange(of: textExpansionLevel) { _, _ in
             synchronizeAssistantDisplayText(immediate: true)
@@ -765,9 +876,13 @@ struct MessageRow: View, Equatable {
             // fight the reveal. The row switches to the selectable path once it settles.
             StreamingAssistantMarkdownTextView(
                 text: visibleAssistantTextWithoutImageSyntax,
-                enablesSelection: false,
+                enablesSelection: enablesInlineMarkdownSelectionInTimeline,
                 constrainsToAvailableWidth: true,
                 animatesReveal: showsStreamingAnimations
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                streamingAssistantAccessibilityLabel(for: visibleAssistantTextWithoutImageSyntax)
             )
             .contextMenu {
                 streamingAssistantTextActions(text: actionText)
@@ -795,6 +910,21 @@ struct MessageRow: View, Equatable {
                 RemodexIcon.menuLabel("Copy", systemName: "doc.on.doc")
             }
         }
+    }
+
+    private func streamingAssistantAccessibilityLabel(for text: String) -> String {
+        let preview = text.prefix(streamingAssistantAccessibilityPreviewCharacterLimit)
+        let isTruncated = preview.endIndex < text.endIndex
+        let trimmedPreview = String(preview)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedPreview.isEmpty else {
+            return "Assistant response, streaming"
+        }
+
+        return isTruncated
+            ? "Assistant response, streaming. \(trimmedPreview)..."
+            : "Assistant response, streaming. \(trimmedPreview)"
     }
 
     private func expandVisibleText() {
@@ -845,6 +975,14 @@ struct MessageRow: View, Equatable {
             assistantDisplayUpdateTask?.cancel()
             assistantDisplayUpdateTask = nil
             throttledAssistantDisplayText = nextText
+            return
+        }
+
+        if prioritizesComposerInput {
+            if throttledAssistantDisplayText == nil,
+               shouldShowInitialStreamingText(nextText) {
+                throttledAssistantDisplayText = nextText
+            }
             return
         }
 

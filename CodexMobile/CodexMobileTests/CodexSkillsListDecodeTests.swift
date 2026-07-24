@@ -92,7 +92,7 @@ final class CodexSkillsListDecodeTests: XCTestCase {
         XCTAssertEqual(capturedParams.count, 2)
         let activeParams = try XCTUnwrap(capturedParams.first { $0["archived"]?.boolValue != true })
         let archivedParams = try XCTUnwrap(capturedParams.first { $0["archived"]?.boolValue == true })
-        XCTAssertEqual(activeParams["limit"]?.intValue, 70)
+        XCTAssertEqual(activeParams["limit"]?.intValue, 30)
         XCTAssertEqual(archivedParams["limit"]?.intValue, 10)
     }
 

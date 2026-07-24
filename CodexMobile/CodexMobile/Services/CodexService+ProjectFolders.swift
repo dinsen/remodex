@@ -25,6 +25,12 @@ struct CodexProjectDirectoryListing: Equatable, Sendable {
     let entries: [CodexProjectDirectoryEntry]
 }
 
+struct CodexConfiguredProject: Identifiable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let path: String
+}
+
 struct CodexProjectlessChatRoots: Equatable, Sendable {
     let roots: [String]
     let codexHome: String?
@@ -41,6 +47,16 @@ extension CodexService {
         }
 
         return locations.compactMap(Self.decodeProjectLocation)
+    }
+
+    // Loads trusted project paths from the paired Mac's Codex config.
+    func fetchConfiguredProjects() async throws -> [CodexConfiguredProject] {
+        let response = try await sendRequest(method: "project/configuredProjects", params: .object([:]))
+        guard let projects = response.result?.objectValue?["projects"]?.arrayValue else {
+            throw CodexServiceError.invalidResponse("project/configuredProjects response missing projects")
+        }
+
+        return projects.compactMap(Self.decodeConfiguredProject)
     }
 
     // Reads host-side Codex chat roots so projectless classification survives custom CODEX_HOME.
@@ -148,6 +164,17 @@ private extension CodexService {
         }
 
         return CodexProjectLocation(id: id, label: label, path: path)
+    }
+
+    static func decodeConfiguredProject(_ value: JSONValue) -> CodexConfiguredProject? {
+        guard let object = value.objectValue,
+              let id = object["id"]?.stringValue,
+              let label = object["label"]?.stringValue,
+              let path = object["path"]?.stringValue else {
+            return nil
+        }
+
+        return CodexConfiguredProject(id: id, label: label, path: path)
     }
 
     static func decodeProjectDirectoryEntry(_ value: JSONValue) -> CodexProjectDirectoryEntry? {

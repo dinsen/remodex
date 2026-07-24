@@ -192,6 +192,44 @@ test("spawn transport explains Codex API-key environment failures without asking
   assert.match(reportedError.message, /codex login/);
 });
 
+test("spawn transport retries transient sqlite database locks", () => {
+  const children = [];
+  const transport = createCodexTransport({
+    env: { PATH: "/usr/bin:/bin" },
+    platform: "darwin",
+    retryDelayMs: 0,
+    setTimeoutImpl(callback) {
+      callback();
+      return 0;
+    },
+    spawnImpl() {
+      const child = createFakeChild();
+      children.push(child);
+      return child;
+    },
+  });
+
+  let reportedError = null;
+  let receivedMessage = "";
+  transport.onError((error) => {
+    reportedError = error;
+  });
+  transport.onMessage((message) => {
+    receivedMessage = message;
+  });
+
+  children[0].emitStderr("data", Buffer.from(
+    "Error: failed to initialize state runtime: error returned from database: (code: 5) database is locked\n"
+  ));
+  children[0].emit("close", 1, null);
+
+  assert.equal(reportedError, null);
+  assert.equal(children.length, 2);
+
+  children[1].emitStdout("data", Buffer.from("{\"id\":\"ok\"}\n"));
+  assert.equal(receivedMessage, "{\"id\":\"ok\"}");
+});
+
 test("missing environment variable diagnostics are extracted from Codex stderr", () => {
   assert.equal(
     extractMissingEnvironmentVariable("Error: Missing environment variable: `CODEX_API_KEY`."),

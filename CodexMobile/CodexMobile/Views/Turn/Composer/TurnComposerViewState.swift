@@ -6,7 +6,7 @@
 
 import SwiftUI
 
-struct TurnComposerAutocompleteState {
+struct TurnComposerAutocompleteState: Equatable {
     let availableSlashCommands: [TurnComposerSlashCommand]
     let fileAutocompleteItems: [CodexFuzzyFileMatch]
     let isFileAutocompleteVisible: Bool
@@ -31,7 +31,7 @@ struct TurnComposerAutocompleteState {
     let gitDefaultBranch: String
 }
 
-struct TurnComposerAccessoryState {
+struct TurnComposerAccessoryState: Equatable {
     let queuedDrafts: [QueuedTurnDraft]
     let canSteerQueuedDrafts: Bool
     let canRestoreQueuedDrafts: Bool

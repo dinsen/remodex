@@ -7,7 +7,7 @@
 import Foundation
 
 // Mirrors the app-server v2 `ThreadGoalStatus` wire values (camelCase).
-enum CodexThreadGoalStatus: String, Codable, Equatable, Sendable, CaseIterable {
+enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable, CaseIterable {
     case active
     case paused
     case blocked

@@ -73,7 +73,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "New Thread")
     }
 
-    func testExplicitServerRenameDoesNotOverridePersistedLocalRename() {
+    func testExplicitServerRenameClearsPersistedLocalRename() {
         let suiteName = "CodexThreadRenamePersistenceTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Expected isolated UserDefaults suite")
@@ -102,7 +102,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Phone Rename")
+        XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Mac Rename")
 
         let secondReloadedService = CodexService(defaults: defaults)
         secondReloadedService.upsertThread(
@@ -113,10 +113,10 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "Phone Rename")
+        XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "New Thread")
     }
 
-    func testServerTitleOnlyRenameDoesNotOverridePersistedLocalRename() {
+    func testServerTitleOnlyRenameClearsPersistedLocalRename() {
         let suiteName = "CodexThreadRenamePersistenceTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Expected isolated UserDefaults suite")
@@ -144,7 +144,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Phone Rename")
+        XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Mac Title Rename")
 
         let secondReloadedService = CodexService(defaults: defaults)
         secondReloadedService.upsertThread(
@@ -155,7 +155,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "Phone Rename")
+        XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "New Thread")
     }
 
     func testFallbackConversationTitleDoesNotOverridePersistedRename() {

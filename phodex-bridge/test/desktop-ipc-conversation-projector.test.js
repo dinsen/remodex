@@ -428,6 +428,24 @@ test("desktop conversation projector mirrors thread metadata changes", () => {
   assert.deepEqual(output.notifications[1].params.status, { type: "active", activeFlags: [] });
 });
 
+test("desktop conversation projector surfaces active goal status without goal contents", () => {
+  const thread = projectDesktopConversationStateToThread("thread-goal", {
+    title: "Goal thread",
+    threadGoal: {
+      objective: "secret goal text",
+      status: "active",
+    },
+    completedThreadGoal: {
+      objective: "old secret",
+      status: "complete",
+    },
+  });
+
+  assert.equal(thread.threadGoalStatus, "active");
+  assert.equal(thread.threadGoal, undefined);
+  assert.equal(thread.completedThreadGoal, undefined);
+});
+
 test("desktop conversation projector hides injected context from user bubbles", () => {
   const projector = createDesktopConversationProjector();
   const output = projector.project("thread-context", {

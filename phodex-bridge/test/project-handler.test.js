@@ -12,6 +12,7 @@ const path = require("path");
 const {
   handleProjectRequest,
   handleProjectMethod,
+  projectConfiguredProjects,
   projectCreateDirectory,
   projectCreateRootlessChatRoot,
   projectListDirectory,
@@ -25,7 +26,7 @@ function makeTempHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "remodex-project-handler-"));
 }
 
-test("project/quickLocations only returns existing allowed folders", async () => {
+test("project/quickLocations only returns existing allowed non-home folders", async () => {
   const homeDir = makeTempHome();
   fs.mkdirSync(path.join(homeDir, "Developer"));
 
@@ -33,7 +34,7 @@ test("project/quickLocations only returns existing allowed folders", async () =>
 
   assert.deepEqual(
     result.locations.map((location) => location.id),
-    ["home", "developer"]
+    ["developer"]
   );
 });
 
@@ -49,6 +50,125 @@ test("project/projectlessRoots returns host-side Codex chat roots", async () => 
     path.join(codexHome, "threads"),
     path.join(homeDir, "Documents", "Codex"),
   ]);
+});
+
+test("project/configuredProjects returns trusted existing Codex config projects", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const existingProject = path.join(projectsRoot, "helper");
+  const untrustedProject = path.join(projectsRoot, "scratch");
+  const missingProject = path.join(projectsRoot, "missing");
+  fs.mkdirSync(existingProject, { recursive: true });
+  fs.mkdirSync(untrustedProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${existingProject}"]
+trust_level = "trusted"
+
+[projects."${untrustedProject}"]
+trust_level = "untrusted"
+
+[projects."${missingProject}"]
+trust_level = "trusted"
+`);
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.equal(result.configPath, path.join(codexHome, "config.toml"));
+  assert.deepEqual(result.projects, [
+    {
+      id: `project:${fs.realpathSync(existingProject)}`,
+      label: "helper",
+      path: fs.realpathSync(existingProject),
+    },
+  ]);
+});
+
+test("project/configuredProjects follows Codex desktop project order and hides stale config entries", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const alphaProject = path.join(projectsRoot, "alpha");
+  const betaProject = path.join(projectsRoot, "beta");
+  const gammaProject = path.join(projectsRoot, "gamma");
+  const desktopOnlyProject = path.join(projectsRoot, "desktop-only");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(gammaProject, { recursive: true });
+  fs.mkdirSync(desktopOnlyProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${alphaProject}"]
+trust_level = "trusted"
+
+[projects."${betaProject}"]
+trust_level = "trusted"
+
+[projects."${gammaProject}"]
+trust_level = "trusted"
+`);
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "project-order": [
+      gammaProject,
+      desktopOnlyProject,
+      alphaProject,
+    ],
+    "electron-saved-workspace-roots": [
+      alphaProject,
+      betaProject,
+    ],
+  }));
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.deepEqual(
+    result.projects.map((project) => project.path),
+    [
+      fs.realpathSync(gammaProject),
+      fs.realpathSync(desktopOnlyProject),
+      fs.realpathSync(alphaProject),
+    ]
+  );
+});
+
+test("project/configuredProjects falls back to saved workspace roots when project order is missing", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const alphaProject = path.join(projectsRoot, "alpha");
+  const betaProject = path.join(projectsRoot, "beta");
+  const gammaProject = path.join(projectsRoot, "gamma");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(gammaProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), `
+[projects."${alphaProject}"]
+trust_level = "trusted"
+
+[projects."${betaProject}"]
+trust_level = "trusted"
+
+[projects."${gammaProject}"]
+trust_level = "trusted"
+`);
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "electron-saved-workspace-roots": [
+      gammaProject,
+      alphaProject,
+    ],
+  }));
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.deepEqual(
+    result.projects.map((project) => project.path),
+    [
+      fs.realpathSync(gammaProject),
+      fs.realpathSync(alphaProject),
+    ]
+  );
 });
 
 test("project/listDirectory returns sorted child folders and skips files or hidden folders by default", async () => {

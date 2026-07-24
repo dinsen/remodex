@@ -14,6 +14,8 @@ const DEFAULT_DIRECTORY_SEARCH_LIMIT = 80;
 const DEFAULT_DIRECTORY_SEARCH_MAX_DEPTH = 8;
 const DEFAULT_DIRECTORY_SEARCH_MAX_VISITED = 5000;
 const DEFAULT_HIDDEN_DIRECTORY_NAMES = new Set(["Library"]);
+const CONFIG_TOML_FILE = "config.toml";
+const CODEX_GLOBAL_STATE_FILE = ".codex-global-state.json";
 
 // Rootless chat slug rules mirror Codex Desktop's `~/Documents/Codex/<DATE>/<slug>`
 // convention so iOS-created Quick Chats land in the same bucket Desktop classifies
@@ -67,6 +69,8 @@ async function handleProjectMethod(method, params, options = {}) {
   switch (method) {
     case "project/quickLocations":
       return projectQuickLocations(options);
+    case "project/configuredProjects":
+      return projectConfiguredProjects(options);
     case "project/projectlessRoots":
       return projectProjectlessRoots(options);
     case "project/listDirectory":
@@ -89,7 +93,6 @@ async function handleProjectMethod(method, params, options = {}) {
 async function projectQuickLocations(options = {}) {
   const homeDir = resolveHomeDir(options);
   const candidates = [
-    { id: "home", label: "Home", path: homeDir },
     { id: "developer", label: "Developer", path: path.join(homeDir, "Developer") },
     { id: "documents", label: "Documents", path: path.join(homeDir, "Documents") },
     { id: "desktop", label: "Desktop", path: path.join(homeDir, "Desktop") },
@@ -112,6 +115,31 @@ async function projectQuickLocations(options = {}) {
   return { locations };
 }
 
+async function projectConfiguredProjects(options = {}) {
+  const codexHome = path.resolve(readString(options.codexHome) || resolveCodexHome());
+  const configPath = path.resolve(readString(options.configPath) || path.join(codexHome, CONFIG_TOML_FILE));
+  let configBody = "";
+
+  try {
+    configBody = await fs.promises.readFile(configPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw projectError("read_failed", error?.message || "Unable to read the Codex config.");
+    }
+  }
+
+  const configuredPaths = parseTrustedProjectPathsFromConfig(configBody);
+  const desktopProjectRootOrder = await readDesktopProjectRootOrder(codexHome, options);
+  const projectPaths = desktopProjectRootOrder.length > 0
+    ? desktopProjectRootOrder
+    : configuredPaths;
+  const projects = await configuredProjectEntries(projectPaths, options);
+  return {
+    configPath,
+    projects,
+  };
+}
+
 async function projectProjectlessRoots(options = {}) {
   const homeDir = resolveHomeDir(options);
   const codexHome = path.resolve(readString(options.codexHome) || resolveCodexHome());
@@ -128,6 +156,139 @@ async function projectProjectlessRoots(options = {}) {
     documentedThreadsRoot,
     desktopDocumentsRoot,
   };
+}
+
+async function configuredProjectEntries(configuredPaths, options = {}) {
+  const seen = new Set();
+  const projects = [];
+
+  for (const configuredPath of configuredPaths) {
+    let normalizedPath;
+    try {
+      normalizedPath = normalizeCandidatePath(configuredPath, options);
+    } catch {
+      continue;
+    }
+
+    let realPath;
+    let stats;
+    try {
+      realPath = await fs.promises.realpath(normalizedPath);
+      stats = await fs.promises.stat(realPath);
+    } catch {
+      continue;
+    }
+
+    if (!stats.isDirectory() || seen.has(realPath)) {
+      continue;
+    }
+
+    seen.add(realPath);
+    projects.push({
+      id: `project:${realPath}`,
+      label: path.basename(realPath) || realPath,
+      path: realPath,
+    });
+  }
+
+  return projects;
+}
+
+async function readDesktopProjectRootOrder(codexHome, options = {}) {
+  const globalStatePath = path.resolve(
+    readString(options.globalStatePath) || path.join(codexHome, CODEX_GLOBAL_STATE_FILE)
+  );
+  let parsed;
+  try {
+    parsed = JSON.parse(await fs.promises.readFile(globalStatePath, "utf8"));
+  } catch {
+    return [];
+  }
+
+  const roots = Array.isArray(parsed?.["project-order"]) && parsed["project-order"].length > 0
+    ? parsed["project-order"]
+    : Array.isArray(parsed?.["electron-saved-workspace-roots"])
+      ? parsed["electron-saved-workspace-roots"]
+      : [];
+  return roots
+    .map((rootPath) => canonicalProjectOrderPath(rootPath))
+    .filter(Boolean);
+}
+
+function canonicalProjectOrderPath(projectPath) {
+  const normalizedPath = readString(projectPath);
+  if (!normalizedPath) {
+    return "";
+  }
+
+  const resolvedPath = path.resolve(normalizedPath);
+  return realpathSyncIfAvailable(resolvedPath) || resolvedPath;
+}
+
+function parseTrustedProjectPathsFromConfig(configBody) {
+  if (typeof configBody !== "string" || !configBody.trim()) {
+    return [];
+  }
+
+  const paths = [];
+  let currentProjectPath = null;
+  let currentProjectIsTrusted = false;
+
+  function flushCurrentProject() {
+    if (currentProjectPath && currentProjectIsTrusted) {
+      paths.push(currentProjectPath);
+    }
+    currentProjectPath = null;
+    currentProjectIsTrusted = false;
+  }
+
+  for (const line of configBody.split(/\r?\n/u)) {
+    const tableMatch = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/u);
+    if (tableMatch) {
+      flushCurrentProject();
+      currentProjectPath = parseProjectTablePath(tableMatch[1]);
+      continue;
+    }
+
+    if (currentProjectPath && /^\s*trust_level\s*=\s*["']trusted["']\s*(?:#.*)?$/u.test(line)) {
+      currentProjectIsTrusted = true;
+    }
+  }
+
+  flushCurrentProject();
+  return paths;
+}
+
+function parseProjectTablePath(tableName) {
+  const match = tableName.match(/^projects\.(?:"((?:\\.|[^"\\])*)"|'([^']*)')$/u);
+  if (!match) {
+    return null;
+  }
+
+  if (match[1] != null) {
+    return decodeTomlBasicString(match[1]);
+  }
+
+  return match[2] || null;
+}
+
+function decodeTomlBasicString(value) {
+  return value.replace(/\\(["\\bfnrt])/gu, (_, escapeCode) => {
+    switch (escapeCode) {
+      case "b":
+        return "\b";
+      case "f":
+        return "\f";
+      case "n":
+        return "\n";
+      case "r":
+        return "\r";
+      case "t":
+        return "\t";
+      default:
+        return escapeCode;
+    }
+  });
 }
 
 async function projectListDirectory(params, options = {}) {
@@ -643,6 +804,7 @@ module.exports = {
   handleProjectRequest,
   handleProjectMethod,
   projectQuickLocations,
+  projectConfiguredProjects,
   projectProjectlessRoots,
   projectListDirectory,
   projectSearchDirectories,

@@ -14,6 +14,15 @@ final class CodexAccessModeTests: XCTestCase {
         XCTAssertEqual(CodexAccessMode.fullAccess.sandboxLegacyValue, "danger-full-access")
     }
 
+    func testDisplayNamesAndPickerTitlesMatchAccessModeIntent() {
+        XCTAssertEqual(CodexAccessMode.onRequest.displayName, "Ask")
+        XCTAssertEqual(CodexAccessMode.autoReview.displayName, "Approve for me")
+        XCTAssertEqual(CodexAccessMode.fullAccess.displayName, "Full access")
+        XCTAssertEqual(CodexAccessMode.onRequest.pickerTitle, "Ask for approval")
+        XCTAssertEqual(CodexAccessMode.autoReview.pickerTitle, "Approve for me")
+        XCTAssertEqual(CodexAccessMode.fullAccess.pickerTitle, "Full access")
+    }
+
     func testAutoReviewKeepsOnRequestApprovalPolicy() {
         XCTAssertEqual(CodexAccessMode.autoReview.approvalPolicyCandidates, ["on-request", "onRequest"])
     }

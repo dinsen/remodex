@@ -55,7 +55,7 @@ struct TurnComposerAttachmentIntakePlan {
     }
 }
 
-struct QueuedTurnDraft: Identifiable {
+struct QueuedTurnDraft: Identifiable, Equatable {
     let id: String
     let text: String
     let attachments: [CodexImageAttachment]
@@ -374,6 +374,7 @@ final class TurnViewModel {
     @ObservationIgnored var fileAutocompleteDebounceTask: Task<Void, Never>?
     @ObservationIgnored var skillAutocompleteDebounceTask: Task<Void, Never>?
     @ObservationIgnored var pluginAutocompleteDebounceTask: Task<Void, Never>?
+    @ObservationIgnored private var localDraftSaveDebounceTask: Task<Void, Never>?
     @ObservationIgnored private var localDraftPersistenceDebounceTask: Task<Void, Never>?
     @ObservationIgnored var gitStatusRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
@@ -396,6 +397,7 @@ final class TurnViewModel {
     private let fileAutocompleteDebounceNanoseconds: UInt64 = 180_000_000
     private let skillAutocompleteDebounceNanoseconds: UInt64 = 180_000_000
     private let pluginAutocompleteDebounceNanoseconds: UInt64 = 180_000_000
+    private let localDraftSaveDebounceNanoseconds: UInt64 = 250_000_000
     private let localDraftPersistenceDebounceNanoseconds: UInt64 = 650_000_000
     let gitStatusRefreshDebounceNanoseconds: UInt64 = 350_000_000
 
@@ -427,6 +429,8 @@ final class TurnViewModel {
         skillAutocompleteDebounceTask = nil
         pluginAutocompleteDebounceTask?.cancel()
         pluginAutocompleteDebounceTask = nil
+        localDraftSaveDebounceTask?.cancel()
+        localDraftSaveDebounceTask = nil
         localDraftPersistenceDebounceTask?.cancel()
         localDraftPersistenceDebounceTask = nil
         gitStatusRefreshTask?.cancel()
@@ -640,6 +644,39 @@ final class TurnViewModel {
         persistToDisk: Bool = false,
         advancesAttachmentMergeRevision: Bool = true
     ) {
+        localDraftSaveDebounceTask?.cancel()
+        localDraftSaveDebounceTask = nil
+        commitLocalDraft(
+            codex: codex,
+            threadID: threadID,
+            persistToDisk: persistToDisk,
+            advancesAttachmentMergeRevision: advancesAttachmentMergeRevision
+        )
+    }
+
+    func scheduleTypingLocalDraftSave(codex: CodexService, threadID: String) {
+        localDraftSaveDebounceTask?.cancel()
+        localDraftSaveDebounceTask = Task { @MainActor [weak self, weak codex] in
+            guard let self, let codex else { return }
+
+            do {
+                try await Task.sleep(nanoseconds: self.localDraftSaveDebounceNanoseconds)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            self.commitLocalDraft(codex: codex, threadID: threadID)
+            self.localDraftSaveDebounceTask = nil
+        }
+    }
+
+    private func commitLocalDraft(
+        codex: CodexService,
+        threadID: String,
+        persistToDisk: Bool = false,
+        advancesAttachmentMergeRevision: Bool = true
+    ) {
         let draft = localDraftSnapshot()
         if isSending, draft.isEmpty {
             if persistToDisk {
@@ -673,6 +710,8 @@ final class TurnViewModel {
     }
 
     func clearLocalDraft(codex: CodexService, threadID: String, persistToDisk: Bool = false) {
+        localDraftSaveDebounceTask?.cancel()
+        localDraftSaveDebounceTask = nil
         codex.setComposerDraft(nil, for: threadID)
         if persistToDisk {
             flushLocalDraftPersistence(codex: codex)
@@ -1668,8 +1707,7 @@ final class TurnViewModel {
         threadID: String
     ) {
         guard let pendingSend = buildValidatedPendingSend(
-            codex: codex,
-            subscriptions: subscriptions
+            codex: codex
         ) else {
             return
         }
@@ -1727,8 +1765,7 @@ final class TurnViewModel {
         onSendFailed: (@MainActor @Sendable () -> Void)? = nil
     ) -> Bool {
         guard let pendingSend = buildValidatedPendingSend(
-            codex: codex,
-            subscriptions: subscriptions
+            codex: codex
         ) else {
             return false
         }
@@ -1798,10 +1835,9 @@ final class TurnViewModel {
     }
 
     // Shared validation + payload assembly used by `sendTurn` and `sendNewThread`
-    // so the empty/connected/blocking/review/subscription guards stay in one place.
+    // so the empty/connected/blocking/review guards stay in one place.
     private func buildValidatedPendingSend(
-        codex: CodexService,
-        subscriptions: SubscriptionService?
+        codex: CodexService
     ) -> PendingTurnSend? {
         let payload = buildPayloadWithMentions()
         let attachments = readyComposerAttachments
@@ -1822,11 +1858,6 @@ final class TurnViewModel {
 
         if reviewSelection != nil, hasComposerContentConflictingWithReview {
             codex.lastErrorMessage = "Clear text, files, skills, and images before starting a code review."
-            return nil
-        }
-
-        if let subscriptions, !subscriptions.hasAppAccess {
-            codex.lastErrorMessage = "Your 5 free messages are over. Unlock Remodex Pro to keep chatting."
             return nil
         }
 

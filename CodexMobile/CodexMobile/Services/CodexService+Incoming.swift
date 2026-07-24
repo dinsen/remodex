@@ -33,6 +33,7 @@ nonisolated enum WireMessagePreDecoder {
     private static let secureKindValues = [
         "\"serverHello\"", "\"secureReady\"", "\"secureError\"", "\"encryptedEnvelope\""
     ]
+    private static let secureKindProbeCharacterLimit = 512
 
     static func decodeRPCMessage(from text: String) -> Result {
         guard let data = text.data(using: .utf8) else { return .invalidUTF8 }
@@ -45,9 +46,10 @@ nonisolated enum WireMessagePreDecoder {
     }
 
     static func classify(_ text: String) -> Classification {
-        if text.contains("\"kind\":") {
+        let secureKindProbe = text.prefix(secureKindProbeCharacterLimit)
+        if secureKindProbe.contains("\"kind\":") {
             for value in secureKindValues {
-                if text.contains(value) {
+                if secureKindProbe.contains(value) {
                     return Classification(isSecure: true, rpcResult: nil)
                 }
             }
@@ -658,11 +660,11 @@ extension CodexService {
         let threadName = firstStringValue(in: paramsObject, keys: renameKeys)
             ?? firstStringValue(in: eventObject, keys: renameKeys)
         let normalizedThreadName = normalizedIdentifier(threadName)
-        let hasLocalRename = persistedThreadRename(for: threadId) != nil
 
         if let normalizedThreadName, !normalizedThreadName.isEmpty {
-            guard !hasLocalRename else {
-                return
+            if let persistedName = persistedThreadRename(for: threadId),
+               persistedName != normalizedThreadName {
+                persistThreadRename(nil, for: threadId)
             }
             if let existingIndex = threadIndex(for: threadId) {
                 threads[existingIndex].title = normalizedThreadName
@@ -683,11 +685,11 @@ extension CodexService {
 
         // If server explicitly sends an empty/null name, clear local custom title.
         guard hasExplicitRenameField,
-              !hasLocalRename,
               let existingIndex = threadIndex(for: threadId) else {
             return
         }
 
+        persistThreadRename(nil, for: threadId)
         threads[existingIndex].title = nil
         threads[existingIndex].name = nil
         threads = sortThreads(threads)

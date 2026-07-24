@@ -607,6 +607,15 @@ struct CommandExecutionCardBody: View {
         return info
     }
 
+    private var displayText: Text {
+        var text = AttributedString(display.verb)
+        text.foregroundColor = .secondary
+        var target = AttributedString(" " + display.target)
+        target.foregroundColor = Color.secondary.opacity(0.65)
+        text.append(target)
+        return Text(text)
+    }
+
     // Cached like `display` so the leading-icon classification isn't re-parsed on
     // every body evaluation while the command streams.
     private static let iconCache = BoundedCache<String, String>(maxEntries: 128)
@@ -627,15 +636,8 @@ struct CommandExecutionCardBody: View {
             )
             .foregroundStyle(.secondary)
 
-            (
-                Text(display.verb)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.secondary)
-                +
-                Text(" " + display.target)
-                    .font(AppFont.body(weight: .regular))
-                    .foregroundStyle(.secondary)
-            )
+            displayText
+                .font(AppFont.body(weight: .regular))
             .lineLimit(1)
             .truncationMode(.tail)
             .layoutPriority(1)

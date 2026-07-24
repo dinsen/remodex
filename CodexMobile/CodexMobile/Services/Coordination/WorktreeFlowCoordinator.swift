@@ -20,8 +20,8 @@ enum WorktreeFlowHandoffOutcome: Sendable {
 
 enum WorktreeFlowCoordinator {
     // Input: optional Local checkout path chosen by the user.
-    // Output: a brand-new chat in Local or project-less Quick Chat mode.
-    // Side effects: issues only `thread/start`.
+    // Output: a brand-new chat in Local or rootless Quick Chat mode.
+    // Side effects: mints a rootless chat folder when no project is chosen, then issues `thread/start`.
     // Rollback: none.
     // Errors: runtime readiness and `thread/start` failures.
     static func startNewLocalChat(

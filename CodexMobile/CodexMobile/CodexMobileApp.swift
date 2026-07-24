@@ -1,9 +1,8 @@
 // FILE: CodexMobileApp.swift
-// Purpose: App entry point, RevenueCat setup, and root dependency wiring.
+// Purpose: App entry point and root dependency wiring.
 // Layer: App
 // Exports: CodexMobileApp
 
-import RevenueCat
 import SwiftUI
 
 @MainActor
@@ -17,7 +16,6 @@ struct CodexMobileApp: App {
     @State private var subscriptionService: SubscriptionService
 
     init() {
-        Self.configureRevenueCatIfAvailable()
         let service = CodexService()
         service.configureNotifications()
         _codexService = State(initialValue: service)
@@ -106,17 +104,5 @@ struct CodexMobileApp: App {
     private static func isThreadRouteComponent(_ value: String) -> Bool {
         value.caseInsensitiveCompare("thread") == .orderedSame
             || value.caseInsensitiveCompare("threads") == .orderedSame
-    }
-
-    // Configures RevenueCat once at launch using the client-safe public SDK key.
-    private static func configureRevenueCatIfAvailable() {
-        guard let apiKey = AppEnvironment.revenueCatPublicAPIKey else {
-            assertionFailure("Missing RevenueCat public API key in Info.plist")
-            return
-        }
-
-        Purchases.logLevel = AppEnvironment.verboseDiagnosticsEnabled ? .debug : .warn
-
-        Purchases.configure(withAPIKey: apiKey)
     }
 }

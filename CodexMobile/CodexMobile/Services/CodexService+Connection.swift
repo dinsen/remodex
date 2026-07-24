@@ -117,14 +117,14 @@ extension CodexService {
             }
 
             startWebSocketKeepAliveLoop()
+            if performInitialSync {
+                schedulePostConnectSyncPass()
+            }
             startSyncLoop()
             // Push registration is best-effort and talks to the bridge, so it must not
             // hold the main connect path hostage when the managed backend is slow.
             Task { @MainActor [weak self] in
                 await self?.syncManagedPushRegistrationIfNeeded(force: true)
-            }
-            if performInitialSync {
-                schedulePostConnectSyncPass()
             }
             Task { @MainActor [weak self] in
                 await self?.refreshBridgeManagedState(
@@ -243,7 +243,7 @@ extension CodexService {
         SecureStore.deleteValue(for: CodexSecureKeys.relayMacDeviceId)
         SecureStore.deleteValue(for: CodexSecureKeys.relayMacIdentityPublicKey)
         SecureStore.deleteValue(for: CodexSecureKeys.relayProtocolVersion)
-        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.deleteRelayLastAppliedBridgeOutboundSeq()
         SecureStore.deleteValue(for: CodexSecureKeys.relayBridgeReplayEpoch)
         relaySessionId = nil
         relayUrl = nil
@@ -274,7 +274,7 @@ extension CodexService {
         }
 
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
-        SecureStore.deleteValue(for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.deleteRelayLastAppliedBridgeOutboundSeq()
         SecureStore.deleteValue(for: CodexSecureKeys.relayBridgeReplayEpoch)
         relaySessionId = nil
         lastAppliedBridgeOutboundSeq = 0
@@ -549,10 +549,10 @@ extension CodexService {
     // Paint chats first; runtime metadata is useful composer chrome but must
     // never block thread sync on bridges where model/list is slow.
     func performPostConnectSyncPass(preferredThreadId: String? = nil) async {
-        await syncThreadsList()
+        await syncThreadsList(limit: initialVisibleThreadListLimit)
         flushPendingReplayDiscontinuityHistoryRefresh()
+        scheduleCompleteThreadListHydration()
         if await routePendingNotificationOpenIfPossible(refreshIfNeeded: false) {
-            scheduleCompleteThreadListHydration()
             scheduleRuntimeOptionRefresh()
             scheduleThreadGoalHydration()
             return
@@ -585,7 +585,6 @@ extension CodexService {
                 )
             }
         }
-        scheduleCompleteThreadListHydration()
         scheduleRuntimeOptionRefresh()
         scheduleThreadGoalHydration()
     }
@@ -599,9 +598,17 @@ extension CodexService {
     }
 
     // Refreshes capped sidebar metadata without keeping initial reconnect in the loading state.
-    private func scheduleCompleteThreadListHydration() {
-        Task { @MainActor [weak self] in
-            guard let self, self.isConnected, self.isInitialized, !self.isLoadingThreads else {
+    func scheduleCompleteThreadListHydration() {
+        guard completeThreadListHydrationTask == nil else {
+            return
+        }
+
+        completeThreadListHydrationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.completeThreadListHydrationTask = nil
+            }
+            guard self.isConnected, self.isInitialized, !self.isLoadingThreads else {
                 return
             }
 
@@ -612,8 +619,12 @@ extension CodexService {
     // Keep model/reasoning metadata off the critical reconnect path. Some bridge
     // runtimes can answer chats while model/list is still slow or unavailable.
     private func scheduleRuntimeOptionRefresh() {
+        requestRuntimeOptionRefresh(delayNanoseconds: 1_000_000_000)
+    }
+
+    func requestRuntimeOptionRefresh(delayNanoseconds: UInt64 = 0) {
         pendingRuntimeOptionRefresh = true
-        flushPendingRuntimeOptionRefreshIfPossible(delayNanoseconds: 1_000_000_000)
+        flushPendingRuntimeOptionRefreshIfPossible(delayNanoseconds: delayNanoseconds)
     }
 
     // Runs a queued runtime metadata refresh once thread hydration is no longer busy.
@@ -651,6 +662,7 @@ extension CodexService {
                 self.pendingRuntimeOptionRefresh = true
                 return
             }
+            try? await self.syncRuntimeDefaultsFromBridge()
             try? await self.listModels()
             if self.runtimeOptionRefreshToken == refreshToken {
                 self.pendingRuntimeOptionRefresh = false
@@ -766,6 +778,10 @@ extension CodexService {
         postConnectSyncToken = nil
         threadListFetchTaskByLimit.values.forEach { $0.task.cancel() }
         threadListFetchTaskByLimit.removeAll()
+        threadListFullHydrationTask?.task.cancel()
+        threadListFullHydrationTask = nil
+        completeThreadListHydrationTask?.cancel()
+        completeThreadListHydrationTask = nil
         cancelAllPerThreadRefreshWork()
     }
 

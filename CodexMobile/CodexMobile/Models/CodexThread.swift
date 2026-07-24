@@ -83,6 +83,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var agentRole: String?
     var model: String?
     var modelProvider: String?
+    var goalStatus: CodexThreadGoalStatus?
     var reasoningEffort: String?
     var serviceTier: String?
     var runtimeSettingsRevision: Int?
@@ -108,6 +109,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         agentRole: String? = nil,
         model: String? = nil,
         modelProvider: String? = nil,
+        goalStatus: CodexThreadGoalStatus? = nil,
         reasoningEffort: String? = nil,
         serviceTier: String? = nil,
         runtimeSettingsRevision: Int? = nil,
@@ -130,6 +132,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.agentRole = Self.normalizeIdentifier(agentRole)
         self.model = Self.normalizeIdentifier(model)
         self.modelProvider = Self.normalizeIdentifier(modelProvider)
+        self.goalStatus = goalStatus
         self.reasoningEffort = Self.normalizeIdentifier(reasoningEffort)
         self.serviceTier = Self.normalizeIdentifier(serviceTier)
         self.runtimeSettingsRevision = runtimeSettingsRevision
@@ -168,6 +171,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case model
         case modelProvider
         case modelProviderSnake = "model_provider"
+        case goalStatus
+        case goalStatusSnake = "goal_status"
+        case threadGoalStatus
+        case threadGoalStatusSnake = "thread_goal_status"
         case reasoningEffort
         case reasoningEffortSnake = "reasoning_effort"
         case serviceTier
@@ -237,6 +244,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
             keys: [.modelProvider, .modelProviderSnake],
             metadataKeys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"]
         )
+        goalStatus = Self.decodeGoalStatus(from: container, metadata: metadata)
         reasoningEffort = Self.decodeIdentifierIfPresent(
             from: container,
             keys: [.reasoningEffort, .reasoningEffortSnake]
@@ -277,6 +285,7 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(Self.normalizeIdentifier(agentRole), forKey: .agentRole)
         try container.encodeIfPresent(Self.normalizeIdentifier(model), forKey: .model)
         try container.encodeIfPresent(Self.normalizeIdentifier(modelProvider), forKey: .modelProvider)
+        try container.encodeIfPresent(goalStatus, forKey: .threadGoalStatus)
         try container.encodeIfPresent(Self.normalizeIdentifier(reasoningEffort), forKey: .reasoningEffort)
         try container.encodeIfPresent(Self.normalizeIdentifier(serviceTier), forKey: .serviceTier)
         try container.encodeIfPresent(runtimeSettingsRevision, forKey: .runtimeSettingsRevision)
@@ -337,6 +346,10 @@ extension CodexThread {
 
     var isSubagent: Bool {
         parentThreadId != nil
+    }
+
+    var isUsingGoal: Bool {
+        goalStatus == .active
     }
 
     // App-server exposes the rollout session identifier as Thread.id.
@@ -616,6 +629,43 @@ extension CodexThread {
         return nil
     }
 
+    private static func decodeGoalStatus(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        metadata: [String: JSONValue]?
+    ) -> CodexThreadGoalStatus? {
+        for key in [CodingKeys.threadGoalStatus, .threadGoalStatusSnake, .goalStatus, .goalStatusSnake] {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key),
+               let status = normalizeGoalStatus(value) {
+                return status
+            }
+        }
+
+        for metadataKey in ["threadGoalStatus", "thread_goal_status", "goalStatus", "goal_status"] {
+            if let status = normalizeGoalStatus(metadata?[metadataKey]?.stringValue) {
+                return status
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizeGoalStatus(_ value: String?) -> CodexThreadGoalStatus? {
+        guard let value else { return nil }
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+
+        switch normalized {
+        case "active", "using", "inprogress", "running", "started":
+            return .active
+        case "completed", "complete", "done", "finished", "succeeded":
+            return .complete
+        default:
+            return nil
+        }
+    }
+
     private static func sanitizedAgentIdentity(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -738,7 +788,7 @@ extension CodexThread {
     }
 
     private static func codexManagedWorktreeToken(for normalizedProjectPath: String) -> String? {
-        let components = URL(fileURLWithPath: normalizedProjectPath).standardized.pathComponents
+        let components = lexicalPathComponents(for: normalizedProjectPath)
         guard let worktreesIndex = components.firstIndex(of: "worktrees"),
               worktreesIndex > 0,
               components[worktreesIndex - 1] == ".codex" else {
@@ -752,6 +802,13 @@ extension CodexThread {
 
         let token = components[tokenIndex].trimmingCharacters(in: .whitespacesAndNewlines)
         return token.isEmpty ? nil : token
+    }
+
+    private static func lexicalPathComponents(for normalizedProjectPath: String) -> [String] {
+        normalizedProjectPath
+            .replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
     }
 
     private static func codexManagedWorktreeDisplayToken(for normalizedProjectPath: String) -> String? {

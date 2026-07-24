@@ -367,18 +367,19 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
         effortPart: String?,
         leadingImageName: String?
     ) -> some View {
-        HStack(spacing: 6) {
+        let modelForegroundStyle = runtimeState.showsSpeedBadgeInModelMenu ? metaLabelColor : Color.primary
+        return HStack(spacing: 6) {
             if let leadingImageName {
                 RemodexIcon.image(systemName: leadingImageName)
                     .font(leadingIconFont)
-                    .foregroundStyle(Color.primary)
+                    .foregroundStyle(modelForegroundStyle)
             }
 
             HStack(spacing: 4) {
                 Text(modelPart)
                     .font(metaTextFont)
                     .fontWeight(.regular)
-                    .foregroundStyle(Color.primary)
+                    .foregroundStyle(modelForegroundStyle)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                     .layoutPriority(1)
@@ -454,6 +455,7 @@ private struct AllModelsSheet: View {
     @ViewBuilder
     private func modelRow(for model: CodexModelOption) -> some View {
         let title = TurnComposerMetaMapper.modelTitle(for: model)
+        let modelTitleColor = Color(.label)
         HStack(alignment: .top, spacing: 12) {
             RemodexIcon.image(systemName: model.id == selectedModelID ? "checkmark.circle.fill" : "circle")
                 .font(.system(size: 18))
@@ -464,11 +466,11 @@ private struct AllModelsSheet: View {
                 HStack(spacing: 6) {
                     Text(title)
                         .font(AppFont.body(weight: .medium))
-                        .foregroundStyle(Color(.label))
+                        .foregroundStyle(modelTitleColor)
                     if modelSupportsFastMode(model) {
                         RemodexIcon.image(systemName: CodexServiceTier.fast.iconName, size: fastModeIconSide)
                             .frame(width: fastModeIconSide, height: fastModeIconSide)
-                            .foregroundStyle(Color(.secondaryLabel))
+                            .foregroundStyle(modelTitleColor)
                     }
                 }
                 if !model.description.isEmpty {
@@ -486,7 +488,7 @@ private struct AllModelsSheet: View {
 }
 
 // Keeps the mic button state and styling decisions outside the layout code.
-struct TurnComposerVoiceButtonPresentation {
+struct TurnComposerVoiceButtonPresentation: Equatable {
     let systemImageName: String
     let foregroundColor: Color
     let backgroundColor: Color
@@ -494,4 +496,15 @@ struct TurnComposerVoiceButtonPresentation {
     let isDisabled: Bool
     let showsProgress: Bool
     let hasCircleBackground: Bool
+
+    static func == (
+        lhs: TurnComposerVoiceButtonPresentation,
+        rhs: TurnComposerVoiceButtonPresentation
+    ) -> Bool {
+        lhs.systemImageName == rhs.systemImageName
+            && lhs.accessibilityLabel == rhs.accessibilityLabel
+            && lhs.isDisabled == rhs.isDisabled
+            && lhs.showsProgress == rhs.showsProgress
+            && lhs.hasCircleBackground == rhs.hasCircleBackground
+    }
 }

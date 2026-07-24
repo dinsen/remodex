@@ -451,6 +451,8 @@ final class CodexService {
     var failedThreadIDs: Set<String> = []
     // Threads that started a real run and haven't completed yet; survives sync-poll clearing.
     @ObservationIgnored var threadsPendingCompletionHaptic: Set<String> = []
+    @ObservationIgnored var composerFocusedThreadIDs: Set<String> = []
+    @ObservationIgnored var deferredStreamingTimelineRefreshThreadIDs: Set<String> = []
     // Keeps the latest terminal outcome per thread so UI can react to real run completion.
     var latestTurnTerminalStateByThread: [String: CodexTurnTerminalState] = [:]
     // Mirrors the app-server persisted thread goal (`thread/goal/updated|cleared`).
@@ -484,8 +486,10 @@ final class CodexService {
     // Tracks loading attachment IDs that may still merge after their originating view disappears.
     @ObservationIgnored var composerDraftPendingAttachmentIDsByThreadID: [String: Set<String>] = [:]
     var messagesByThread: [String: [CodexMessage]] = [:]
-    // Monotonic per-thread revision so views can react to message mutations without hashing full transcripts.
-    var messageRevisionByThread: [String: Int] = [:]
+    // Monotonic per-thread revision used to build observed ThreadTimelineState snapshots.
+    // Deferred streaming deltas still bump this counter, but should not invalidate the
+    // whole service-observing SwiftUI tree until a render snapshot is published.
+    @ObservationIgnored var messageRevisionByThread: [String: Int] = [:]
     var syncRealtimeEnabled = true
     var availableModels: [CodexModelOption] = []
     var selectedModelId: String?
@@ -696,6 +700,8 @@ final class CodexService {
     @ObservationIgnored var canonicalHistoryReconcileRetryAttemptByThreadID: [String: Int] = [:]
     // Coalesces sidebar/bootstrap thread/list refreshes so launch paths do not duplicate the same fetch.
     @ObservationIgnored var threadListFetchTaskByLimit: [Int: (id: UUID, task: Task<[CodexThread], Error>)] = [:]
+    @ObservationIgnored var threadListFullHydrationTask: (id: UUID, task: Task<[CodexThread], Error>)?
+    @ObservationIgnored var completeThreadListHydrationTask: Task<Void, Never>?
     var isAppInForeground = true
     // Network quality flag: when true, sync and keepalive intervals are stretched to reduce
     // bandwidth usage on constrained connections (Low Data Mode, hotspot tethering).
@@ -1213,6 +1219,8 @@ final class CodexService {
             activeThreadSyncTask?.cancel()
             runningThreadWatchSyncTask?.cancel()
             postConnectSyncTask?.cancel()
+            threadListFullHydrationTask?.task.cancel()
+            completeThreadListHydrationTask?.cancel()
             gptAccountLoginSyncTask?.cancel()
 
             notificationObserverTokens.forEach { NotificationCenter.default.removeObserver($0) }

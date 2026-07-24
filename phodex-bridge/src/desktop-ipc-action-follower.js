@@ -480,6 +480,27 @@ function createDesktopIpcActionFollower({
     return false;
   }
 
+  function startTurn(request) {
+    if (!request || typeof request !== "object" || request.method !== "turn/start") {
+      return Promise.reject(new Error("Expected turn/start request."));
+    }
+
+    const requestId = requestIdKey(request.id);
+    const params = request.params && typeof request.params === "object" && !Array.isArray(request.params)
+      ? request.params
+      : {};
+    const threadId = readThreadId(params);
+    if (!requestId || !threadId) {
+      return Promise.reject(new Error("Missing turn/start request id or thread id."));
+    }
+
+    activeThreadIds.add(threadId);
+    return ipc.sendRequest(
+      "thread-follower-start-turn",
+      buildThreadFollowerStartTurnParams(threadId, requestId, params)
+    );
+  }
+
   function stopAll() {
     for (const threadId of pendingSnapshotsByThreadId.keys()) {
       cancelPendingSnapshot(threadId);
@@ -1663,11 +1684,7 @@ function createDesktopIpcActionFollower({
       return {
         threadId,
         method: "thread-follower-start-turn",
-        params: {
-          conversationId: threadId,
-          senderRequestId: requestId,
-          turnStartParams: params,
-        },
+        params: buildThreadFollowerStartTurnParams(threadId, requestId, params),
       };
     }
     if (method === "turn/steer") {
@@ -1835,9 +1852,30 @@ function createDesktopIpcActionFollower({
     const turnStartParams = normalized && typeof normalized === "object" && !Array.isArray(normalized)
       ? normalized
       : route.params.turnStartParams;
+    return buildThreadFollowerStartTurnParams(
+      route.threadId,
+      route.params.senderRequestId,
+      turnStartParams
+    );
+  }
+
+  function buildThreadFollowerStartTurnParams(threadId, senderRequestId, turnStartParams) {
+    const normalizedThreadId = readString(threadId);
+    const params = turnStartParams && typeof turnStartParams === "object" && !Array.isArray(turnStartParams)
+      ? turnStartParams
+      : {};
+    const followerParams = { ...params };
+    delete followerParams.effort;
+    delete followerParams.reasoningEffort;
+    delete followerParams.reasoning_effort;
+    delete followerParams.serviceTier;
+    delete followerParams.service_tier;
     return {
-      ...route.params,
-      turnStartParams,
+      ...followerParams,
+      conversationId: normalizedThreadId,
+      threadId: normalizedThreadId,
+      senderRequestId,
+      turnStartParams: params,
     };
   }
 
@@ -1941,6 +1979,7 @@ function createDesktopIpcActionFollower({
 
   return {
     observeInbound,
+    startTurn,
     stopAll,
     // True while this thread has live Desktop-owned IPC state mirrored to the
     // phone; used to keep fallback mirrors (rollout tail) silent.

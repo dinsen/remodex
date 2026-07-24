@@ -50,6 +50,7 @@ struct TurnConversationContainerView: View {
     let onTapOutsideComposer: () -> Void
 
     @State private var isShowingPinnedPlanSheet = false
+    @State private var messageLayoutCache = TimelineMessageLayoutCache()
 
     // Keeps accessory-only chats informative instead of showing a blank viewport.
     private func timelineEmptyState(for messageLayout: TimelineMessageLayout) -> AnyView {
@@ -80,10 +81,12 @@ struct TurnConversationContainerView: View {
 
     // ─── ENTRY POINT ─────────────────────────────────────────────
     var body: some View {
-        // Keep this split synchronous with `messages`: cached layout refreshes can
-        // be starved by rapid assistant streaming and hide a just-sent user row.
-        let messageLayout = Self.buildMessageLayout(
+        // Keep this split synchronous with `messages`, but do not rescan the
+        // unchanged timeline when composer-local state invalidates this view.
+        let messageLayout = messageLayoutCache.layout(
+            threadID: threadID,
             from: messages,
+            timelineChangeToken: timelineChangeToken,
             activeTurnID: activeTurnID,
             planSessionSource: planSessionSource
         )
@@ -178,7 +181,7 @@ struct TurnConversationContainerView: View {
     }
 
     // Separates pinned plan content from renderable timeline rows in one pass.
-    private static func buildMessageLayout(
+    fileprivate static func buildMessageLayout(
         from messages: [CodexMessage],
         activeTurnID: String?,
         planSessionSource: CodexPlanSessionSource?
@@ -258,6 +261,67 @@ private struct TimelineMessageLayout: Equatable {
         pinnedTaskPlanMessage: nil,
         activeStructuredPromptMessage: nil
     )
+}
+
+private final class TimelineMessageLayoutCache {
+    private var key: TimelineMessageLayoutCacheKey?
+    private var value = TimelineMessageLayout.empty
+
+    func layout(
+        threadID: String,
+        from messages: [CodexMessage],
+        timelineChangeToken: Int,
+        activeTurnID: String?,
+        planSessionSource: CodexPlanSessionSource?
+    ) -> TimelineMessageLayout {
+        let nextKey = TimelineMessageLayoutCacheKey(
+            threadID: threadID,
+            timelineChangeToken: timelineChangeToken,
+            activeTurnID: activeTurnID,
+            planSessionSource: planSessionSource,
+            messages: messages
+        )
+        if key == nextKey {
+            return value
+        }
+
+        let nextValue = TurnConversationContainerView.buildMessageLayout(
+            from: messages,
+            activeTurnID: activeTurnID,
+            planSessionSource: planSessionSource
+        )
+        key = nextKey
+        value = nextValue
+        return nextValue
+    }
+}
+
+private struct TimelineMessageLayoutCacheKey: Equatable {
+    let threadID: String
+    let timelineChangeToken: Int
+    let activeTurnID: String?
+    let planSessionSource: CodexPlanSessionSource?
+    let messageCount: Int
+    let lastMessageID: String?
+    let lastMessageByteCount: Int?
+    let lastMessageRevision: Int?
+
+    init(
+        threadID: String,
+        timelineChangeToken: Int,
+        activeTurnID: String?,
+        planSessionSource: CodexPlanSessionSource?,
+        messages: [CodexMessage]
+    ) {
+        self.threadID = threadID
+        self.timelineChangeToken = timelineChangeToken
+        self.activeTurnID = activeTurnID
+        self.planSessionSource = planSessionSource
+        self.messageCount = messages.count
+        self.lastMessageID = messages.last?.id
+        self.lastMessageByteCount = messages.last?.textRenderSignature.byteCount
+        self.lastMessageRevision = messages.last?.textRenderSignature.revision
+    }
 }
 
 private struct AccessoryBackedEmptyState: View {

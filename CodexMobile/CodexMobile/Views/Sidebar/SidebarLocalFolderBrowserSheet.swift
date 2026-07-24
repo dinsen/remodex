@@ -37,6 +37,10 @@ struct SidebarLocalFolderBrowserSheet: View {
         "\(currentPath ?? "")\n\(searchText)"
     }
 
+    private var canUseCurrentFolder: Bool {
+        currentPath != nil && parentPath != nil
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -74,7 +78,7 @@ struct SidebarLocalFolderBrowserSheet: View {
                     .disabled(currentPath == nil || isCreatingFolder)
 
                     Button("Use", action: useCurrentFolder)
-                        .disabled(currentPath == nil)
+                        .disabled(!canUseCurrentFolder)
                 }
             }
         }
@@ -101,7 +105,7 @@ struct SidebarLocalFolderBrowserSheet: View {
     }
 
     private func useCurrentFolder() {
-        guard let currentPath else { return }
+        guard canUseCurrentFolder, let currentPath else { return }
 
         dismiss()
         onSelectFolder(currentPath)
@@ -112,7 +116,7 @@ struct SidebarLocalFolderBrowserSheet: View {
         Task { await loadDirectory(path) }
     }
 
-    // Starts from Developer when present, otherwise falls back to the Mac home folder.
+    // Starts from a non-home quick location so new project chats cannot target the bare home folder.
     private func loadInitialDirectory() async {
         guard quickLocations.isEmpty, currentPath == nil else { return }
 

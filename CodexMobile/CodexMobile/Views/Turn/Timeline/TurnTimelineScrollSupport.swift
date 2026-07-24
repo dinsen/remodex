@@ -11,19 +11,34 @@ import UIKit
 
 struct ScrollBottomState: Equatable {
     let isAtBottom: Bool
+    let viewportHeight: CGFloat
+    let contentHeight: CGFloat
 
     static func from(_ geometry: ScrollGeometry) -> ScrollBottomState {
-        let viewportHeight = geometry.visibleRect.height
+        let viewportHeight = quantizedLength(geometry.visibleRect.height)
+        let contentHeight = quantizedLength(geometry.contentSize.height)
         let isAtBottom: Bool
-        if geometry.contentSize.height <= 0 || viewportHeight <= 0 {
+        if contentHeight <= 0 || viewportHeight <= 0 {
             isAtBottom = true
-        } else if geometry.contentSize.height <= viewportHeight {
+        } else if contentHeight <= viewportHeight {
             isAtBottom = true
         } else {
             isAtBottom = geometry.visibleRect.maxY
-                >= geometry.contentSize.height - TurnScrollStateTracker.bottomThreshold
+                >= contentHeight - TurnScrollStateTracker.bottomThreshold
         }
-        return ScrollBottomState(isAtBottom: isAtBottom)
+        // Whole-point heights: sub-point layout jitter otherwise produces several
+        // distinct values per frame, tripping SwiftUI's multiple-updates-per-frame
+        // runtime issue. Consumers compare with thresholds >= 2pt, so rounding is safe.
+        return ScrollBottomState(
+            isAtBottom: isAtBottom,
+            viewportHeight: viewportHeight,
+            contentHeight: contentHeight
+        )
+    }
+
+    private static func quantizedLength(_ value: CGFloat) -> CGFloat {
+        guard value.isFinite else { return 0 }
+        return value.rounded(.toNearestOrAwayFromZero)
     }
 }
 

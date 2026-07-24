@@ -7,7 +7,9 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  parseSessionIndexThreadNames,
   parseSessionJsonlMetadata,
+  parseSessionJsonlThreadSummary,
   parseSessionJsonlTurns,
   readThreadTurnsListPageFromSessionJsonl,
 } = require("../src/session-jsonl-history");
@@ -38,6 +40,72 @@ test("parseSessionJsonlMetadata reads desktop thread cwd", () => {
     threadId: "thread-jsonl-meta",
     cwd: "/Users/test/Project",
   });
+});
+
+test("parseSessionJsonlThreadSummary reads delegated worktree thread metadata", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-06-25T14:21:38.598Z",
+      type: "session_meta",
+      payload: {
+        id: "thread-jsonl-subagent",
+        cwd: "/Users/test/.codex/worktrees/a457/finn-ios-vertical",
+        source: "vscode",
+        thread_source: "subagent",
+        model_provider: "openai",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-06-25T14:21:45.594Z",
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: [
+          "<codex_delegation>",
+          "<source_thread_id>parent-thread</source_thread_id>",
+          "<input>Task: make the MobilityAdIn wizard available when editing an active ad.</input>",
+          "</codex_delegation>",
+        ].join("\n"),
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-06-26T06:44:09.072Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+      },
+    }),
+  ].join("\n");
+
+  assert.deepEqual(parseSessionJsonlThreadSummary(content), {
+    threadId: "thread-jsonl-subagent",
+    cwd: "/Users/test/.codex/worktrees/a457/finn-ios-vertical",
+    source: "vscode",
+    threadSource: "subagent",
+    modelProvider: "openai",
+    parentThreadId: "parent-thread",
+    preview: "make the MobilityAdIn wizard available when editing an active ad.",
+    createdAt: "2026-06-25T14:21:38.598Z",
+    updatedAt: "2026-06-26T06:44:09.072Z",
+  });
+});
+
+test("parseSessionIndexThreadNames reads Codex desktop thread names", () => {
+  const names = parseSessionIndexThreadNames([
+    JSON.stringify({
+      id: "thread-indexed",
+      thread_name: "Fix Xcode Logging Timeout",
+      updated_at: "2026-06-26T09:18:49.605617Z",
+    }),
+    JSON.stringify({
+      id: "thread-renamed",
+      threadName: "Rename From Desktop",
+    }),
+    "",
+  ].join("\n"));
+
+  assert.equal(names.get("thread-indexed"), "Fix Xcode Logging Timeout");
+  assert.equal(names.get("thread-renamed"), "Rename From Desktop");
 });
 
 test("readThreadTurnsListPageFromSessionJsonl builds a recent turns page from rollout JSONL", () => {

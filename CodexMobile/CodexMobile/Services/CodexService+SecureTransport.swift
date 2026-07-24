@@ -278,7 +278,10 @@ extension CodexService {
         SecureStore.writeString(payload.macDeviceId, for: CodexSecureKeys.relayMacDeviceId)
         SecureStore.writeString(payload.macIdentityPublicKey, for: CodexSecureKeys.relayMacIdentityPublicKey)
         SecureStore.writeString(String(codexSecureProtocolVersion), for: CodexSecureKeys.relayProtocolVersion)
-        SecureStore.writeString("0", for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+        SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+            0,
+            sessionID: payload.sessionId
+        )
         SecureStore.deleteValue(for: CodexSecureKeys.relayBridgeReplayEpoch)
         relaySessionId = payload.sessionId
         relayUrl = payload.relay
@@ -385,7 +388,10 @@ extension CodexService {
         let previousSessionId = normalizedRelaySessionId
         let shouldResetReplayCursor = previousSessionId == nil || previousSessionId != resolved.sessionId
         if shouldResetReplayCursor {
-            SecureStore.writeString("0", for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq)
+            SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+                0,
+                sessionID: resolved.sessionId
+            )
             SecureStore.deleteValue(for: CodexSecureKeys.relayBridgeReplayEpoch)
             lastAppliedBridgeOutboundSeq = 0
             lastAppliedBridgeReplayEpoch = nil
@@ -445,22 +451,36 @@ extension CodexService {
         guard bridgeOutboundSeq > lastAppliedBridgeOutboundSeq else {
             return
         }
-        setBridgeOutboundReplayCursor(to: bridgeOutboundSeq)
+        setBridgeOutboundReplayCursor(to: bridgeOutboundSeq, persistsImmediately: false)
     }
 
     // Sequence space is process-local on the bridge. An explicit reset marker
     // may therefore move a stale phone cursor backwards before seq 1+ resumes.
-    func setBridgeOutboundReplayCursor(to bridgeOutboundSeq: Int) {
+    func setBridgeOutboundReplayCursor(to bridgeOutboundSeq: Int, persistsImmediately: Bool = true) {
         let normalizedSequence = max(0, bridgeOutboundSeq)
         lastAppliedBridgeOutboundSeq = normalizedSequence
         if var session = secureSession {
             session.lastInboundBridgeOutboundSeq = normalizedSequence
             secureSession = session
         }
-        SecureStore.writeString(
-            String(normalizedSequence),
-            for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
-        )
+        guard let sessionID = secureSession?.sessionId ?? normalizedRelaySessionId else {
+            SecureStore.writeString(
+                String(normalizedSequence),
+                for: CodexSecureKeys.relayLastAppliedBridgeOutboundSeq
+            )
+            return
+        }
+        if persistsImmediately {
+            SecureStoreReplayCursorWriter.shared.persistRelayLastAppliedBridgeOutboundSeqImmediately(
+                normalizedSequence,
+                sessionID: sessionID
+            )
+        } else {
+            SecureStoreReplayCursorWriter.shared.scheduleRelayLastAppliedBridgeOutboundSeq(
+                normalizedSequence,
+                sessionID: sessionID
+            )
+        }
     }
 
     func setBridgeReplayEpoch(to replayEpoch: String?) {

@@ -152,6 +152,7 @@ struct TurnComposerHostView: View {
         )
 
         TurnComposerView(
+            threadID: thread.id,
             input: $viewModel.input,
             isInputFocused: isInputFocused,
             accessoryState: accessoryState,
@@ -240,7 +241,7 @@ struct TurnComposerHostView: View {
                         text,
                         activeTurnID: activeTurnID
                     )
-                    viewModel.saveLocalDraft(codex: codex, threadID: thread.id)
+                    viewModel.scheduleTypingLocalDraftSave(codex: codex, threadID: thread.id)
                 }
             ),
             onSelectFileAutocomplete: { item in
@@ -336,5 +337,6 @@ struct TurnComposerHostView: View {
             showsSecondaryBar: showsSecondaryBar,
             allowsCollapsedComposer: allowsCollapsedComposer
         )
+        .equatable()
     }
 }

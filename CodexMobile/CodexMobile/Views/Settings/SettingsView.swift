@@ -4,7 +4,6 @@
 // Exports: SettingsView
 
 import SwiftUI
-import StoreKit
 import UIKit
 
 private struct SettingsComputerNamePresentation: Identifiable, Equatable {
@@ -19,7 +18,6 @@ private enum SettingsSheet: Identifiable, Equatable {
     case computerName(SettingsComputerNamePresentation)
     case commandReference
     case macLoginInfo
-    case paywall
 
     var id: String {
         switch self {
@@ -29,25 +27,27 @@ private enum SettingsSheet: Identifiable, Equatable {
             return "commandReference"
         case .macLoginInfo:
             return "macLoginInfo"
-        case .paywall:
-            return "paywall"
         }
     }
 }
 
-// One active presentation at a time so sheets and offer-code redemption
-// never compete while Settings is already inside a full-screen cover.
-private enum SettingsActivePresentation: Equatable {
-    case none
-    case sheet(SettingsSheet)
-    case offerCodeRedemption
+enum SettingsPresentationRefreshPolicy {
+    static let automaticRefreshDelay: Duration = .milliseconds(350)
+
+    static func waitForInitialPresentationSettle() async -> Bool {
+        do {
+            try await Task.sleep(for: automaticRefreshDelay)
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
 }
 
 struct SettingsView: View {
     @Environment(CodexService.self) private var codex
-    @Environment(SubscriptionService.self) private var subscriptions
     @AppStorage("codex.appFontStyle") private var appFontStyleRawValue = AppFont.defaultStoredStyleRawValue
-    @State private var activePresentation: SettingsActivePresentation = .none
+    @State private var activeSheet: SettingsSheet?
     @State private var isShowingAboutRemodex = false
 
     var body: some View {
@@ -55,18 +55,12 @@ struct SettingsView: View {
             SettingsAppearanceCard(appFontStyle: appFontStyleBinding)
             SettingsAppIconCard()
             SettingsNotificationsCard()
+            SettingsProjectsCard()
             SettingsRuntimeDefaultsCard()
             SettingsBridgeVersionCard {
                 presentSettingsSheet(.commandReference)
             }
-            SettingsSubscriptionCard(
-                onShowPaywall: {
-                    presentSettingsSheet(.paywall)
-                },
-                onRedeemCode: {
-                    presentOfferCodeRedemption()
-                }
-            )
+            SettingsSubscriptionCard()
             SettingsUsageCard()
             SettingsGPTAccountCard {
                 presentSettingsSheet(.macLoginInfo)
@@ -89,48 +83,9 @@ struct SettingsView: View {
         .navigationDestination(isPresented: $isShowingAboutRemodex) {
             AboutRemodexView()
         }
-        .sheet(item: activeSheetBinding) { sheet in
+        .sheet(item: $activeSheet) { sheet in
             settingsSheetContent(for: sheet)
         }
-        .offerCodeRedemption(isPresented: isPresentingOfferCodeRedemption) { result in
-            handleOfferCodeRedemptionCompletion(result)
-        }
-    }
-
-    private var activeSheetBinding: Binding<SettingsSheet?> {
-        Binding(
-            get: {
-                if case .sheet(let sheet) = activePresentation {
-                    return sheet
-                }
-                return nil
-            },
-            set: { newSheet in
-                if let newSheet {
-                    activePresentation = .sheet(newSheet)
-                } else if case .sheet = activePresentation {
-                    activePresentation = .none
-                }
-            }
-        )
-    }
-
-    private var isPresentingOfferCodeRedemption: Binding<Bool> {
-        Binding(
-            get: {
-                if case .offerCodeRedemption = activePresentation {
-                    return true
-                }
-                return false
-            },
-            set: { isPresented in
-                if isPresented {
-                    activePresentation = .offerCodeRedemption
-                } else if case .offerCodeRedemption = activePresentation {
-                    activePresentation = .none
-                }
-            }
-        )
     }
 
     @ViewBuilder
@@ -146,18 +101,6 @@ struct SettingsView: View {
             SettingsCommandReferenceSheet()
         case .macLoginInfo:
             GPTVoiceSetupSheet()
-        case .paywall:
-            RevenueCatPaywallView()
-        }
-    }
-
-    private func handleOfferCodeRedemptionCompletion(_ result: Result<Void, Error>) {
-        Task {
-            if case .failure = result {
-                await subscriptions.refreshCustomerInfoSilently()
-            } else {
-                await subscriptions.syncPurchasesAfterOfferCodeRedemption()
-            }
         }
     }
 
@@ -166,23 +109,7 @@ struct SettingsView: View {
     }
 
     private func presentSettingsSheet(_ sheet: SettingsSheet) {
-        activePresentation = .sheet(sheet)
-    }
-
-    private func presentOfferCodeRedemption() {
-        switch activePresentation {
-        case .none:
-            activePresentation = .offerCodeRedemption
-        case .sheet:
-            activePresentation = .none
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(350))
-                guard activePresentation == .none else { return }
-                activePresentation = .offerCodeRedemption
-            }
-        case .offerCodeRedemption:
-            break
-        }
+        activeSheet = sheet
     }
 
     private var appFontStyleBinding: Binding<AppFont.Style> {
@@ -244,6 +171,9 @@ private struct SettingsUsageCard: View {
             )
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await refreshStatusIfNeeded()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -394,6 +324,33 @@ private struct SettingsAppIconCard: View {
                 }
             }
         }
+    }
+}
+
+private struct SettingsProjectsCard: View {
+    @AppStorage(SidebarProjectSource.storageKey)
+    private var projectSourceRawValue = SidebarProjectSource.defaultSource.rawValue
+
+    var body: some View {
+        SettingsCard(
+            title: "Projects",
+            footer: "Configured projects mirror the paired Mac's Codex project list."
+        ) {
+            Picker("Source", selection: projectSourceBinding) {
+                ForEach(SidebarProjectSource.allCases) { source in
+                    Text(source.title).tag(source)
+                }
+            }
+            .pickerStyle(.menu)
+            .tint(.primary)
+        }
+    }
+
+    private var projectSourceBinding: Binding<SidebarProjectSource> {
+        Binding(
+            get: { SidebarProjectSource(rawValue: projectSourceRawValue) ?? SidebarProjectSource.defaultSource },
+            set: { projectSourceRawValue = $0.rawValue }
+        )
     }
 }
 
@@ -565,6 +522,9 @@ private struct SettingsPetCompanionSection: View {
             guard codex.isConnected, petStore.isEnabled else {
                 return
             }
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await petStore.loadPetsIfNeeded(codex: codex)
             await petStore.loadSelectedPet(codex: codex)
         }
@@ -629,6 +589,9 @@ private struct SettingsNotificationsCard: View {
             }
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await codex.refreshManagedNotificationRegistrationState()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -734,6 +697,9 @@ private struct SettingsBridgeVersionCard: View {
             }
         }
         .task {
+            guard await SettingsPresentationRefreshPolicy.waitForInitialPresentationSettle() else {
+                return
+            }
             await codex.refreshBridgeVersionState()
         }
         .onChange(of: scenePhase) { _, phase in

@@ -5,6 +5,10 @@
 
 import SwiftUI
 
+private enum SidebarThreadListLayout {
+    static let projectThreadLeadingInset: CGFloat = 12
+}
+
 struct SidebarThreadListView: View {
     var isFiltering: Bool = false
     let isConnected: Bool
@@ -16,6 +20,8 @@ struct SidebarThreadListView: View {
     var emptyStateTitle: String = "No conversations"
     var emptyFilterTitle: String = "No matching conversations"
     var projectlessRootPaths: [String] = []
+    let timingLabelProvider: (CodexThread) -> String?
+    var showsTimestampRefreshIndicator: (CodexThread) -> Bool = { _ in false }
     let runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
     let onSelectThread: (CodexThread) -> Void
     let onCreateThreadInProjectGroup: (SidebarThreadGroup) -> Void
@@ -39,13 +45,13 @@ struct SidebarThreadListView: View {
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
 
-            if threads.isEmpty && !isFiltering {
+            if groups.isEmpty && !isFiltering {
                 Text(isConnected ? emptyStateTitle : "Connect to view conversations")
                     .foregroundStyle(.secondary)
                     .font(AppFont.subheadline())
                     .padding(.horizontal, 16)
                     .padding(.top, 20)
-            } else if groups.flatMap(\.threads).isEmpty && isFiltering {
+            } else if groups.isEmpty && isFiltering {
                 Text(emptyFilterTitle)
                     .foregroundStyle(.secondary)
                     .font(AppFont.subheadline())
@@ -182,7 +188,8 @@ struct SidebarThreadListView: View {
                 ForEach(visibleRootThreads) { thread in
                     threadRowTree(
                         thread,
-                        childrenByParentID: hierarchy.childrenByParentID
+                        childrenByParentID: hierarchy.childrenByParentID,
+                        leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
                     )
                 }
 
@@ -205,8 +212,12 @@ struct SidebarThreadListView: View {
             isCreatingThread: isCreatingThread,
             onToggle: { toggleProjectGroupExpansion(group.id) },
             onCreate: { onCreateThreadInProjectGroup(group) },
-            onArchive: onArchiveProjectGroup.map { handler in { handler(group) } },
-            onDelete: onDeleteProjectGroup.map { handler in { handler(group) } }
+            onArchive: group.threads.isEmpty
+                ? nil
+                : onArchiveProjectGroup.map { handler in { handler(group) } },
+            onDelete: group.threads.isEmpty
+                ? nil
+                : onDeleteProjectGroup.map { handler in { handler(group) } }
         )
     }
 
@@ -241,7 +252,8 @@ struct SidebarThreadListView: View {
                         ForEach(hierarchy.rootThreads) { thread in
                             threadRowTree(
                                 thread,
-                                childrenByParentID: hierarchy.childrenByParentID
+                                childrenByParentID: hierarchy.childrenByParentID,
+                                leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
                             )
                         }
                     }
@@ -255,7 +267,8 @@ struct SidebarThreadListView: View {
         _ thread: CodexThread,
         childrenByParentID: [String: [CodexThread]],
         ancestorThreadIDs: Set<String> = [],
-        pinnedRootThreadIDs: Set<String> = []
+        pinnedRootThreadIDs: Set<String> = [],
+        leadingInset: CGFloat = 0
     ) -> AnyView {
         let childThreads = childrenByParentID[thread.id] ?? []
         let isExpanded = expandedSubagentParentIDs.contains(thread.id)
@@ -271,18 +284,20 @@ struct SidebarThreadListView: View {
                     toggleSubagentExpansion(parentThreadID: thread.id)
                 }
             )
+            .padding(.leading, leadingInset)
 
             if isExpanded, !childThreads.isEmpty {
                 VStack(spacing: 2) {
                     ForEach(childThreads) { childThread in
                         if nextAncestorThreadIDs.contains(childThread.id) {
-                            AnyView(threadRow(childThread))
+                            AnyView(threadRow(childThread).padding(.leading, leadingInset))
                         } else {
                             threadRowTree(
                                 childThread,
                                 childrenByParentID: childrenByParentID,
                                 ancestorThreadIDs: nextAncestorThreadIDs,
-                                pinnedRootThreadIDs: pinnedRootThreadIDs
+                                pinnedRootThreadIDs: pinnedRootThreadIDs,
+                                leadingInset: leadingInset
                             )
                         }
                     }
@@ -308,6 +323,8 @@ struct SidebarThreadListView: View {
             thread: thread,
             isSelected: isSelected,
             runBadgeState: runBadgeStateByThreadID[thread.id],
+            timingLabel: timingLabelProvider(thread),
+            showsTimestampRefreshIndicator: showsTimestampRefreshIndicator(thread),
             isPinned: codex.isThreadPinned(thread.id),
             pinnedProjectLabel: isPinnedRow && !SidebarThreadGrouping.isRootlessChatThread(
                 thread,
@@ -588,6 +605,14 @@ private enum SidebarThreadListPreviewFixtures {
         "br-2": .ready,
     ]
 
+    static func timingLabel(for thread: CodexThread) -> String? {
+        guard let updated = thread.updatedAt else { return nil }
+        let seconds = Int(now.timeIntervalSince(updated))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        return "\(minutes / 60)h"
+    }
 }
 
 @MainActor
@@ -601,6 +626,7 @@ private func sidebarThreadBlockPreviewBody() -> some View {
             groups: SidebarThreadListPreviewFixtures.groups,
             selectedThread: SidebarThreadListPreviewFixtures.omnaraThreads[2],
             bottomContentInset: 80,
+            timingLabelProvider: SidebarThreadListPreviewFixtures.timingLabel,
             runBadgeStateByThreadID: SidebarThreadListPreviewFixtures.runBadges,
             onSelectThread: { _ in },
             onCreateThreadInProjectGroup: { _ in },

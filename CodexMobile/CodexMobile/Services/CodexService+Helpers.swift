@@ -43,7 +43,7 @@ extension CodexService {
             return activeThreadId
         }
 
-        let newThread = try await startThread()
+        let newThread = try await startThreadIfReady()
         return newThread.id
     }
 
@@ -61,7 +61,10 @@ extension CodexService {
         if resolvedThread.forkedFromThreadId == nil {
             resolvedThread.forkedFromThreadId = persistedForkOrigin(for: resolvedThread.id)
         }
-        applyPersistedThreadRename(to: &resolvedThread)
+        applyPersistedThreadRename(
+            to: &resolvedThread,
+            respectingAuthoritativeTitle: treatAsServerState && hasAuthoritativeThreadTitle(incomingThread)
+        )
         rememberForkOriginIfNeeded(sourceThreadId: resolvedThread.forkedFromThreadId, forkedThreadId: resolvedThread.id)
         let derivedIdentity = resolvedThread.derivedSubagentIdentity
         upsertSubagentIdentity(
@@ -105,8 +108,9 @@ extension CodexService {
         }
 
         var merged = incoming
+        let shouldPreserveLocalName = !treatAsServerState || !hasAuthoritativeThreadTitle(incoming)
         if merged.title == nil { merged.title = existing.title }
-        if merged.name == nil { merged.name = existing.name }
+        if merged.name == nil, shouldPreserveLocalName { merged.name = existing.name }
         if merged.preview == nil { merged.preview = existing.preview }
         if merged.createdAt == nil { merged.createdAt = existing.createdAt }
         if merged.updatedAt == nil { merged.updatedAt = existing.updatedAt }
@@ -225,9 +229,20 @@ extension CodexService {
         return normalizedPersistedThreadName(renamedThreadNameByThreadID[normalizedThreadId])
     }
 
-    // Reapplies local rename intent after server refreshes so stale list payloads cannot reset titles.
-    func applyPersistedThreadRename(to thread: inout CodexThread) {
+    func hasAuthoritativeThreadTitle(_ thread: CodexThread) -> Bool {
+        [thread.name, thread.title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .contains { !$0.isEmpty && !CodexThread.isGenericPlaceholderTitle($0) }
+    }
+
+    // Reapplies local rename intent after stale/generic server refreshes without hiding real desktop titles.
+    func applyPersistedThreadRename(to thread: inout CodexThread, respectingAuthoritativeTitle: Bool = false) {
         guard let persistedName = persistedThreadRename(for: thread.id) else {
+            return
+        }
+
+        if respectingAuthoritativeTitle {
+            persistThreadRename(nil, for: thread.id)
             return
         }
 

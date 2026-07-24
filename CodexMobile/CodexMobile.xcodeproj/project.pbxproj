@@ -9,7 +9,7 @@
 /* Begin PBXBuildFile section */
 		11A2B3C4D5E6F708192A3B4C /* TurnFileAutocompleteTokenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11A2B3C4D5E6F708192A3B4D /* TurnFileAutocompleteTokenTests.swift */; };
 		1BF7B512D49503A3C3290F00 /* BridgeMenuBarStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A1FC345ADD350213550F36C /* BridgeMenuBarStore.swift */; };
-		1DB06CCC628601FAF334C9B2 /* RemodexWidget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = C31FD4BBF43CBB431839BBF8 /* RemodexWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		1DB06CCC628601FAF334C9B2 /* RemodexWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = C31FD4BBF43CBB431839BBF8 /* RemodexWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		22B3C4D5E6F708192A3B4C5D /* CodexFuzzyFileSearchDecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B3C4D5E6F708192A3B4C5E /* CodexFuzzyFileSearchDecodeTests.swift */; };
 		2A6D4B8C1E3F507192A4B6C8 /* CodexStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A6D4B8C1E3F507192A4B6C9 /* CodexStatusTests.swift */; };
 		309A8DBD0FC5466F217D2793 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9A37794F4B32C1952A3770E0 /* Foundation.framework */; };
@@ -64,7 +64,6 @@
 		B3C4D5E6F708192A3B4C5D6E /* CodexPlanModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3C4D5E6F708192A3B4C5D6F /* CodexPlanModeTests.swift */; };
 		B7A1C2D3E4F5061728394051 /* SidebarThreadGroupingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7A1C2D3E4F5061728394052 /* SidebarThreadGroupingTests.swift */; };
 		BFA160000000000000000001 /* TerminalSelectableTextNormalizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFA160000000000000000002 /* TerminalSelectableTextNormalizerTests.swift */; };
-		C04E214B2F71D34100AA3193 /* RevenueCat in Frameworks */ = {isa = PBXBuildFile; productRef = C04E214A2F71D34100AA3193 /* RevenueCat */; };
 		C04E214D2F71D4DB00AA3193 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C04E214C2F71D4DB00AA3193 /* StoreKit.framework */; };
 		C078C1A22F79000100BEEF01 /* Citadel in Frameworks */ = {isa = PBXBuildFile; productRef = C078C1A12F79000100BEEF01 /* Citadel */; };
 		C0A34C3A2FBA9D04007294E3 /* RemodexTextKit in Frameworks */ = {isa = PBXBuildFile; productRef = C0A34C392FBA9D04007294E3 /* RemodexTextKit */; };
@@ -125,15 +124,15 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		17BE0F06A89467BC99605261 /* Embed App Extensions */ = {
+		17BE0F06A89467BC99605261 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				1DB06CCC628601FAF334C9B2 /* RemodexWidget.appex in Embed App Extensions */,
+				1DB06CCC628601FAF334C9B2 /* RemodexWidget.appex in Embed Foundation Extensions */,
 			);
-			name = "Embed App Extensions";
+			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -212,9 +211,22 @@
 		FDBD5C45B205BFD7C281AD0D /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/SwiftUI.framework; sourceTree = DEVELOPER_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		9D57FD152FEEB50000DC83FD /* Exceptions for "CodexMobile" folder in "CodexMobile" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Terminal/Vendor/GhosttyKit.xcframework,
+			);
+			target = C09A76AD2F4B8D7B003B3F3A /* CodexMobile */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		C09A76B02F4B8D7B003B3F3A /* CodexMobile */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				9D57FD152FEEB50000DC83FD /* Exceptions for "CodexMobile" folder in "CodexMobile" target */,
+			);
 			path = CodexMobile;
 			sourceTree = "<group>";
 		};
@@ -246,7 +258,6 @@
 				A4B0C1D2E3F4051627384A0E /* libz.tbd in Frameworks */,
 				C04E214D2F71D4DB00AA3193 /* StoreKit.framework in Frameworks */,
 				C078C1A22F79000100BEEF01 /* Citadel in Frameworks */,
-				C04E214B2F71D34100AA3193 /* RevenueCat in Frameworks */,
 				D1A000000000000000000200 /* Runestone in Frameworks */,
 				D1A000000000000000000201 /* TreeSitterBashRunestone in Frameworks */,
 				D1A000000000000000000202 /* TreeSitterCRunestone in Frameworks */,
@@ -546,7 +557,7 @@
 				C09A76AA2F4B8D7B003B3F3A /* Sources */,
 				C09A76AB2F4B8D7B003B3F3A /* Frameworks */,
 				C09A76AC2F4B8D7B003B3F3A /* Resources */,
-				17BE0F06A89467BC99605261 /* Embed App Extensions */,
+				17BE0F06A89467BC99605261 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
@@ -558,7 +569,6 @@
 			);
 			name = CodexMobile;
 			packageProductDependencies = (
-				C04E214A2F71D34100AA3193 /* RevenueCat */,
 				C078C1A12F79000100BEEF01 /* Citadel */,
 				C0A34C392FBA9D04007294E3 /* RemodexTextKit */,
 				D1A000000000000000000100 /* Runestone */,
@@ -595,7 +605,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2620;
-				LastUpgradeCheck = 2620;
+				LastUpgradeCheck = 2650;
 				TargetAttributes = {
 					B37F412BAE6D4B4BFF0980D2 = {
 						CreatedOnToolsVersion = 26.2;
@@ -615,7 +625,6 @@
 			mainGroup = C09A76A52F4B8D7B003B3F3A;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				C04E21492F71D34100AA3193 /* XCRemoteSwiftPackageReference "purchases-ios-spm" */,
 				C078C1A02F79000100BEEF01 /* XCRemoteSwiftPackageReference "Citadel" */,
 				C0A34C382FBA9D04007294E3 /* XCRemoteSwiftPackageReference "RemodexTextKit" */,
 				D1A000000000000000000001 /* XCRemoteSwiftPackageReference "Runestone" */,
@@ -791,7 +800,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 130;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = RemodexWidget/Info.plist;
@@ -801,8 +810,8 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.6;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.Remodex.RemodexWidget;
+				MARKETING_VERSION = 2.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodex.RemodexWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
@@ -825,11 +834,11 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "$(PRODUCT_NAME)";
+				INFOPLIST_KEY_CFBundleDisplayName = CodexMobileTests;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.CodexMobileTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodexTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
@@ -843,7 +852,7 @@
 			buildSettings = {
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "$(PRODUCT_NAME)";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
@@ -865,7 +874,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 130;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = RemodexWidget/Info.plist;
@@ -875,8 +884,8 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.6;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.Remodex.RemodexWidget;
+				MARKETING_VERSION = 2.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodex.RemodexWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
@@ -897,7 +906,7 @@
 			buildSettings = {
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "$(PRODUCT_NAME)";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
@@ -917,11 +926,11 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "$(PRODUCT_NAME)";
+				INFOPLIST_KEY_CFBundleDisplayName = CodexMobileTests;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.CodexMobileTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodexTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
@@ -990,6 +999,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -1047,6 +1057,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -1065,7 +1076,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 130;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "BuildSupport/CodexMobile-Info.plist";
@@ -1078,13 +1089,13 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.Remodex;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodex;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -1113,7 +1124,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 130;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "BuildSupport/CodexMobile-Info.plist";
@@ -1126,13 +1137,13 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.Remodex;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodex;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -1158,7 +1169,9 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "BuildSupport/RemodexMenuBar-Info.plist";
@@ -1169,7 +1182,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.RemodexMenuBar;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodexMenuBar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -1192,7 +1205,9 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = HR24WHR326;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = EA5MF9LCWZ;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "BuildSupport/RemodexMenuBar-Info.plist";
@@ -1203,7 +1218,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.emanueledipietro.RemodexMenuBar;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dinsen.remodexMenuBar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -1276,14 +1291,6 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		C04E21492F71D34100AA3193 /* XCRemoteSwiftPackageReference "purchases-ios-spm" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/RevenueCat/purchases-ios-spm.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 5.66.0;
-			};
-		};
 		C078C1A02F79000100BEEF01 /* XCRemoteSwiftPackageReference "Citadel" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/orlandos-nl/Citadel.git";
@@ -1319,11 +1326,6 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		C04E214A2F71D34100AA3193 /* RevenueCat */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = C04E21492F71D34100AA3193 /* XCRemoteSwiftPackageReference "purchases-ios-spm" */;
-			productName = RevenueCat;
-		};
 		C078C1A12F79000100BEEF01 /* Citadel */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = C078C1A02F79000100BEEF01 /* XCRemoteSwiftPackageReference "Citadel" */;

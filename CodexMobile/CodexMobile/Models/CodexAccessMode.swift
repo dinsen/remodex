@@ -18,7 +18,7 @@ enum CodexAccessMode: String, Codable, CaseIterable, Hashable, Sendable {
         case .autoReview:
             return "Approve for me"
         case .fullAccess:
-            return "Full"
+            return "Full access"
         }
     }
 
