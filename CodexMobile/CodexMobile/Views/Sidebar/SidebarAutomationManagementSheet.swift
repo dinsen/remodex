@@ -345,4 +345,3 @@ private enum LoadPhase {
     case loaded(CodexAutomation)
     case failed
 }
-

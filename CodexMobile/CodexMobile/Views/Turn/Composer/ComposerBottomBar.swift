@@ -8,8 +8,6 @@ import SwiftUI
 
 struct ComposerBottomBar: View {
     @Environment(\.colorScheme) private var colorScheme
-    @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
-    @State private var showsAllModelsSheet = false
 
     // Data
     let orderedModelOptions: [CodexModelOption]
@@ -49,15 +47,17 @@ struct ComposerBottomBar: View {
     // MARK: - Constants
 
     private let metaLabelColor = Color(.secondaryLabel)
-    private var metaTextFont: Font { AppFont.subheadline() }
     private let composerCircleDiameter: CGFloat = 32
     private let composerActionIconSize: CGFloat = 14
-    private let inlineAccessControlSize: CGFloat = 32
-    private let inlineAccessControlIconSize: CGFloat = 20
     // Send stays the primary CTA, so give it a slightly larger tap target than
     // the neutral composer chrome.
     // Keep the send circle two points larger than its previous 32pt size.
     private let sendButtonDiameter: CGFloat = 34
+
+    @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
+    @State private var showsAllModelsSheet = false
+
+    private var metaTextFont: Font { AppFont.subheadline() }
 
     private var selectedUserBubbleColor: UserBubbleColor {
         UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default
@@ -98,7 +98,11 @@ struct ComposerBottomBar: View {
                 onTapTakePhoto: onTapTakePhoto
             )
             .padding(.leading, 6)
-            inlineAccessMenuLabel
+            ComposerAccessModeControl(
+                selectedAccessMode: selectedAccessMode,
+                isInteractionLocked: isComposerInteractionLocked,
+                onSelect: onSelectAccessMode
+            )
             Spacer(minLength: 0)
 
             // Ring + runtime pill travel together on the trailing side; the
@@ -192,36 +196,6 @@ struct ComposerBottomBar: View {
     }
 
     // MARK: - Menus
-
-    // Access and usage stay inline with the bottom composer controls for every
-    // thread type so rootless and project-backed chats share the same layout.
-    private var inlineAccessMenuLabel: some View {
-        Menu {
-            ForEach(CodexAccessMode.allCases, id: \.rawValue) { mode in
-                Button {
-                    HapticFeedback.shared.triggerImpactFeedback(style: .light)
-                    onSelectAccessMode(mode)
-                } label: {
-                    if selectedAccessMode == mode {
-                        Label(mode.menuTitle, systemImage: "checkmark")
-                    } else {
-                        Text(mode.menuTitle)
-                    }
-                }
-            }
-        } label: {
-            RemodexIcon.image(
-                systemName: selectedAccessMode == .fullAccess ? "hand.thumbsup" : "hand.raised",
-                size: inlineAccessControlIconSize
-            )
-            .frame(width: inlineAccessControlSize, height: inlineAccessControlSize)
-            .foregroundStyle(selectedAccessMode == .fullAccess ? .orange : metaLabelColor)
-            .contentShape(Circle())
-        }
-        .menuIndicator(.hidden)
-        .tint(metaLabelColor)
-        .disabled(isComposerInteractionLocked)
-    }
 
     private var runtimeMenuControl: some View {
         ComposerRuntimeMenuControl(
