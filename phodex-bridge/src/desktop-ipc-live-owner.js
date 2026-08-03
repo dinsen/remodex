@@ -9,6 +9,7 @@ const net = require("net");
 const {
   CLIENT_STATUS_CHANGED,
   DESKTOP_IPC_METHOD_VERSIONS: METHOD_VERSION_BY_NAME,
+  buildCompleteThreadReadParams,
   cloneJSON,
   conversationSnapshotShowsActiveTurn,
   isPlainJSONObject,
@@ -16,6 +17,7 @@ const {
   readString,
   requestIdKey,
   resolveDefaultIpcSocketPath,
+  resolveIpcSocketPathCandidates,
   safeParseJSON,
   visibleUserPromptFromInputEntries,
 } = require("./desktop-ipc-shared");
@@ -51,6 +53,8 @@ const DEFAULT_LIVE_OWNERSHIP_FRESHNESS_MS = 20_000;
 // can actually see the thread.
 const DEFAULT_SIDEBAR_REFRESH_DELAY_MS = 1_200;
 const THREAD_STREAM_STATE_CHANGED = "thread-stream-state-changed";
+const THREAD_STREAM_FOLLOWING_CHANGED = "thread-stream-following-changed";
+const THREAD_STREAM_FOLLOWING_STATUS_REQUESTED = "thread-stream-following-status-requested";
 // Cached thread/read responses are only a hydration convenience; owned threads
 // are never evicted, so a small cap keeps long browsing sessions bounded.
 const MAX_CACHED_THREADS = 30;
@@ -114,7 +118,9 @@ function createDesktopIpcLiveOwner({
   sendRawCodexMessage,
   normalizeTurnStartParams = (params) => params,
   runtimeSettingsStore = null,
-  socketPath = resolveDefaultIpcSocketPath(),
+  // Resolved per connect: Codex Desktop can start, stop, or move its bus while
+  // the bridge stays up.
+  socketPath = resolveIpcSocketPathCandidates,
   sidebarRefreshDelayMs = DEFAULT_SIDEBAR_REFRESH_DELAY_MS,
   snapshotDebounceMs = DEFAULT_SNAPSHOT_DEBOUNCE_MS,
   maxPatchCount = DEFAULT_MAX_PATCH_COUNT,
@@ -124,6 +130,7 @@ function createDesktopIpcLiveOwner({
   initialHistoryRetryMs = DEFAULT_INITIAL_HISTORY_RETRY_MS,
   initialHistoryMaxAttempts = DEFAULT_INITIAL_HISTORY_MAX_ATTEMPTS,
   liveOwnershipFreshnessMs = DEFAULT_LIVE_OWNERSHIP_FRESHNESS_MS,
+  onFollowerStateChanged = null,
   netModule = net,
   now = () => Date.now(),
   logPrefix = "[remodex]",
@@ -155,8 +162,14 @@ function createDesktopIpcLiveOwner({
   // baseRevision matches their last-seen revision, and load-complete-history
   // waits for the snapshot carrying the returned revision.
   const streamRevisionsByThreadId = new Map();
+  const followerClientIdsByThreadId = new Map();
   const announcedSidebarThreadIds = new Set();
   const sidebarRefreshTimersByThreadId = new Map();
+  // A new rollout can exist as a thread id before Desktop's separate app-server
+  // can return it from thread/list. Keep a bounded materialization replay alive
+  // until the first user item and turn completion prove the rollout was written.
+  const pendingSidebarMaterializationThreadIds = new Set();
+  const replayedSidebarMaterializationThreadIds = new Set();
   const pendingTurnStartParamsByThreadId = new Map();
   const pendingTurnStartEntriesByRequestId = new Map();
   const followerRuntimeOverridesByThreadId = new Map();
@@ -179,6 +192,7 @@ function createDesktopIpcLiveOwner({
     logPrefix,
     onConnected() {
       flushPendingThreadArchiveMetadataBroadcasts();
+      requestFollowerStatusForAllOwnedThreads();
       broadcastAllOwnedSnapshots();
     },
     onBroadcast(envelope) {
@@ -322,6 +336,7 @@ function createDesktopIpcLiveOwner({
       }
       refreshOptimisticFallbackForThread(update.threadId);
       scheduleSnapshot(update.threadId);
+      replaySidebarAnnouncementAfterMaterialization(message, update.threadId);
     }
 
     if (readString(message.method) === "turn/completed") {
@@ -360,11 +375,14 @@ function createDesktopIpcLiveOwner({
     lastBroadcastStatesByThreadId.clear();
     fallbackTurnIdsByThreadId.clear();
     streamRevisionsByThreadId.clear();
+    followerClientIdsByThreadId.clear();
     for (const timer of sidebarRefreshTimersByThreadId.values()) {
       clearTimeout(timer);
     }
     sidebarRefreshTimersByThreadId.clear();
     announcedSidebarThreadIds.clear();
+    pendingSidebarMaterializationThreadIds.clear();
+    replayedSidebarMaterializationThreadIds.clear();
     pendingTurnStartParamsByThreadId.clear();
     pendingTurnStartEntriesByRequestId.clear();
     followerRuntimeOverridesByThreadId.clear();
@@ -616,8 +634,12 @@ function createDesktopIpcLiveOwner({
     if (!normalizedThreadId) {
       return;
     }
+    const isNewOwner = !ownedThreadIds.has(normalizedThreadId);
     ownedThreadIds.add(normalizedThreadId);
     ipc.ensureConnected();
+    if (isNewOwner) {
+      requestFollowerStatus(normalizedThreadId);
+    }
   }
 
   // Notification-only thread/start paths do not echo a request id, so consume the
@@ -662,6 +684,9 @@ function createDesktopIpcLiveOwner({
     lastBroadcastStatesByThreadId.delete(normalizedThreadId);
     fallbackTurnIdsByThreadId.delete(normalizedThreadId);
     streamRevisionsByThreadId.delete(normalizedThreadId);
+    if (followerClientIdsByThreadId.delete(normalizedThreadId)) {
+      onFollowerStateChanged?.(normalizedThreadId, false);
+    }
     // An active-peer takeover can still drop a non-empty queue (hasActiveLocalTurn
     // only shields idle yields); announce the emptied queue instead of letting
     // clients keep rendering drafts the bridge will never run.
@@ -674,6 +699,8 @@ function createDesktopIpcLiveOwner({
     announcedReadStateThreadIds.delete(normalizedThreadId);
     cancelSidebarAnnouncement(normalizedThreadId);
     announcedSidebarThreadIds.delete(normalizedThreadId);
+    pendingSidebarMaterializationThreadIds.delete(normalizedThreadId);
+    replayedSidebarMaterializationThreadIds.delete(normalizedThreadId);
     pendingTurnStartParamsByThreadId.delete(normalizedThreadId);
     followerRuntimeOverridesByThreadId.delete(normalizedThreadId);
     for (const [requestId, pending] of Array.from(pendingTurnStartEntriesByRequestId.entries())) {
@@ -726,9 +753,9 @@ function createDesktopIpcLiveOwner({
   }
 
   // Desktop has no watcher on the shared session store, but its webview reacts
-  // to thread-unarchived broadcasts by re-running thread/list. Announcing each
-  // phone-driven thread once (after the rollout has had time to persist) makes
-  // it appear in Desktop's sidebar without the disruptive deep-link bounce.
+  // to thread-unarchived broadcasts by re-running thread/list. The first timed
+  // announcement keeps the common path responsive; materialization events below
+  // replay it because a new rollout id can precede Desktop's thread/list entry.
   function scheduleSidebarAnnouncement(threadId) {
     const normalizedThreadId = readString(threadId);
     if (!normalizedThreadId
@@ -736,6 +763,7 @@ function createDesktopIpcLiveOwner({
       || sidebarRefreshTimersByThreadId.has(normalizedThreadId)) {
       return;
     }
+    pendingSidebarMaterializationThreadIds.add(normalizedThreadId);
     const timer = setTimeout(() => {
       sidebarRefreshTimersByThreadId.delete(normalizedThreadId);
       if (!ownedThreadIds.has(normalizedThreadId)) {
@@ -746,6 +774,42 @@ function createDesktopIpcLiveOwner({
     }, Math.max(0, sidebarRefreshDelayMs));
     timer.unref?.();
     sidebarRefreshTimersByThreadId.set(normalizedThreadId, timer);
+  }
+
+  function replaySidebarAnnouncementAfterMaterialization(message, threadId) {
+    const normalizedThreadId = readString(threadId);
+    if (!normalizedThreadId
+      || !ownedThreadIds.has(normalizedThreadId)
+      || !pendingSidebarMaterializationThreadIds.has(normalizedThreadId)) {
+      return;
+    }
+
+    const method = readString(message?.method);
+    const itemType = readString(message?.params?.item?.type);
+    const turnItems = Array.isArray(message?.params?.turn?.items)
+      ? message.params.turn.items
+      : [];
+    const includesPersistedUserMessage = (
+      (method === "item/started" || method === "item/completed")
+        && itemType === "userMessage"
+    ) || turnItems.some((item) => readString(item?.type) === "userMessage");
+    const turnCompleted = method === "turn/completed";
+    if (!includesPersistedUserMessage && !turnCompleted) {
+      return;
+    }
+
+    cancelSidebarAnnouncement(normalizedThreadId);
+    announcedSidebarThreadIds.add(normalizedThreadId);
+    if (!replayedSidebarMaterializationThreadIds.has(normalizedThreadId) || turnCompleted) {
+      broadcastThreadUnarchived(normalizedThreadId);
+    }
+
+    if (turnCompleted) {
+      pendingSidebarMaterializationThreadIds.delete(normalizedThreadId);
+      replayedSidebarMaterializationThreadIds.delete(normalizedThreadId);
+      return;
+    }
+    replayedSidebarMaterializationThreadIds.add(normalizedThreadId);
   }
 
   function cancelSidebarAnnouncement(threadId) {
@@ -993,7 +1057,10 @@ function createDesktopIpcLiveOwner({
       return;
     }
     const hydration = Promise.resolve()
-      .then(() => sendCodexRequest("thread/read", { threadId: normalizedThreadId }))
+      .then(() => sendCodexRequest(
+        "thread/read",
+        buildCompleteThreadReadParams(normalizedThreadId)
+      ))
       .then((result) => {
         const thread = readThreadFromPayload(result);
         if (!thread?.id) {
@@ -1097,7 +1164,19 @@ function createDesktopIpcLiveOwner({
 
   function handlePeerBroadcast(envelope) {
     if (envelope?.method === CLIENT_STATUS_CHANGED) {
+      // The fallback router can accept the owner's connection before any
+      // Desktop client exists. Metadata broadcasts remain queued in that state;
+      // retry them whenever peer membership changes so a newly connected
+      // Desktop immediately refreshes its sidebar.
+      flushPendingThreadArchiveMetadataBroadcasts();
       broadcastAllOwnedSnapshots();
+      if (normalizeToken(envelope.params?.status) === "disconnected") {
+        removeFollowerClient(envelope.params?.clientId || envelope.sourceClientId);
+      }
+      return;
+    }
+    if (envelope?.method === THREAD_STREAM_FOLLOWING_CHANGED) {
+      updateFollowerState(envelope);
       return;
     }
     if (maybeYieldOwnedThreadForPeerArchive(envelope)) {
@@ -1129,6 +1208,66 @@ function createDesktopIpcLiveOwner({
     // and all cached conversation state so a later re-claim rehydrates fresh data
     // instead of republishing stale turns and requests.
     removeOwnedThread(threadId);
+  }
+
+  function updateFollowerState(envelope) {
+    const params = envelope?.params || {};
+    const threadId = readString(params.conversationId) || readString(params.conversation_id);
+    const clientId = readString(envelope?.sourceClientId);
+    if (!threadId || !clientId || !ownedThreadIds.has(threadId)) {
+      return;
+    }
+
+    const followers = followerClientIdsByThreadId.get(threadId) || new Set();
+    if (params.following === true) {
+      const wasUnfollowed = followers.size === 0;
+      followers.add(clientId);
+      followerClientIdsByThreadId.set(threadId, followers);
+      if (wasUnfollowed) {
+        onFollowerStateChanged?.(threadId, true);
+      }
+      // Match Codex's owner behavior: a newly mounted follower receives an
+      // immediate full baseline instead of waiting for the next model delta.
+      broadcastConversationState(threadId, { forceSnapshot: true });
+      return;
+    }
+
+    if (!followers.delete(clientId)) {
+      return;
+    }
+    if (followers.size === 0) {
+      followerClientIdsByThreadId.delete(threadId);
+      onFollowerStateChanged?.(threadId, false);
+    }
+  }
+
+  function removeFollowerClient(clientId) {
+    const normalizedClientId = readString(clientId);
+    if (!normalizedClientId) {
+      return;
+    }
+    for (const [threadId, followers] of followerClientIdsByThreadId) {
+      if (!followers.delete(normalizedClientId)) {
+        continue;
+      }
+      if (followers.size === 0) {
+        followerClientIdsByThreadId.delete(threadId);
+        onFollowerStateChanged?.(threadId, false);
+      }
+    }
+  }
+
+  function requestFollowerStatusForAllOwnedThreads() {
+    for (const threadId of ownedThreadIds) {
+      requestFollowerStatus(threadId);
+    }
+  }
+
+  function requestFollowerStatus(threadId) {
+    ipc.sendBroadcast(THREAD_STREAM_FOLLOWING_STATUS_REQUESTED, {
+      hostId,
+      conversationId: threadId,
+    });
   }
 
   function isPeerOwnershipBroadcast(params) {
@@ -1203,7 +1342,10 @@ function createDesktopIpcLiveOwner({
   // history is complete, then force-broadcast a fresh snapshot.
   async function handleFollowerLoadCompleteHistory(conversationId) {
     try {
-      const result = await sendCodexRequest("thread/read", { threadId: conversationId });
+      const result = await sendCodexRequest(
+        "thread/read",
+        buildCompleteThreadReadParams(conversationId)
+      );
       const thread = readThreadFromPayload(result);
       if (thread?.id) {
         rememberCachedThread(thread.id, thread);

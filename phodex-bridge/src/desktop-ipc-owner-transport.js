@@ -11,16 +11,18 @@ const path = require("path");
 const {
   CLIENT_STATUS_CHANGED,
   DESKTOP_IPC_METHOD_VERSIONS: METHOD_VERSION_BY_NAME,
-  FRAME_HEADER_BYTES,
-  MAX_FRAME_BYTES,
+  buildIpcRequestEnvelope,
+  createFrameReader,
   normalizeToken,
   readString,
   requestIdKey,
-  safeParseJSON,
+  toSocketPathCandidatesResolver,
+  toSocketPathResolver,
   writeFrame,
 } = require("./desktop-ipc-shared");
 
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 1_000;
+const SOCKET_PROBE_TIMEOUT_MS = 500;
 
 function createDesktopOwnerIpcClient({
   socketPath,
@@ -35,16 +37,22 @@ function createDesktopOwnerIpcClient({
   canHandleRequest,
   handleRequest,
 }) {
+  const resolveSocketPaths = toSocketPathCandidatesResolver(socketPath);
   let socket = null;
   let isConnecting = false;
   let isInitialized = false;
   let clientId = "";
-  let readBuffer = Buffer.alloc(0);
   let reconnectTimer = null;
   let shouldReconnect = false;
+  let remainingSocketPaths = [];
+  let preferredSocketFailure = null;
+  const frameReader = createFrameReader({
+    onFrame: (envelope) => dispatchEnvelope(envelope),
+    onOverflow: () => closeSocket(),
+  });
   const localRouter = startRouterWhenMissing
     ? createDesktopIpcRouterServer({
-      socketPath,
+      socketPath: () => resolveSocketPaths()[0],
       netModule,
       now,
       requestTimeoutMs,
@@ -60,8 +68,20 @@ function createDesktopOwnerIpcClient({
       return;
     }
     clearReconnectTimer();
+    remainingSocketPaths = resolveSocketPaths();
+    preferredSocketFailure = null;
+    connectNextSocket();
+  }
+
+  function connectNextSocket() {
+    const nextSocketPath = remainingSocketPaths.shift();
+    if (!nextSocketPath) {
+      isConnecting = false;
+      return;
+    }
+
     isConnecting = true;
-    const nextSocket = netModule.createConnection(socketPath);
+    const nextSocket = netModule.createConnection(nextSocketPath);
     socket = nextSocket;
 
     nextSocket.on("connect", () => {
@@ -77,11 +97,19 @@ function createDesktopOwnerIpcClient({
           closeSocket();
         });
     });
-    nextSocket.on("data", handleData);
+    nextSocket.on("data", (chunk) => frameReader.push(chunk));
     nextSocket.on("close", () => handleClose(nextSocket));
     nextSocket.on("error", (error) => {
       if (error?.code === "ENOENT" || error?.code === "ECONNREFUSED") {
-        startLocalRouterAfterMissingSocket(error.code);
+        preferredSocketFailure ||= { code: error.code, socketPath: nextSocketPath };
+        if (remainingSocketPaths.length > 0) {
+          retryNextSocket(nextSocket);
+          return;
+        }
+        startLocalRouterAfterMissingSocket(
+          preferredSocketFailure.code,
+          preferredSocketFailure.socketPath
+        );
         return;
       }
       if (error?.code !== "ENOENT" && error?.code !== "ECONNREFUSED") {
@@ -90,19 +118,36 @@ function createDesktopOwnerIpcClient({
     });
   }
 
-  function startLocalRouterAfterMissingSocket(reasonCode) {
+  function retryNextSocket(failedSocket) {
+    if (socket === failedSocket) {
+      socket = null;
+    }
+    isConnecting = false;
+    frameReader.reset();
+    failedSocket.destroy();
+    connectNextSocket();
+  }
+
+  function startLocalRouterAfterMissingSocket(reasonCode, failedSocketPath) {
     if (!localRouter || localRouter.isStarted) {
       return;
     }
-    localRouter.start({ removeStaleSocket: reasonCode === "ECONNREFUSED" })
-      .then(() => {
-        if (!shouldReconnect) {
-          return;
+    // ECONNREFUSED means the socket file is there with nobody behind it, so the
+    // fallback router replaces it. Codex can bind its own bus in the gap between
+    // that refusal and the replacement, and unlinking a live socket would strand
+    // the desktop on a path no other client reaches: probe once more first, and
+    // let the ordinary reconnect take over when the bus is back.
+    const mayReplaceStaleSocket = reasonCode === "ECONNREFUSED";
+    const removeStaleSocket = mayReplaceStaleSocket
+      ? probeSocketIsListening(failedSocketPath, netModule).then((isListening) => !isListening)
+      : Promise.resolve(false);
+
+    removeStaleSocket
+      .then((shouldRemoveStaleSocket) => {
+        if (mayReplaceStaleSocket && !shouldRemoveStaleSocket) {
+          return null;
         }
-        closeSocket();
-        isConnecting = false;
-        clearReconnectTimer();
-        ensureConnected();
+        return startLocalRouter({ removeStaleSocket: shouldRemoveStaleSocket });
       })
       .catch((error) => {
         if (error?.code !== "EADDRINUSE") {
@@ -111,9 +156,28 @@ function createDesktopOwnerIpcClient({
       });
   }
 
+  function startLocalRouter({ removeStaleSocket }) {
+    return localRouter.start({ removeStaleSocket })
+      .then(() => {
+        if (!shouldReconnect) {
+          return;
+        }
+        closeSocket();
+        isConnecting = false;
+        clearReconnectTimer();
+        ensureConnected();
+      });
+  }
+
   function sendBroadcast(method, params) {
     ensureConnected();
     if (!socket || socket.destroyed || !isInitialized) {
+      return false;
+    }
+    // A write to the bridge-owned fallback router is not a delivery when no
+    // Desktop/VSCode peer is attached. Report that state as pending so callers
+    // can replay metadata and snapshots when the router announces a real peer.
+    if (localRouter && !localRouter.hasBroadcastRecipientFor(clientId)) {
       return false;
     }
     const envelope = {
@@ -132,14 +196,7 @@ function createDesktopOwnerIpcClient({
       return Promise.reject(new Error("Desktop IPC is not connected."));
     }
     const requestId = `remodex-owner-${now().toString(36)}-${randomUUID()}`;
-    const envelope = {
-      type: "request",
-      requestId,
-      sourceClientId: initializing ? "initializing-client" : clientId || "remodex-bridge",
-      version: METHOD_VERSION_BY_NAME.get(method) || 1,
-      method,
-      params: params || {},
-    };
+    const envelope = buildIpcRequestEnvelope({ requestId, method, params, clientId, initializing });
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         pendingResponses.delete(requestId);
@@ -158,27 +215,6 @@ function createDesktopOwnerIpcClient({
         reject(new Error("Desktop IPC write failed."));
       }
     });
-  }
-
-  function handleData(chunk) {
-    readBuffer = Buffer.concat([readBuffer, chunk]);
-    while (readBuffer.length >= FRAME_HEADER_BYTES) {
-      const frameLength = readBuffer.readUInt32LE(0);
-      if (frameLength > MAX_FRAME_BYTES) {
-        closeSocket();
-        return;
-      }
-      if (readBuffer.length < FRAME_HEADER_BYTES + frameLength) {
-        return;
-      }
-
-      const payload = readBuffer.slice(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + frameLength).toString("utf8");
-      readBuffer = readBuffer.slice(FRAME_HEADER_BYTES + frameLength);
-      const envelope = safeParseJSON(payload);
-      if (envelope) {
-        dispatchEnvelope(envelope);
-      }
-    }
   }
 
   function dispatchEnvelope(envelope) {
@@ -252,7 +288,7 @@ function createDesktopOwnerIpcClient({
     isConnecting = false;
     isInitialized = false;
     clientId = "";
-    readBuffer = Buffer.alloc(0);
+    frameReader.reset();
     for (const waiter of pendingResponses.values()) {
       clearTimeout(waiter.timeout);
       waiter.reject(new Error("Desktop IPC connection closed."));
@@ -332,10 +368,14 @@ function createDesktopIpcRouterServer({
   discoveryTimeoutMs,
   logPrefix,
 }) {
+  const resolveSocketPath = toSocketPathResolver(socketPath);
   let server = null;
   let started = false;
   let starting = null;
   let closed = false;
+  // Closing must unlink exactly what this router listened on, not whatever the
+  // resolver would pick later.
+  let listeningSocketPath = "";
   let nextClientSeq = 1;
   const clientsById = new Map();
   const pendingDiscoveryResponses = new Map();
@@ -350,8 +390,9 @@ function createDesktopIpcRouterServer({
     }
     closed = false;
     starting = new Promise((resolve, reject) => {
+      const nextSocketPath = resolveSocketPath();
       try {
-        prepareSocketPathForListen(socketPath, { removeStaleSocket });
+        prepareSocketPathForListen(nextSocketPath, { removeStaleSocket });
       } catch (error) {
         starting = null;
         reject(error);
@@ -365,9 +406,10 @@ function createDesktopIpcRouterServer({
         server = null;
         reject(error);
       });
-      nextServer.listen(socketPath, () => {
+      nextServer.listen(nextSocketPath, () => {
         started = true;
         starting = null;
+        listeningSocketPath = nextSocketPath;
         nextServer.removeAllListeners("error");
         nextServer.on("error", (error) => {
           console.warn(`${logPrefix} desktop IPC router fallback error: ${error.message}`);
@@ -384,33 +426,15 @@ function createDesktopIpcRouterServer({
       id: "",
       type: "",
       socket,
-      buffer: Buffer.alloc(0),
       initialized: false,
     };
-    socket.on("data", (chunk) => handleClientData(client, chunk));
+    const frameReader = createFrameReader({
+      onFrame: (envelope) => dispatchClientEnvelope(client, envelope),
+      onOverflow: () => client.socket.destroy(),
+    });
+    socket.on("data", (chunk) => frameReader.push(chunk));
     socket.on("close", () => removeClient(client));
     socket.on("error", () => removeClient(client));
-  }
-
-  function handleClientData(client, chunk) {
-    client.buffer = Buffer.concat([client.buffer, chunk]);
-    while (client.buffer.length >= FRAME_HEADER_BYTES) {
-      const frameLength = client.buffer.readUInt32LE(0);
-      if (frameLength > MAX_FRAME_BYTES) {
-        client.socket.destroy();
-        return;
-      }
-      if (client.buffer.length < FRAME_HEADER_BYTES + frameLength) {
-        return;
-      }
-
-      const payload = client.buffer.slice(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + frameLength).toString("utf8");
-      client.buffer = client.buffer.slice(FRAME_HEADER_BYTES + frameLength);
-      const envelope = safeParseJSON(payload);
-      if (envelope) {
-        dispatchClientEnvelope(client, envelope);
-      }
-    }
   }
 
   function dispatchClientEnvelope(client, envelope) {
@@ -685,9 +709,10 @@ function createDesktopIpcRouterServer({
       server.close();
       server = null;
     }
-    if (shouldRemoveSocketPath) {
-      removeSocketPathAfterClose(socketPath);
+    if (shouldRemoveSocketPath && listeningSocketPath) {
+      removeSocketPathAfterClose(listeningSocketPath);
     }
+    listeningSocketPath = "";
   }
 
   function writeEnvelopeToClient(client, envelope) {
@@ -703,9 +728,25 @@ function createDesktopIpcRouterServer({
     }
   }
 
+  function hasBroadcastRecipientFor(senderClientId) {
+    const sender = clientsById.get(senderClientId);
+    if (!sender) {
+      // The owner is connected to an external Codex bus rather than this
+      // fallback router; that bus itself is the broadcast recipient.
+      return true;
+    }
+    return Array.from(clientsById.values()).some((client) => (
+      client !== sender
+      && client.initialized
+      && !client.socket.destroyed
+      && normalizeToken(client.type) !== "remodexbridge"
+    ));
+  }
+
   return {
     start,
     close,
+    hasBroadcastRecipientFor,
     get isStarted() {
       return started && !closed;
     },
@@ -716,11 +757,40 @@ function routedResponseKey(clientId, requestId) {
   return `${clientId}:${requestId}`;
 }
 
+// Answers "is anyone actually serving this path right now", which is the only
+// safe basis for replacing a socket file the bridge does not own.
+function probeSocketIsListening(socketPath, netModule) {
+  return new Promise((resolve) => {
+    let probe = null;
+    const finish = (isListening) => {
+      clearTimeout(timeout);
+      if (probe) {
+        probe.removeAllListeners();
+        probe.destroy();
+        probe = null;
+      }
+      resolve(isListening);
+    };
+    const timeout = setTimeout(() => finish(false), SOCKET_PROBE_TIMEOUT_MS);
+    timeout.unref?.();
+
+    try {
+      probe = netModule.createConnection(socketPath);
+    } catch {
+      finish(false);
+      return;
+    }
+    probe.once("connect", () => finish(true));
+    probe.once("error", () => finish(false));
+  });
+}
+
 function prepareSocketPathForListen(socketPath, { removeStaleSocket = false } = {}) {
   if (process.platform === "win32") {
     return;
   }
-  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  // Matches how Codex creates its own IPC directory: local user only.
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   if (removeStaleSocket && fs.existsSync(socketPath)) {
     const socketStat = fs.lstatSync(socketPath);
     if (!socketStat.isSocket()) {

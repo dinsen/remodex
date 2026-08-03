@@ -14,6 +14,10 @@ const {
 const { resolveCodexGeneratedImagesRoot } = require("./codex-home");
 const { buildApplyPatchFileChangeItem } = require("./apply-patch-changes");
 const {
+  expandExecWrapperToolCall,
+  isOrchestrationWaitCall,
+} = require("./codex-tool-wrapper");
+const {
   TERMINAL_TASK_EVENT_TYPES,
   terminalEventClosesTrackedTurn,
 } = require("./rollout-turn-semantics");
@@ -56,6 +60,8 @@ function createRolloutLiveMirrorController({
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  setImmediateFn = setImmediate,
+  clearImmediateFn = clearImmediate,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   lookupTimeoutMs = DEFAULT_LOOKUP_TIMEOUT_MS,
   idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
@@ -110,6 +116,8 @@ function createRolloutLiveMirrorController({
       now,
       setIntervalFn,
       clearIntervalFn,
+      setImmediateFn,
+      clearImmediateFn,
       pollIntervalMs,
       lookupTimeoutMs,
       idleTimeoutMs,
@@ -132,9 +140,17 @@ function createRolloutLiveMirrorController({
     mirrorsByThreadId.clear();
   }
 
+  // The real turn id this mirror is actively tailing, or null. Lets the bridge
+  // answer the phone's turn-state probe from mirror truth when the bounded
+  // canonical page reads a busy run as closed.
+  function getActiveTurnId(threadId) {
+    return mirrorsByThreadId.get(threadId)?.getActiveTurnId() || null;
+  }
+
   return {
     observeInbound,
     stopAll,
+    getActiveTurnId,
   };
 }
 
@@ -149,6 +165,8 @@ function createThreadRolloutLiveMirror({
   now,
   setIntervalFn,
   clearIntervalFn,
+  setImmediateFn,
+  clearImmediateFn,
   pollIntervalMs,
   lookupTimeoutMs,
   idleTimeoutMs,
@@ -158,6 +176,7 @@ function createThreadRolloutLiveMirror({
   onStop = () => {},
 }) {
   const startedAt = now();
+  let lookupStartedAt = startedAt;
   const state = createMirrorState(threadId);
 
   let isStopped = false;
@@ -174,7 +193,10 @@ function createThreadRolloutLiveMirror({
   let wasSuppressed = false;
 
   const intervalId = setIntervalFn(tick, pollIntervalMs);
-  tick();
+  let initialTickId = setImmediateFn(() => {
+    initialTickId = null;
+    tick();
+  });
 
   function tick() {
     if (isStopped) {
@@ -183,9 +205,30 @@ function createThreadRolloutLiveMirror({
 
     try {
       const currentTime = now();
+      const suppressedBeforeScan = isSuppressed();
+      if (suppressedBeforeScan) {
+        if (!wasSuppressed) {
+          rolloutPath = null;
+          lastSize = 0;
+          partialLine = "";
+          didBootstrap = false;
+          resetRunState(state);
+        }
+        wasSuppressed = true;
+        return;
+      }
+      if (wasSuppressed) {
+        rolloutPath = null;
+        lastSize = 0;
+        partialLine = "";
+        didBootstrap = false;
+        resetRunState(state);
+        lookupStartedAt = currentTime;
+        wasSuppressed = false;
+      }
 
       if (!rolloutPath) {
-        if (currentTime - startedAt >= lookupTimeoutMs) {
+        if (currentTime - lookupStartedAt >= lookupTimeoutMs) {
           stop();
           return;
         }
@@ -201,20 +244,21 @@ function createThreadRolloutLiveMirror({
 
       const rolloutStat = fsModule.statSync(rolloutPath);
       const fileSize = rolloutStat.size;
-      // While another live source streams this thread the tail keeps consuming
-      // rollout lines with its emissions muted. Compare per-thread activity so
-      // a quiet Desktop turn stays owned, while newer rollout growth can recover
-      // from a stale connected snapshot.
+      // Re-check ownership with the rollout's activity time before bootstrapping.
+      // If another source owns the thread, leave the file untouched until that
+      // ownership expires.
       const suppressed = isSuppressed({
         fallbackActivityAt: Number(rolloutStat.mtimeMs) || 0,
       });
-      if (wasSuppressed && !suppressed && didBootstrap) {
+      if (suppressed) {
+        rolloutPath = null;
         lastSize = 0;
         partialLine = "";
         didBootstrap = false;
         resetRunState(state);
+        wasSuppressed = true;
+        return;
       }
-      wasSuppressed = suppressed;
       if (!didBootstrap) {
         didBootstrap = true;
         bootstrapFromExistingRollout({
@@ -346,6 +390,10 @@ function createThreadRolloutLiveMirror({
     // final partial-line flush must never leak the poll interval.
     isStopped = true;
     clearIntervalFn(intervalId);
+    if (initialTickId != null) {
+      clearImmediateFn(initialTickId);
+      initialTickId = null;
+    }
     if (partialLine) {
       const flushLine = partialLine;
       partialLine = "";
@@ -358,9 +406,30 @@ function createThreadRolloutLiveMirror({
     onStop();
   }
 
+  // Only a healthy, actively-tailed run with a real id counts: synthetic ids
+  // are not actionable app-server turn ids, and suppressed/awaiting states
+  // mean the mirror does not actually know what is running. While another live
+  // source owns the thread the mirror has no parsed file state, so reporting a
+  // turn id would resurrect exactly the state the bridge muted.
+  function getActiveTurnId() {
+    if (
+      isStopped
+      || wasSuppressed
+      || state.isDesktopOrigin === false
+      || state.awaitingCoherentBoundary
+      || state.suppressLiveActivityUntilGrowth
+      || state.activeTurnIdIsSynthetic
+      || state.pendingSyntheticTerminalTurnId
+    ) {
+      return null;
+    }
+    return state.activeTurnId || null;
+  }
+
   return {
     bump,
     stop,
+    getActiveTurnId,
   };
 }
 
@@ -401,10 +470,28 @@ function bootstrapFromExistingRollout({
     fsModule,
   });
   if (!bootstrapWindow) {
-    // The active run starts outside the bounded bootstrap window. Do not emit
-    // a plausible-looking tail: canonical history remains the baseline and
-    // this mirror will still consume future growth normally.
     state.awaitingCoherentBoundary = true;
+    return;
+  }
+  if (!bootstrapWindow.coherent) {
+    // The active run starts outside the bounded bootstrap window. Do not emit
+    // a plausible-looking tail: canonical history remains the baseline. But do
+    // not go dark either — a long busy run would stop mirroring tool activity
+    // until its next turn boundary. Attach to the run in place instead, so
+    // growth from here on keeps streaming live.
+    const attached = attachToActiveRunFromTruncatedTail({
+      contents: bootstrapWindow.alignedContents,
+      boundary: bootstrapWindow.boundary,
+      state,
+      rolloutPath,
+      fsModule,
+      sendApplicationResponse,
+      nowMs,
+      staleActiveRunMaxAgeMs,
+    });
+    if (!attached) {
+      state.awaitingCoherentBoundary = true;
+    }
     return;
   }
   const { tailStart, contents: bootstrapContents } = bootstrapWindow;
@@ -532,7 +619,8 @@ function bootstrapFromExistingRollout({
 // Expands backwards only until the newest active task has its opening user
 // message. Every expansion reads just the newly needed prefix, so a 30MB file
 // is read at most once rather than once per retry. The hard cap keeps bootstrap
-// work/memory bounded; no coherent opener means no replay.
+// work/memory bounded; a capped window without a coherent opener comes back
+// with `coherent: false` and must never be replayed as history.
 function readCoherentBootstrapWindow({ rolloutPath, fileSize, fsModule }) {
   const maxBytes = Math.min(fileSize, DEFAULT_BOOTSTRAP_MAX_BYTES);
   let windowBytes = Math.min(fileSize, DEFAULT_BOOTSTRAP_TAIL_BYTES);
@@ -549,10 +637,16 @@ function readCoherentBootstrapWindow({ rolloutPath, fileSize, fsModule }) {
     // some legitimate system/continuation turns have no materialized user row.
     // The opener requirement only protects a truncated tail.
     if (!boundary.hasActiveRun || boundary.hasOpeningUser || tailStart === 0) {
-      return { tailStart, contents };
+      return { tailStart, contents, coherent: true };
     }
     if (windowBytes >= maxBytes || tailStart === 0) {
-      return null;
+      return {
+        tailStart,
+        contents,
+        coherent: false,
+        alignedContents,
+        boundary,
+      };
     }
 
     const nextWindowBytes = Math.min(maxBytes, windowBytes * 2);
@@ -584,11 +678,20 @@ function inspectBootstrapRunBoundary(contents) {
   // closing terminal is evidence of an unknown active boundary, not permission
   // to replay a partial conversation.
   let unboundedActivitySinceTerminal = false;
+  // Attach metadata for the incoherent-window case, so the caller never has to
+  // re-parse the (up to 64MB) window a second time.
+  let newestTaskStartedLineIndex = -1;
+  let lastEntryTimestamp = "";
 
-  for (const rawLine of contents.split("\n")) {
-    const parsed = safeParseJSON(rawLine.trim());
+  const lines = contents.split("\n");
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const parsed = safeParseJSON(lines[lineIndex].trim());
     if (!parsed) {
       continue;
+    }
+    const entryTimestamp = readString(parsed.timestamp);
+    if (entryTimestamp) {
+      lastEntryTimestamp = entryTimestamp;
     }
     const taskEventType = parsed?.type === "event_msg"
       ? readString(parsed?.payload?.type)
@@ -611,6 +714,7 @@ function inspectBootstrapRunBoundary(contents) {
       hasOpeningUser = pendingUserBeforeStart;
       hasTurnOutputSinceStart = false;
       pendingUserBeforeStart = false;
+      newestTaskStartedLineIndex = lineIndex;
       continue;
     }
     if (!activeTurnId) {
@@ -653,6 +757,8 @@ function inspectBootstrapRunBoundary(contents) {
   return {
     hasActiveRun: Boolean(activeTurnId) || unboundedActivitySinceTerminal,
     hasOpeningUser,
+    newestTaskStartedLineIndex,
+    lastEntryTimestamp,
   };
 }
 
@@ -665,6 +771,58 @@ function isBootstrapNeutralRecord(entry, taskEventType = "") {
     || entryType === "world_state"
     || entryType === "turn_context"
     || taskEventType === "context_updated";
+}
+
+// Attaches mid-run when the active run's opener is beyond the bounded window:
+// nothing already in the tail is emitted (it stays canonical-history
+// territory), but run state is hydrated so subsequent growth mirrors live.
+// Returns false when the tail proves the visible runs all closed — trailing
+// bytes then belong to an unknown older boundary and stay suppressed.
+function attachToActiveRunFromTruncatedTail({
+  contents,
+  boundary,
+  state,
+  rolloutPath,
+  fsModule,
+  sendApplicationResponse,
+  nowMs,
+  staleActiveRunMaxAgeMs,
+}) {
+  const newestTaskStartedIndex = boundary?.newestTaskStartedLineIndex ?? -1;
+  if (newestTaskStartedIndex >= 0) {
+    // Hydrate through the shared reducer so parallel-turn and terminal
+    // semantics stay authoritative for what is still open at EOF.
+    processRolloutLines(contents.split("\n").slice(newestTaskStartedIndex), state, () => {});
+    if (!state.activeTurnId) {
+      return false;
+    }
+  } else {
+    // Mid-turn tail without its task_started: adopt a synthetic turn. The
+    // first non-terminal event carrying the real id promotes it, and a
+    // mismatched terminal closes it via the synthetic-terminal path.
+    state.activeTurnId = buildSyntheticTurnId(state, { timestamp: boundary?.lastEntryTimestamp || "" });
+    state.activeTurnIdIsSynthetic = true;
+    state.reasoningItemId = buildSyntheticItemId("thinking", state.threadId, state.activeTurnId);
+  }
+
+  if (isRolloutFileStale(rolloutPath, fsModule, nowMs, staleActiveRunMaxAgeMs)) {
+    // Same contract as the stale coherent bootstrap: stay silent until real
+    // growth proves the desktop process is alive again.
+    state.suppressLiveActivityUntilGrowth = true;
+    return true;
+  }
+
+  // A hydrated run that already carries a pending synthetic terminal is
+  // closing, not running: announcing it as live would just be followed by the
+  // tick's synthetic turn/completed one grace period later.
+  if (!state.pendingSyntheticTerminalTurnId) {
+    sendApplicationResponse(JSON.stringify(createNotification("turn/activity", {
+      threadId: state.threadId,
+      turnId: state.activeTurnId,
+      id: state.activeTurnId,
+    })));
+  }
+  return true;
 }
 
 // After a bounded bootstrap cannot reach the old opener, consume only new
@@ -832,6 +990,7 @@ function synthesizeNotificationsFromRolloutEntry(entry, state, { nowMs = Date.no
       state.commandCalls.clear();
       state.applyPatchCalls.clear();
       state.emittedPatchApplyEndCalls.clear();
+      state.wrappedExecCallIdsByOuterId.clear();
 
       const startedParams = {
         threadId: state.threadId,
@@ -963,16 +1122,16 @@ function synthesizeNotificationsFromRolloutEntry(entry, state, { nowMs = Date.no
   }
 
   if (itemType === "functioncall") {
-    notifications.push(...toolStartNotifications(state, payload));
+    notifications.push(...projectedToolStartNotifications(state, payload));
     return notifications;
   }
 
   if (itemType === "customtoolcall") {
-    notifications.push(...customToolStartNotifications(state, payload));
+    notifications.push(...projectedToolStartNotifications(state, payload));
     return notifications;
   }
 
-  if (itemType === "functioncalloutput") {
+  if (itemType === "functioncalloutput" || itemType === "customtoolcalloutput") {
     notifications.push(...toolOutputNotifications(state, payload));
     return notifications;
   }
@@ -1208,6 +1367,29 @@ function extractResponseItemMessageText(payload) {
   return responseItemMessageText(payload);
 }
 
+function projectedToolStartNotifications(state, payload) {
+  if (isOrchestrationWaitCall(payload)) {
+    return [];
+  }
+
+  const projectedPayloads = expandExecWrapperToolCall(payload);
+  const outerCallId = projectedPayloads[0]?.remodexWrappedExecCallId;
+  if (outerCallId && projectedPayloads.length > 1) {
+    state.wrappedExecCallIdsByOuterId.set(
+      outerCallId,
+      projectedPayloads.map((projectedPayload) => (
+        readString(projectedPayload.call_id) || readString(projectedPayload.callId)
+      )).filter(Boolean)
+    );
+  }
+
+  return projectedPayloads.flatMap((projectedPayload) => (
+    normalizeRolloutItemType(projectedPayload.type) === "customtoolcall"
+      ? customToolStartNotifications(state, projectedPayload)
+      : toolStartNotifications(state, projectedPayload)
+  ));
+}
+
 function toolStartNotifications(state, payload) {
   if (!state.activeTurnId) {
     return [];
@@ -1265,6 +1447,7 @@ function toolStartNotifications(state, payload) {
     toolName,
     command: resolveToolCommand(toolName, argumentsObject),
     cwd: resolveToolWorkingDirectory(argumentsObject, state),
+    wrappedExecCall: Boolean(payload.remodexWrappedExecCallId),
   });
 
   if (isCommandToolName(toolName)) {
@@ -1293,6 +1476,8 @@ function toolStartNotifications(state, payload) {
       threadId: state.threadId,
       turnId: state.activeTurnId,
       call_id: callId,
+      itemId: callId,
+      status: "inProgress",
       message: activityMessage,
     }),
   ];
@@ -1336,12 +1521,27 @@ function customToolStartNotifications(state, payload) {
     return notifications;
   }
 
+  // Custom tool calls settle through custom_tool_call_output. Without tracking
+  // them the activity row never completes, so it lingers between command groups.
+  if (!isCommandToolName(toolName) && !state.applyPatchCalls.has(callId)) {
+    state.commandCalls.set(callId, {
+      toolName,
+      command: toolName,
+      cwd: readString(state.sessionMeta?.cwd) || "",
+      wrappedExecCall: Boolean(payload.remodexWrappedExecCallId),
+    });
+  }
+
   return [
     ...notifications,
     createNotification("codex/event/background_event", {
       threadId: state.threadId,
       turnId: state.activeTurnId,
       call_id: callId,
+      ...(!state.applyPatchCalls.has(callId) ? {
+        itemId: callId,
+        status: "inProgress",
+      } : {}),
       message: activityMessage,
     }),
   ];
@@ -1416,8 +1616,28 @@ function toolOutputNotifications(state, payload) {
     return [];
   }
 
+  const wrappedCallIds = state.wrappedExecCallIdsByOuterId.get(callId);
+  if (Array.isArray(wrappedCallIds) && wrappedCallIds.length > 0) {
+    state.wrappedExecCallIdsByOuterId.delete(callId);
+    const outputRecipientId = wrappedCallIds.find((nestedCallId) => (
+      isCommandToolName(state.commandCalls.get(nestedCallId)?.toolName)
+    )) || wrappedCallIds[0];
+    return wrappedCallIds.flatMap((nestedCallId) => toolOutputNotifications(state, {
+      ...payload,
+      call_id: nestedCallId,
+      callId: nestedCallId,
+      output: nestedCallId === outputRecipientId ? payload.output : "",
+    }));
+  }
+
   const toolCall = state.commandCalls.get(callId);
   if (!toolCall) {
+    if (state.applyPatchCalls.has(callId)) {
+      return patchApplyEndNotifications(state, {
+        ...payload,
+        status: readString(payload.status) || "completed",
+      });
+    }
     return [];
   }
 
@@ -1427,13 +1647,16 @@ function toolOutputNotifications(state, payload) {
       threadId: state.threadId,
       turnId: state.activeTurnId,
       call_id: callId,
+      itemId: callId,
+      status: "completed",
       message: genericToolCompletionMessage(toolCall.toolName),
     }));
     state.commandCalls.delete(callId);
     return notifications;
   }
 
-  const output = readString(payload.output);
+  const rawOutput = extractToolOutputText(payload.output);
+  const output = toolCall.wrappedExecCall ? stripExecOutputEnvelope(rawOutput) : rawOutput;
   const notifications = [...ensureThinkingNotifications(state)];
   if (output) {
     notifications.push(createNotification("codex/event/exec_command_output_delta", {
@@ -1457,6 +1680,38 @@ function toolOutputNotifications(state, payload) {
   }));
   state.commandCalls.delete(callId);
   return notifications;
+}
+
+function extractToolOutputText(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(extractToolOutputText).join("");
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  for (const key of ["text", "output_text", "outputText"]) {
+    if (typeof value[key] === "string") {
+      return value[key];
+    }
+  }
+  for (const key of ["content", "output", "result"]) {
+    const text = extractToolOutputText(value[key]);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function stripExecOutputEnvelope(output) {
+  return readString(output).replace(
+    /^Script [^\n]*\nWall time [^\n]*\nOutput:\n?/,
+    ""
+  );
 }
 
 function imageGenerationNotifications(state, payload, { preferCallId = false } = {}) {
@@ -1631,6 +1886,7 @@ function createMirrorState(threadId) {
     commandCalls: new Map(),
     applyPatchCalls: new Map(),
     emittedPatchApplyEndCalls: new Set(),
+    wrappedExecCallIdsByOuterId: new Map(),
     emittedAgentMessageKeys: new Set(),
     agentMessageOccurrencesByBaseKey: new Map(),
     pendingEventAgentMessageOccurrencesByBaseKey: new Map(),
@@ -1796,8 +2052,19 @@ function genericToolActivityMessage(toolName) {
   }
 }
 
+// Mirrors the wording of genericToolActivityMessage so the completion line
+// supersedes the start line instead of stacking a second row beside it.
 function genericToolCompletionMessage(toolName) {
-  return `Completed ${readString(toolName)}`;
+  switch (readString(toolName).toLowerCase()) {
+  case "apply_patch":
+    return "Applied patch";
+  case "write_stdin":
+    return "Wrote to terminal";
+  case "read_thread_terminal":
+    return "Read terminal output";
+  default:
+    return `Completed ${readString(toolName)}`;
+  }
 }
 
 function createNotification(method, params = {}) {
@@ -1952,6 +2219,7 @@ function resetRunState(state) {
   state.commandCalls.clear();
   state.applyPatchCalls.clear();
   state.emittedPatchApplyEndCalls.clear();
+  state.wrappedExecCallIdsByOuterId.clear();
   state.emittedAgentMessageKeys.clear();
   state.agentMessageOccurrencesByBaseKey.clear();
   state.pendingEventAgentMessageOccurrencesByBaseKey.clear();

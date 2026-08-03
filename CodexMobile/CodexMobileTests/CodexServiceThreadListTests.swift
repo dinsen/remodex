@@ -46,6 +46,7 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         XCTAssertEqual(requestParams.map { $0["limit"]?.intValue }, [10, 10])
         XCTAssertEqual(requestParams.compactMap { $0["cursor"] }, [.null, .string("cursor-page-2")])
+        XCTAssertEqual(requestParams.map { $0["sortKey"]?.stringValue }, ["updated_at", "updated_at"])
         XCTAssertNil(requestParams.last?["archived"])
         XCTAssertEqual(requestCount, 2)
         XCTAssertEqual(
@@ -479,6 +480,7 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         XCTAssertEqual(activeRequestParams?["limit"]?.intValue, 10)
         XCTAssertNil(activeRequestParams?["archived"])
+        XCTAssertEqual(activeRequestParams?["sortKey"]?.stringValue, "updated_at")
         XCTAssertEqual(requestCount, 1)
     }
 

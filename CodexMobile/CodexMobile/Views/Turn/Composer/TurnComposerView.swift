@@ -69,6 +69,9 @@ struct TurnComposerView: View, Equatable {
     let gitState: TurnComposerGitState
     let gitActions: TurnComposerGitActions
     let onRefreshUsageStatus: () async -> Void
+    // Re-requests model/list when the runtime picker opens without options
+    // (bootstrap fetch failed or still in flight). Defaulted for previews.
+    var onRefreshModelsIfNeeded: () -> Void = {}
 
     let onSelectAccessMode: (CodexAccessMode) -> Void
     let onTapAddImage: () -> Void
@@ -111,12 +114,18 @@ struct TurnComposerView: View, Equatable {
     // Square hit target for the resting capsule's "+", mic, and send/stop
     // controls. The extra 2pt keeps the closed capsule comfortable to tap.
     private let collapsedControlTapTarget: CGFloat = 34
+    // Extra inset applied to the resting capsule (and the accessory row above
+    // it, so the two stay flush) on top of the composer's own 12pt margins.
+    private static let collapsedComposerInset: CGFloat = 24
     private let expandedPlainTextMaxVisibleLines: CGFloat = 6
     private let expandedAccessoryTextMaxVisibleLines: CGFloat = 4
 
     @State private var composerInputHeight: CGFloat = 32
     @State private var inputChangeTask: Task<Void, Never>?
     @State private var isShowingQueuedDraftsSheet = false
+    // The runtime picker is presented from the always-mounted composer root (not
+    // from the bottom bar) so it survives the composer collapsing mid-flow.
+    @State private var showsRuntimeOverlay = false
 
     @Environment(\.pinnedPlanAccessory) private var pinnedPlanAccessory
 
@@ -149,8 +158,26 @@ struct TurnComposerView: View, Equatable {
 
     // ─── ENTRY POINT ─────────────────────────────────────────────
     var body: some View {
-        AdaptiveGlassContainer(spacing: 6) {
-            composerStack
+        VStack(spacing: 6) {
+            // The capsule stays outside the glass container: its glass lives on
+            // a `Color.clear` background layer (see VoiceRecordingCapsule), so
+            // inside a `GlassEffectContainer` the waveform/timer would be
+            // plain sibling content that the container renders beneath the
+            // promoted glass surface — i.e. blurred out. Standalone glass
+            // draws behind the capsule content like a normal background and
+            // never merges with the composer card's glass.
+            if accessoryState.showsVoiceRecordingCapsule {
+                VoiceRecordingCapsule(
+                    audioLevels: accessoryState.voiceAudioLevels,
+                    duration: accessoryState.voiceRecordingDuration,
+                    onCancel: onCancelVoiceRecording
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            AdaptiveGlassContainer(spacing: 6) {
+                composerStack
+            }
         }
         .padding(.horizontal, 12)
         .padding(.top, 4)
@@ -174,6 +201,13 @@ struct TurnComposerView: View, Equatable {
                 onRemove: onRemoveQueuedDraft
             )
         }
+        // Containment, not presentation: presenting any view controller ends
+        // editing and drops the keyboard. The overlay is installed in this same
+        // hierarchy, so the composer keeps focus and the chat behind it is what
+        // gets blurred. Anchored here so the picker sits right above the keyboard.
+        .fullScreenOverlay(isPresented: showsRuntimeOverlay) {
+            runtimeSliderOverlay
+        }
         .onChange(of: accessoryState.hasQueuedDrafts) { _, hasDrafts in
             if !hasDrafts {
                 isShowingQueuedDraftsSheet = false
@@ -183,15 +217,6 @@ struct TurnComposerView: View, Equatable {
 
     private var composerStack: some View {
         VStack(spacing: 6) {
-            if accessoryState.showsVoiceRecordingCapsule {
-                VoiceRecordingCapsule(
-                    audioLevels: accessoryState.voiceAudioLevels,
-                    duration: accessoryState.voiceRecordingDuration,
-                    onCancel: onCancelVoiceRecording
-                )
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
-
             // Gated here (not inside the bar) so the VStack never keeps an
             // empty child whose spacing could leave a stray gap above the
             // input. The row stays visible while the composer rests as a
@@ -217,6 +242,9 @@ struct TurnComposerView: View, Equatable {
                     gitState: gitState,
                     gitActions: gitActions
                 )
+                // Keep the accessory pills lined up with whichever width the
+                // surface below them currently has.
+                .padding(.horizontal, showsCollapsedComposer ? Self.collapsedComposerInset : 0)
             }
 
             VStack(spacing: 0) {
@@ -349,8 +377,10 @@ struct TurnComposerView: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .leading)
             .adaptiveGlass(.regular, in: RoundedRectangle(cornerRadius: composerSurfaceCornerRadius))
             .clipShape(RoundedRectangle(cornerRadius: composerSurfaceCornerRadius))
-            // The resting capsule sits slightly narrower than the expanded composer.
-            .padding(.horizontal, showsCollapsedComposer ? 8 : 0)
+            // The resting capsule sits noticeably narrower than the expanded
+            // composer, so the closed state reads as a floating control rather
+            // than an edge-to-edge input bar.
+            .padding(.horizontal, showsCollapsedComposer ? Self.collapsedComposerInset : 0)
             .overlay(alignment: .topLeading) {
                 Color.clear
                     .frame(maxWidth: .infinity, maxHeight: 0, alignment: .topLeading)
@@ -377,11 +407,7 @@ struct TurnComposerView: View, Equatable {
 
     private var expandedBottomBar: some View {
         ComposerBottomBar(
-            orderedModelOptions: orderedModelOptions,
-            selectedModelID: selectedModelID,
-            selectedModelTitle: selectedModelTitle,
-            isLoadingModels: isLoadingModels,
-            isRuntimeSelectionLoading: isRuntimeSelectionLoading,
+            runtimeLabelParts: runtimeLabelParts,
             runtimeState: runtimeState,
             runtimeActions: runtimeActions,
             remainingAttachmentSlots: remainingAttachmentSlots,
@@ -409,7 +435,40 @@ struct TurnComposerView: View, Equatable {
             onSetPlanModeArmed: onSetPlanModeArmed,
             onResumeQueue: onResumeQueue,
             onStopTurn: onStopTurn,
+            onTapRuntimePill: {
+                // A failed bootstrap fetch would otherwise leave the picker
+                // with no fast-mode toggle and no effort slider forever.
+                onRefreshModelsIfNeeded()
+                showsRuntimeOverlay = true
+            },
             onSend: onSend
+        )
+    }
+
+    // MARK: - Runtime picker hosting
+
+    // Shared by the pill and the slider overlay so both render identical text.
+    private var runtimeLabelParts: TurnComposerRuntimeLabelParts {
+        TurnComposerMetaMapper.runtimeLabelParts(
+            selectedModelID: selectedModelID,
+            selectedModelTitle: selectedModelTitle,
+            isRuntimeSelectionLoading: isRuntimeSelectionLoading,
+            runtimeState: runtimeState
+        )
+    }
+
+    // The overlay owns its own backdrop, model menu, and all-models sheet; this
+    // view only decides when it is on screen.
+    private var runtimeSliderOverlay: some View {
+        ComposerRuntimeSliderOverlay(
+            runtimeState: runtimeState,
+            runtimeActions: runtimeActions,
+            modelDisplayTitle: runtimeLabelParts.modelPart,
+            effortDisplayTitle: runtimeLabelParts.effortPart,
+            orderedModelOptions: orderedModelOptions,
+            selectedModelID: selectedModelID,
+            isLoadingModels: isLoadingModels,
+            onDismiss: { showsRuntimeOverlay = false }
         )
     }
 

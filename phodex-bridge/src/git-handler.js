@@ -635,13 +635,11 @@ async function gitCreateBranch(cwd, params) {
   return { branch: name, status };
 }
 
-async function gitCreateWorktree(cwd, params) {
-  const branch = normalizeCreatedBranchName(params.name);
-  if (!branch) {
-    throw gitError("missing_branch_name", "Branch name is required.");
-  }
-  await assertValidCreatedBranchName(cwd, branch);
-
+// Resolves the shared creation context for both worktree flavors and enforces
+// the invariants they have in common: a locally available base branch, and
+// dirty changes that may only travel when the base branch is checked out.
+// `destinationLabel` only shapes the dirty-transfer error message.
+async function resolveWorktreeCreationContext(cwd, params, destinationLabel) {
   const branchResult = await gitBranches(cwd);
   const repoRoot = await resolveRepoRoot(cwd);
   const status = await gitStatus(cwd);
@@ -666,34 +664,27 @@ async function gitCreateWorktree(cwd, params) {
     const transferVerb = changeTransfer === "copy" ? "copy" : "move";
     throw gitError(
       "dirty_worktree_base_mismatch",
-      `Uncommitted changes can ${transferVerb} into a new worktree only from ${currentBranchLabel}. Switch the base branch to match or clean up local changes first.`
+      `Uncommitted changes can ${transferVerb} into ${destinationLabel} only from ${currentBranchLabel}. Switch the base branch to match or clean up local changes first.`
     );
   }
 
-  const existingWorktreePath = branchResult.worktreePathByBranch[branch];
-  if (existingWorktreePath) {
-    if (sameFilePath(existingWorktreePath, cwd)) {
-      throw gitError(
-        "branch_already_open_here",
-        `Branch '${branch}' is already open in this project.`
-      );
-    }
+  return {
+    branchResult,
+    repoRoot,
+    projectRelativePath,
+    changeScope,
+    baseBranch,
+    changeTransfer,
+    canCarryLocalChanges,
+  };
+}
 
-    return {
-      branch,
-      worktreePath: existingWorktreePath,
-      alreadyExisted: true,
-    };
-  }
-
-  const branchExists = await localBranchExists(cwd, branch);
-  if (branchExists) {
-    throw gitError(
-      "branch_exists",
-      `Branch '${branch}' already exists locally. Choose another name or open that branch instead.`
-    );
-  }
-
+// Shared creation core: allocates the managed path, carries local changes per
+// the transfer mode, runs `git worktree add`, copies manifest files, and rolls
+// everything back if any step after allocation fails. `branch` switches the
+// checkout mode (`-b branch` vs `--detach`) and scopes cleanup/error mapping.
+async function createWorktreeAtManagedPath(context, { branch = null, failureMessage }) {
+  const { repoRoot, changeScope, baseBranch, changeTransfer, canCarryLocalChanges } = context;
   const worktreeRootPath = allocateManagedWorktreePath(repoRoot);
   let handoffStashRef = null;
   let copiedLocalChangesPatch = "";
@@ -708,7 +699,8 @@ async function gitCreateWorktree(cwd, params) {
       }
     }
 
-    await git(repoRoot, "worktree", "add", "-b", branch, worktreeRootPath, baseBranch);
+    const checkoutArgs = branch ? ["-b", branch] : ["--detach"];
+    await git(repoRoot, "worktree", "add", ...checkoutArgs, worktreeRootPath, baseBranch);
     didCreateWorktree = true;
 
     if (handoffStashRef) {
@@ -717,6 +709,7 @@ async function gitCreateWorktree(cwd, params) {
     if (copiedLocalChangesPatch) {
       await applyCopiedLocalChangesToWorktree(worktreeRootPath, copiedLocalChangesPatch);
     }
+    await copyWorktreeIncludeFiles(repoRoot, worktreeRootPath);
   } catch (err) {
     if (didCreateWorktree) {
       await cleanupManagedWorktree(repoRoot, worktreeRootPath, branch);
@@ -731,102 +724,90 @@ async function gitCreateWorktree(cwd, params) {
     if (err.message?.includes("invalid reference")) {
       throw gitError("missing_base_branch", `Base branch '${baseBranch}' does not exist.`);
     }
-    if (err.message?.includes("already exists")) {
-      throw gitError("branch_exists", `Branch '${branch}' already exists.`);
+    if (branch) {
+      if (err.message?.includes("already exists")) {
+        throw gitError("branch_exists", `Branch '${branch}' already exists.`);
+      }
+      if (err.message?.includes("already used by worktree") || err.message?.includes("already checked out at")) {
+        throw gitError(
+          "branch_in_other_worktree",
+          `Branch '${branch}' is already open in another worktree.`
+        );
+      }
     }
-    if (err.message?.includes("already used by worktree") || err.message?.includes("already checked out at")) {
-      throw gitError(
-        "branch_in_other_worktree",
-        `Branch '${branch}' is already open in another worktree.`
-      );
-    }
-    throw gitError("create_worktree_failed", err.message || "Failed to create worktree.");
+    throw gitError("create_worktree_failed", err.message || failureMessage);
   }
 
-  const worktreePath = scopedWorktreePath(worktreeRootPath, projectRelativePath);
+  return {
+    worktreeRootPath,
+    transferredChanges: Boolean(handoffStashRef || copiedLocalChangesPatch),
+  };
+}
+
+async function gitCreateWorktree(cwd, params) {
+  const branch = normalizeCreatedBranchName(params.name);
+  if (!branch) {
+    throw gitError("missing_branch_name", "Branch name is required.");
+  }
+  await assertValidCreatedBranchName(cwd, branch);
+
+  const context = await resolveWorktreeCreationContext(cwd, params, "a new worktree");
+  const { branchResult, repoRoot, projectRelativePath } = context;
+
+  const existingWorktreePath = branchResult.worktreePathByBranch[branch];
+  if (existingWorktreePath) {
+    if (sameFilePath(existingWorktreePath, cwd)) {
+      throw gitError(
+        "branch_already_open_here",
+        `Branch '${branch}' is already open in this project.`
+      );
+    }
+
+    // Backfill manifest files a worktree created before `.worktreeinclude`
+    // existed never received; the copy skips files the worktree already has.
+    const existingWorktreeRoot = await resolveRepoRoot(existingWorktreePath).catch(() => null);
+    if (existingWorktreeRoot) {
+      await copyWorktreeIncludeFiles(repoRoot, existingWorktreeRoot);
+    }
+
+    return {
+      branch,
+      worktreePath: existingWorktreePath,
+      alreadyExisted: true,
+    };
+  }
+
+  if (await localBranchExists(cwd, branch)) {
+    throw gitError(
+      "branch_exists",
+      `Branch '${branch}' already exists locally. Choose another name or open that branch instead.`
+    );
+  }
+
+  const { worktreeRootPath } = await createWorktreeAtManagedPath(context, {
+    branch,
+    failureMessage: "Failed to create worktree.",
+  });
+
   return {
     branch,
-    worktreePath,
+    worktreePath: scopedWorktreePath(worktreeRootPath, projectRelativePath),
     alreadyExisted: false,
   };
 }
 
 async function gitCreateManagedWorktree(cwd, params) {
-  const branchResult = await gitBranches(cwd);
-  const repoRoot = await resolveRepoRoot(cwd);
-  const status = await gitStatus(cwd);
-  const projectRelativePath = resolveProjectRelativePath(cwd, repoRoot);
-  const changeScope = await scopedProjectChanges(repoRoot, projectRelativePath);
-  const baseBranch = resolveBaseBranchName(params.baseBranch, branchResult.defaultBranch);
-  const changeTransfer = resolveWorktreeChangeTransfer(params.changeTransfer);
-  if (!baseBranch) {
-    throw gitError("missing_base_branch", "Base branch is required.");
-  }
-  if (!(await localBranchExists(cwd, baseBranch))) {
-    throw gitError(
-      "missing_base_branch",
-      `Base branch '${baseBranch}' is not available locally. Create or check out that branch first.`
-    );
-  }
+  const context = await resolveWorktreeCreationContext(cwd, params, "a managed worktree");
+  const { worktreeRootPath, transferredChanges } = await createWorktreeAtManagedPath(context, {
+    failureMessage: "Failed to create managed worktree.",
+  });
 
-  const currentBranch = typeof status.branch === "string" ? status.branch.trim() : "";
-  const canCarryLocalChanges = changeScope.dirty && !!currentBranch && currentBranch === baseBranch;
-  if (changeScope.dirty && changeTransfer !== "none" && !canCarryLocalChanges) {
-    const currentBranchLabel = currentBranch || "the current branch";
-    const transferVerb = changeTransfer === "copy" ? "copy" : "move";
-    throw gitError(
-      "dirty_worktree_base_mismatch",
-      `Uncommitted changes can ${transferVerb} into a managed worktree only from ${currentBranchLabel}. Switch the base branch to match or clean up local changes first.`
-    );
-  }
-
-  const worktreeRootPath = allocateManagedWorktreePath(repoRoot);
-  let handoffStashRef = null;
-  let copiedLocalChangesPatch = "";
-  let didCreateWorktree = false;
-
-  try {
-    if (canCarryLocalChanges) {
-      if (changeTransfer === "copy") {
-        copiedLocalChangesPatch = await captureLocalChangesPatch(repoRoot, changeScope.pathspecArgs);
-      } else if (changeTransfer === "move") {
-        handoffStashRef = await stashChangesForWorktreeHandoff(repoRoot, changeScope.pathspecArgs);
-      }
-    }
-
-    await git(repoRoot, "worktree", "add", "--detach", worktreeRootPath, baseBranch);
-    didCreateWorktree = true;
-
-    if (handoffStashRef) {
-      await applyWorktreeHandoffStash(worktreeRootPath, handoffStashRef);
-    }
-    if (copiedLocalChangesPatch) {
-      await applyCopiedLocalChangesToWorktree(worktreeRootPath, copiedLocalChangesPatch);
-    }
-  } catch (err) {
-    if (didCreateWorktree) {
-      await cleanupManagedWorktree(repoRoot, worktreeRootPath);
-    } else {
-      fs.rmSync(path.dirname(worktreeRootPath), { recursive: true, force: true });
-    }
-
-    if (handoffStashRef) {
-      await restoreWorktreeHandoffStash(repoRoot, handoffStashRef);
-    }
-
-    if (err.message?.includes("invalid reference")) {
-      throw gitError("missing_base_branch", `Base branch '${baseBranch}' does not exist.`);
-    }
-    throw gitError("create_worktree_failed", err.message || "Failed to create managed worktree.");
-  }
-
-  const worktreePath = scopedWorktreePath(worktreeRootPath, projectRelativePath);
   return {
-    worktreePath,
+    worktreePath: scopedWorktreePath(worktreeRootPath, context.projectRelativePath),
     alreadyExisted: false,
-    baseBranch,
+    baseBranch: context.baseBranch,
     headMode: "detached",
-    transferredChanges: Boolean(handoffStashRef || copiedLocalChangesPatch),
+    transferredChanges,
   };
 }
 
@@ -2003,6 +1984,106 @@ async function rollbackFailedHandoffTransfer(cwd, pathspecArgs = []) {
   } catch {
     // Best effort: leave the original transfer error as the primary failure.
   }
+}
+
+// Mirrors Codex Desktop's `.worktreeinclude`: files Git leaves behind (like an
+// ignored `.env`) listed in a repository-root manifest are copied into worktrees.
+// Best effort by design — a stale manifest entry must never fail creation.
+const WORKTREE_INCLUDE_FILE = ".worktreeinclude";
+const WORKTREE_INCLUDE_MAX_FILES = 512;
+
+async function copyWorktreeIncludeFiles(repoRoot, worktreeRootPath) {
+  const manifestPath = path.join(repoRoot, WORKTREE_INCLUDE_FILE);
+  if (!fs.existsSync(manifestPath)) {
+    return;
+  }
+
+  const relativePaths = await listWorktreeIncludePaths(repoRoot, manifestPath);
+  if (relativePaths.length === 0) {
+    return;
+  }
+
+  const canonicalWorktreeRoot = await fs.promises.realpath(worktreeRootPath).catch(() => null);
+  if (!canonicalWorktreeRoot) {
+    return;
+  }
+
+  for (const relativePath of relativePaths) {
+    const sourcePath = path.resolve(repoRoot, relativePath);
+    const destinationPath = path.resolve(worktreeRootPath, relativePath);
+    // `ls-files` output is repo-relative, but keep both sides pinned to their
+    // roots so a hostile manifest entry cannot escape either tree.
+    if (!isPathContainedIn(sourcePath, repoRoot) || !isPathContainedIn(destinationPath, worktreeRootPath)) {
+      continue;
+    }
+    await copyWorktreeIncludeEntry(sourcePath, destinationPath, canonicalWorktreeRoot);
+  }
+}
+
+// Resolves the manifest to repo-relative untracked paths. The manifest uses
+// gitignore syntax, so let git itself do the matching: `--others -i
+// --exclude-from` lists every untracked file (ignored or not) that the
+// manifest patterns select, with full gitignore semantics — nested `.env`
+// matches, anchored `/foo` and `!negations` behave as documented, and a
+// malformed line cannot abort the listing the way a bad pathspec would.
+async function listWorktreeIncludePaths(repoRoot, manifestPath) {
+  let listing = "";
+  try {
+    listing = await git(
+      repoRoot,
+      "ls-files",
+      "--others",
+      "-i",
+      "-z",
+      `--exclude-from=${manifestPath}`
+    );
+  } catch (err) {
+    console.error(`[remodex] .worktreeinclude listing failed: ${err.message}`);
+    return [];
+  }
+
+  const relativePaths = listing.split("\0").filter(Boolean);
+  if (relativePaths.length > WORKTREE_INCLUDE_MAX_FILES) {
+    console.error(
+      `[remodex] .worktreeinclude matched ${relativePaths.length} files; copying only the first ${WORKTREE_INCLUDE_MAX_FILES}. Narrow the manifest patterns.`
+    );
+    relativePaths.length = WORKTREE_INCLUDE_MAX_FILES;
+  }
+  return relativePaths;
+}
+
+// Copies one manifest match into the worktree, skipping anything unsafe or
+// already present rather than failing the surrounding creation flow.
+async function copyWorktreeIncludeEntry(sourcePath, destinationPath, canonicalWorktreeRoot) {
+  try {
+    // Regular files only: copying through a symlinked source would smuggle
+    // out-of-repo content (e.g. `.env -> ~/.ssh/key`) into every worktree.
+    const sourceStats = await fs.promises.lstat(sourcePath);
+    if (!sourceStats.isFile()) {
+      return;
+    }
+    const destinationDirectory = path.dirname(destinationPath);
+    await fs.promises.mkdir(destinationDirectory, { recursive: true });
+    // Re-check containment on the real path: a checked-out symlinked parent
+    // directory would otherwise let the copy write outside the worktree.
+    const canonicalDestinationDirectory = await fs.promises.realpath(destinationDirectory);
+    if (!isPathContainedIn(canonicalDestinationDirectory, canonicalWorktreeRoot)) {
+      return;
+    }
+    // COPYFILE_EXCL keeps existing files intact: change transfer may already
+    // have carried a dirty copy, and reused worktrees keep their own state.
+    await fs.promises.copyFile(
+      sourcePath,
+      path.join(canonicalDestinationDirectory, path.basename(destinationPath)),
+      fs.constants.COPYFILE_EXCL
+    );
+  } catch {
+    // Skip unreadable or already-present entries; the worktree stays usable.
+  }
+}
+
+function isPathContainedIn(candidatePath, rootPath) {
+  return candidatePath === rootPath || candidatePath.startsWith(rootPath + path.sep);
 }
 
 async function cleanupManagedWorktree(repoRoot, worktreeRootPath, branchName = null) {

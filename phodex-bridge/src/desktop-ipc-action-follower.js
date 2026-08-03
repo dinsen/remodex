@@ -15,15 +15,19 @@ const {
   projectDesktopConversationStateToThread,
 } = require("./desktop-ipc-conversation-projector");
 const {
+  CLIENT_STATUS_CHANGED,
   DESKTOP_IPC_METHOD_VERSIONS: METHOD_VERSION_BY_NAME,
-  FRAME_HEADER_BYTES,
-  MAX_FRAME_BYTES,
+  buildIpcRequestEnvelope,
   cloneJSON,
+  createFrameReader,
+  isThreadTurnStateProbeRequest,
   normalizeToken,
   readString,
   requestIdKey,
   resolveDefaultIpcSocketPath,
+  resolveIpcSocketPathCandidates,
   safeParseJSON,
+  toSocketPathCandidatesResolver,
   writeFrame,
 } = require("./desktop-ipc-shared");
 
@@ -41,6 +45,8 @@ const MAX_QUEUED_CHANGES_PER_THREAD = 300;
 const MAX_ACTIVE_THREAD_IDS = 512;
 const DESKTOP_IPC_ACTION_SOURCE = "desktop-ipc-action-follower";
 const REMODEX_LIVE_OWNER_SOURCE = "desktop-ipc-live-owner";
+const THREAD_STREAM_FOLLOWING_CHANGED = "thread-stream-following-changed";
+const THREAD_STREAM_FOLLOWING_STATUS_REQUESTED = "thread-stream-following-status-requested";
 const DESKTOP_STATE_READ_METHODS = new Set([
   "thread/read",
   "thread/resume",
@@ -51,6 +57,12 @@ const DESKTOP_STATE_READ_METHODS = new Set([
 // this, a phone with no selected chat never connects to the Desktop bus and
 // cannot discover runs that started on the Mac.
 const DESKTOP_BACKGROUND_DISCOVERY_METHODS = new Set(["thread/list"]);
+// A run is announced to the phone exactly once, and the phone ignores buffered
+// replays of that announcement by design. An app session that starts after the
+// run did would otherwise never learn about it and show no sidebar badge until
+// the chat is opened. Sidebar refreshes re-announce still-active turns instead,
+// throttled per thread so steady polling costs one idempotent notification.
+const BACKGROUND_TURN_REANNOUNCE_MIN_INTERVAL_MS = 30_000;
 const DESKTOP_TURNS_CURSOR_PREFIX = "remodex-desktop-turns:";
 // Per-thread activity can be quiet during tools and subagents, so the short
 // freshness window alone does not revoke a healthy Desktop owner.
@@ -220,13 +232,16 @@ function createDesktopIpcActionFollower({
   normalizeTurnStartParams = (params) => params,
   runtimeSettingsStore = null,
   logPrefix = "[remodex]",
-  socketPath = resolveDefaultIpcSocketPath(),
+  // Resolved per connect: Codex Desktop can start, stop, or move its bus while
+  // the bridge stays up.
+  socketPath = resolveIpcSocketPathCandidates,
   netModule = net,
   now = () => Date.now(),
   snapshotDebounceMs = 0,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
   onNormalizedHistoryIndexRebuilt = () => {},
+  onFollowerStateChanged = null,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   ownershipProbeTimeoutMs = OWNERSHIP_PROBE_TIMEOUT_MS,
 } = {}) {
@@ -238,6 +253,7 @@ function createDesktopIpcActionFollower({
     logPrefix,
     onEnvelope,
     onConnected() {
+      announceDesktopFollowForActiveThreads();
       probeHeldFollowerRequests();
     },
     onDisconnect,
@@ -259,6 +275,8 @@ function createDesktopIpcActionFollower({
   const conversationProjector = createDesktopConversationProjector({ now });
   const pendingRoutesByRequestId = new Map();
   const activeThreadIds = new Set();
+  const desktopFollowThreadIds = new Set();
+  const followerClientIdsByThreadId = new Map();
   // Threads discovered from Litter snapshots before the phone reads them.
   // Their raw state is retained for lifecycle detection, but their transcript
   // stays off the relay until the user actually opens the chat.
@@ -267,6 +285,7 @@ function createDesktopIpcActionFollower({
   // baseline. Otherwise a disconnect/eviction can erase the only evidence
   // needed to send the matching completion and leave a phantom running badge.
   const announcedBackgroundTurnsByThreadId = new Map();
+  const backgroundTurnReannouncedAtByThreadId = new Map();
   // JS Set preserves insertion order; delete-before-add refreshes recency, and
   // cap eviction skips threads with pending prompts so approvals are not lost.
   function rememberActiveThread(threadId) {
@@ -279,6 +298,35 @@ function createDesktopIpcActionFollower({
       }
       activeThreadIds.delete(oldest);
       forgetEvictedThreadState(oldest);
+    }
+  }
+
+  function followDesktopThread(threadId, targetClientIds = undefined) {
+    if (!threadId || isLocallyOwnedThread(threadId) || liveOwnerThreadIds.has(threadId)) {
+      return false;
+    }
+    desktopFollowThreadIds.add(threadId);
+    return ipc.sendBroadcast(THREAD_STREAM_FOLLOWING_CHANGED, {
+      hostId: "local",
+      conversationId: threadId,
+      following: true,
+    }, { targetClientIds });
+  }
+
+  function unfollowDesktopThread(threadId) {
+    if (!desktopFollowThreadIds.delete(threadId)) {
+      return false;
+    }
+    return ipc.sendBroadcast(THREAD_STREAM_FOLLOWING_CHANGED, {
+      hostId: "local",
+      conversationId: threadId,
+      following: false,
+    });
+  }
+
+  function announceDesktopFollowForActiveThreads() {
+    for (const threadId of desktopFollowThreadIds) {
+      followDesktopThread(threadId);
     }
   }
 
@@ -306,6 +354,7 @@ function createDesktopIpcActionFollower({
   // without rejecting held requests (removeDesktopThreadState handles real removal).
   function forgetEvictedThreadState(threadId) {
     cancelPendingSnapshot(threadId);
+    unfollowDesktopThread(threadId);
     settleAnnouncedBackgroundTurn(threadId, "interrupted");
     backgroundOnlyThreadIds.delete(threadId);
     rawStatesByThreadId.delete(threadId);
@@ -345,6 +394,7 @@ function createDesktopIpcActionFollower({
     const method = readString(message?.method);
     if (DESKTOP_BACKGROUND_DISCOVERY_METHODS.has(method)) {
       ipc.ensureConnected();
+      reannounceActiveBackgroundTurns();
     }
     if (DESKTOP_STATE_READ_METHODS.has(method)) {
       const threadId = readThreadId(message?.params);
@@ -363,6 +413,7 @@ function createDesktopIpcActionFollower({
           settleAnnouncedBackgroundTurn(threadId, "interrupted");
         }
         announcedBackgroundTurnsByThreadId.delete(threadId);
+        backgroundTurnReannouncedAtByThreadId.delete(threadId);
         if (rawState) {
           const liveState = boundedDesktopLiveStateForThread(threadId, rawState);
           const hasCanonicalNormalizedHistory = canonicalHistoryThreadIds.has(threadId)
@@ -392,7 +443,8 @@ function createDesktopIpcActionFollower({
             // stays idle after opening never delivers them.
             emitNormalizedReviewOverlays(
               threadId,
-              normalizedLiveIndexesByThreadId.get(threadId)
+              normalizedLiveIndexesByThreadId.get(threadId),
+              liveState
             );
             const output = conversationProjector.project(threadId, liveState, {
               includeAllActiveTurns: true,
@@ -477,6 +529,7 @@ function createDesktopIpcActionFollower({
       ownershipProbeDeadlinesByThreadId.set(threadId, now() + ownershipProbeTimeoutMs);
     }
     ipc.ensureConnected();
+    followDesktopThread(threadId);
     return false;
   }
 
@@ -515,9 +568,15 @@ function createDesktopIpcActionFollower({
     normalizedReviewFingerprintsByThreadId.clear();
     conversationProjector.reset();
     pendingRoutesByRequestId.clear();
+    for (const threadId of desktopFollowThreadIds) {
+      unfollowDesktopThread(threadId);
+    }
+    desktopFollowThreadIds.clear();
     activeThreadIds.clear();
+    followerClientIdsByThreadId.clear();
     backgroundOnlyThreadIds.clear();
     announcedBackgroundTurnsByThreadId.clear();
+    backgroundTurnReannouncedAtByThreadId.clear();
     recoveringThreadIds.clear();
     baselineRecoveryStateByThreadId.clear();
     queuedChangesByThreadId.clear();
@@ -536,6 +595,25 @@ function createDesktopIpcActionFollower({
 
   // Desktop broadcasts carry the live conversation state Litter projects from.
   function onEnvelope(envelope) {
+    if (envelope?.type === "broadcast" && envelope.method === CLIENT_STATUS_CHANGED) {
+      if (normalizeToken(envelope.params?.status) === "disconnected") {
+        removeFollowerClient(envelope.params?.clientId || envelope.sourceClientId);
+      }
+      return;
+    }
+    if (envelope?.type === "broadcast" && envelope.method === THREAD_STREAM_FOLLOWING_CHANGED) {
+      updateFollowerState(envelope);
+      return;
+    }
+    if (envelope?.type === "broadcast"
+      && envelope.method === THREAD_STREAM_FOLLOWING_STATUS_REQUESTED) {
+      const params = envelope.params || {};
+      const threadId = readString(params.conversationId) || readString(params.conversation_id);
+      if (threadId && desktopFollowThreadIds.has(threadId)) {
+        followDesktopThread(threadId, [envelope.sourceClientId].filter(Boolean));
+      }
+      return;
+    }
     if (envelope?.type === "broadcast"
       && (envelope.method === "thread-archived" || envelope.method === "thread-unarchived")) {
       syncThreadArchiveBroadcast(envelope);
@@ -580,6 +658,14 @@ function createDesktopIpcActionFollower({
       backgroundOnlyThreadIds.add(threadId);
     }
     if (!activeThreadIds.has(threadId)) {
+      // After a bridge restart Desktop can re-announce that a renderer follows
+      // the thread without replaying its baseline snapshot. A request patch may
+      // then be the first state update we see. Preserve that blocking action
+      // immediately instead of waiting for a phone read that may never arrive
+      // while the already-open screen is parked on the question.
+      if (commitSpeculativeActionPatch(threadId, params.change, { backgroundOnly: true })) {
+        return;
+      }
       return;
     }
 
@@ -601,21 +687,11 @@ function createDesktopIpcActionFollower({
     const previousState = rawStatesByThreadId.get(threadId) || null;
     const nextState = applyConversationStateChange(previousState, params.change);
     if (!nextState) {
-      if (isPatchChange(params.change)) {
-        const emptyState = createEmptyConversationState();
-        const speculativeState = applyConversationStateChange(emptyState, params.change);
-        const speculativeActions = projectPendingDesktopActions(threadId, speculativeState);
-        if (speculativeActions.length > 0) {
-          rawStatesByThreadId.set(threadId, speculativeState);
-          rawStateUpdatedAtByThreadId.set(threadId, now());
-          if (!backgroundOnlyThreadIds.has(threadId)) {
-            conversationProjector.seed(threadId, speculativeState);
-          }
-          syncProjectedActions(threadId, speculativeActions);
-          releaseHeldFollowerRequests(threadId, { toDesktop: true });
-          return;
-        }
+      if (commitSpeculativeActionPatch(threadId, params.change)) {
+        return;
+      }
 
+      if (isPatchChange(params.change)) {
         if (typeof readConversationState !== "function") {
           return;
         }
@@ -635,6 +711,31 @@ function createDesktopIpcActionFollower({
       isFullSnapshot: isSnapshotChange(params.change),
       change: params.change,
     });
+  }
+
+  function commitSpeculativeActionPatch(threadId, change, { backgroundOnly = false } = {}) {
+    if (!isPatchChange(change)) {
+      return false;
+    }
+
+    const speculativeState = applyConversationStateChange(createEmptyConversationState(), change);
+    const speculativeActions = projectPendingDesktopActions(threadId, speculativeState);
+    if (speculativeActions.length === 0) {
+      return false;
+    }
+
+    if (backgroundOnly) {
+      rememberActiveThread(threadId);
+      backgroundOnlyThreadIds.add(threadId);
+    }
+    rawStatesByThreadId.set(threadId, speculativeState);
+    rawStateUpdatedAtByThreadId.set(threadId, now());
+    if (!backgroundOnlyThreadIds.has(threadId)) {
+      conversationProjector.seed(threadId, speculativeState);
+    }
+    syncProjectedActions(threadId, speculativeActions);
+    releaseHeldFollowerRequests(threadId, { toDesktop: true });
+    return true;
   }
 
   function schedulePendingSnapshot(threadId, state) {
@@ -755,6 +856,7 @@ function createDesktopIpcActionFollower({
     queuedChangesByThreadId.clear();
     pendingOwnershipProbeTokensByThreadId.clear();
     desktopOwnedByProbeThreadIds.clear();
+    clearFollowerState();
     // A lost IPC connection is not evidence that Desktop stopped the turn.
     // Keep announced lifecycle state until a reconnect snapshot, archive, or
     // another authoritative state transition supplies a real terminal status.
@@ -770,6 +872,67 @@ function createDesktopIpcActionFollower({
     // a proven delivery failure falls back to the local app-server.
   }
 
+  // The same route-follow handshake is used whether Remodex's app-server owns
+  // the thread or Codex Desktop owns it. The live-owner component covers the
+  // former; this follower covers Desktop-owned threads so the navigation
+  // controller can stop retrying as soon as the renderer is actually mounted.
+  function updateFollowerState(envelope) {
+    const params = envelope?.params || {};
+    const threadId = readString(params.conversationId) || readString(params.conversation_id);
+    const clientId = readString(envelope?.sourceClientId);
+    if (!threadId
+      || !clientId
+      || clientId === ipc.clientId
+      || isLocallyOwnedThread(threadId)
+      || liveOwnerThreadIds.has(threadId)) {
+      return;
+    }
+
+    const followers = followerClientIdsByThreadId.get(threadId) || new Set();
+    if (params.following === true) {
+      rememberActiveThread(threadId);
+      followDesktopThread(threadId);
+      const wasUnfollowed = followers.size === 0;
+      followers.add(clientId);
+      followerClientIdsByThreadId.set(threadId, followers);
+      if (wasUnfollowed) {
+        onFollowerStateChanged?.(threadId, true);
+      }
+      return;
+    }
+
+    if (!followers.delete(clientId)) {
+      return;
+    }
+    if (followers.size === 0) {
+      followerClientIdsByThreadId.delete(threadId);
+      onFollowerStateChanged?.(threadId, false);
+    }
+  }
+
+  function removeFollowerClient(clientId) {
+    const normalizedClientId = readString(clientId);
+    if (!normalizedClientId) {
+      return;
+    }
+    for (const [threadId, followers] of followerClientIdsByThreadId) {
+      if (!followers.delete(normalizedClientId)) {
+        continue;
+      }
+      if (followers.size === 0) {
+        followerClientIdsByThreadId.delete(threadId);
+        onFollowerStateChanged?.(threadId, false);
+      }
+    }
+  }
+
+  function clearFollowerState() {
+    for (const threadId of followerClientIdsByThreadId.keys()) {
+      onFollowerStateChanged?.(threadId, false);
+    }
+    followerClientIdsByThreadId.clear();
+  }
+
   // The bridge's own live owner just claimed this thread's stream, so drop stale
   // Desktop state instead of hijacking future phone requests into Desktop IPC.
   function releaseDesktopThreadState(threadId) {
@@ -779,6 +942,7 @@ function createDesktopIpcActionFollower({
       activeThreadIds.delete(threadId);
     }
     liveOwnerThreadIds.add(threadId);
+    unfollowDesktopThread(threadId);
     ownershipProbeDeadlinesByThreadId.delete(threadId);
     pendingOwnershipProbeTokensByThreadId.delete(threadId);
     desktopOwnedByProbeThreadIds.delete(threadId);
@@ -809,6 +973,7 @@ function createDesktopIpcActionFollower({
       activeThreadIds.delete(threadId);
     }
     liveOwnerThreadIds.delete(threadId);
+    unfollowDesktopThread(threadId);
     ownershipProbeDeadlinesByThreadId.delete(threadId);
     pendingOwnershipProbeTokensByThreadId.delete(threadId);
     desktopOwnedByProbeThreadIds.delete(threadId);
@@ -1023,23 +1188,30 @@ function createDesktopIpcActionFollower({
   }
 
   function syncProjectedActions(threadId, actions) {
-    const nextRequestIds = new Set(actions.map((action) => action.id));
+    const nextRequestIds = new Set(actions.map((action) => requestIdKey(action.id)));
     for (const [requestId, route] of Array.from(pendingRoutesByRequestId.entries())) {
       if (route.threadId !== threadId || nextRequestIds.has(requestId)) {
         continue;
       }
 
       pendingRoutesByRequestId.delete(requestId);
-      sendApplicationResponse(JSON.stringify(projectedResolvedNotification(threadId, requestId)));
+      sendApplicationResponse(JSON.stringify(
+        projectedResolvedNotification(threadId, route.desktopRequestId)
+      ));
     }
 
     for (const action of actions) {
-      if (pendingRoutesByRequestId.has(action.id)) {
+      const requestId = requestIdKey(action.id);
+      if (!requestId || pendingRoutesByRequestId.has(requestId)) {
         continue;
       }
 
-      pendingRoutesByRequestId.set(action.id, {
-        requestId: action.id,
+      pendingRoutesByRequestId.set(requestId, {
+        requestId,
+        // Preserve the JSON-RPC id's original scalar type. Codex Desktop uses
+        // numeric ids for real requestUserInput calls, and its follower command
+        // must receive that same number rather than the phone-facing map key.
+        desktopRequestId: action.id,
         method: action.method,
         threadId,
       });
@@ -1097,7 +1269,7 @@ function createDesktopIpcActionFollower({
       canonicalHistoryThreadIds.add(threadId);
     }
     if (canonicalHistoryThreadIds.has(threadId)) {
-      if (isDesktopLiveTurnStateSnapshotRequest(message)) {
+      if (isThreadTurnStateProbeRequest(message)) {
         const liveState = boundedDesktopLiveStateForThread(threadId, rawState);
         sendApplicationResponse(JSON.stringify({
           id: message.id,
@@ -1150,21 +1322,6 @@ function createDesktopIpcActionFollower({
       },
     }));
     return true;
-  }
-
-  function isDesktopLiveTurnStateSnapshotRequest(message) {
-    if (readString(message?.method) !== "thread/turns/list"
-      || readString(message?.params?.cursor)
-      || message?.params?.remodexRequireCanonical === true) {
-      return false;
-    }
-    if (message?.params?.remodexTurnStateOnly === true) {
-      return true;
-    }
-    // Remodex iPhone 2.1 predates the explicit marker. Its running-state probe
-    // has this unique request shape; actual history pages use limits 1 and 5.
-    return Number(message?.params?.limit) === 8
-      && normalizeToken(readString(message?.params?.sortDirection) || "desc") === "desc";
   }
 
   function buildDesktopLiveTurnStateResult(turns) {
@@ -1381,7 +1538,8 @@ function createDesktopIpcActionFollower({
       }));
       emitNormalizedReviewOverlays(
         threadId,
-        normalizedLiveIndexesByThreadId.get(threadId)
+        normalizedLiveIndexesByThreadId.get(threadId),
+        liveState
       );
       emitDesktopSnapshotLifecycleTransition(threadId, liveState);
       for (const notification of bootstrapOutput.notifications || []) {
@@ -1400,7 +1558,8 @@ function createDesktopIpcActionFollower({
       emitDesktopSnapshotLifecycleTransition(threadId, liveState);
       emitNormalizedReviewOverlays(
         threadId,
-        normalizedLiveIndexesByThreadId.get(threadId)
+        normalizedLiveIndexesByThreadId.get(threadId),
+        liveState
       );
       conversationProjector.seed(threadId, liveState);
       rememberDesktopLiveProjection(threadId, liveState);
@@ -1413,7 +1572,8 @@ function createDesktopIpcActionFollower({
     }
     emitNormalizedReviewOverlays(
       threadId,
-      normalizedLiveIndexesByThreadId.get(threadId)
+      normalizedLiveIndexesByThreadId.get(threadId),
+      liveState
     );
     const output = conversationProjector.project(threadId, liveState);
     if (resumedAfterStaleYield || output.type === "fullReplace" || output.type === "baseline") {
@@ -1470,11 +1630,16 @@ function createDesktopIpcActionFollower({
     rememberDesktopLiveProjection(threadId, liveState);
   }
 
-  function emitNormalizedReviewOverlays(threadId, index) {
+  function emitNormalizedReviewOverlays(threadId, index, projectedState) {
     if (!index || !Array.isArray(index.pendingReviewOverlays)) {
       return;
     }
     const overlays = index.pendingReviewOverlays.splice(0);
+    const projectedTurnIds = new Set(
+      (Array.isArray(projectedState?.turns) ? projectedState.turns : [])
+        .map(turnIdOf)
+        .filter(Boolean)
+    );
     const fingerprints = normalizedReviewFingerprintsByThreadId.get(threadId) || new Map();
     for (const overlay of overlays) {
       // Reviews on turns in the projected live tail may also be emitted by
@@ -1489,6 +1654,16 @@ function createDesktopIpcActionFollower({
         || readString(item?.id).replace(/^automatic-approval-review:/, "");
       const status = readString(review?.status);
       if (!reviewId || !status || !item?.action) {
+        continue;
+      }
+      // Completed approved reviews are ordinary tool history. Replaying every
+      // normalized-history review after a bounded canonical read appends old
+      // rows at the phone's live tail, detached from their original disclosure.
+      // The projected tail still emits its approvals so they reconcile in the
+      // owning turn; non-approved outcomes remain global because they may need
+      // the user's attention.
+      if (normalizeToken(status) === "approved"
+        && !projectedTurnIds.has(readString(overlay.turnId))) {
         continue;
       }
       const fingerprint = createHash("sha256")
@@ -1586,7 +1761,34 @@ function createDesktopIpcActionFollower({
       settledTurn
     )));
     announcedBackgroundTurnsByThreadId.delete(threadId);
+    backgroundTurnReannouncedAtByThreadId.delete(threadId);
     return true;
+  }
+
+  // Re-sends the start of runs that are still in flight, so a phone that missed
+  // the original announcement (fresh app session, reconnect after the run began)
+  // gets its sidebar badge on the next sidebar refresh instead of only when the
+  // chat is opened. The phone treats a repeated start for the same turn as a
+  // no-op, and the identity marker keeps a phone that already saw it from
+  // treating this as a second run. Only worth doing while Desktop IPC is
+  // responsive: the matching completion arrives over the same link, so this
+  // cannot keep a phantom badge alive on its own.
+  function reannounceActiveBackgroundTurns() {
+    if (announcedBackgroundTurnsByThreadId.size === 0 || !hasResponsiveDesktopIpc()) {
+      return;
+    }
+
+    const reannouncedAt = now();
+    for (const [threadId, announcedTurn] of announcedBackgroundTurnsByThreadId) {
+      const lastReannouncedAt = backgroundTurnReannouncedAtByThreadId.get(threadId) || 0;
+      if (reannouncedAt - lastReannouncedAt < BACKGROUND_TURN_REANNOUNCE_MIN_INTERVAL_MS) {
+        continue;
+      }
+      backgroundTurnReannouncedAtByThreadId.set(threadId, reannouncedAt);
+      sendApplicationResponse(JSON.stringify(notificationWithTurnIdentityContinuity(
+        backgroundTurnLifecycleNotification("turn/started", threadId, announcedTurn)
+      )));
+    }
   }
 
   function syncThreadArchiveBroadcast(envelope) {
@@ -1651,7 +1853,7 @@ function createDesktopIpcActionFollower({
       .then(() => {
         pendingRoutesByRequestId.delete(route.requestId);
         sendApplicationResponse(JSON.stringify(
-          projectedResolvedNotification(route.threadId, route.requestId)
+          projectedResolvedNotification(route.threadId, route.desktopRequestId)
         ));
       })
       .catch((error) => {
@@ -2051,21 +2253,37 @@ function createDesktopIpcClient({
   onConnected,
   onDisconnect,
 }) {
+  const resolveSocketPaths = toSocketPathCandidatesResolver(socketPath);
   let socket = null;
   let clientId = "";
   let isConnecting = false;
   let lastActivityAt = 0;
-  let readBuffer = Buffer.alloc(0);
+  let remainingSocketPaths = [];
   const pendingRequests = new Map();
   const pendingDiscoveries = new Map();
+  const frameReader = createFrameReader({
+    onFrame: (envelope) => dispatchEnvelope(envelope),
+    onOverflow: () => close(),
+  });
 
   function ensureConnected() {
     if (socket || isConnecting) {
       return;
     }
 
+    remainingSocketPaths = resolveSocketPaths();
+    connectNextSocket();
+  }
+
+  function connectNextSocket() {
+    const nextSocketPath = remainingSocketPaths.shift();
+    if (!nextSocketPath) {
+      isConnecting = false;
+      return;
+    }
+
     isConnecting = true;
-    const nextSocket = netModule.createConnection(socketPath);
+    const nextSocket = netModule.createConnection(nextSocketPath);
     socket = nextSocket;
 
     nextSocket.on("connect", () => {
@@ -2081,12 +2299,27 @@ function createDesktopIpcClient({
         });
     });
     nextSocket.on("data", handleData);
-    nextSocket.on("close", handleClose);
+    nextSocket.on("close", () => handleClose(nextSocket));
     nextSocket.on("error", (error) => {
+      if ((error?.code === "ENOENT" || error?.code === "ECONNREFUSED")
+          && remainingSocketPaths.length > 0) {
+        retryNextSocket(nextSocket);
+        return;
+      }
       if (error?.code !== "ENOENT" && error?.code !== "ECONNREFUSED") {
         console.warn(`${logPrefix} desktop IPC connection failed: ${error.message}`);
       }
     });
+  }
+
+  function retryNextSocket(failedSocket) {
+    if (socket === failedSocket) {
+      socket = null;
+    }
+    isConnecting = false;
+    frameReader.reset();
+    failedSocket.destroy();
+    connectNextSocket();
   }
 
   function sendRequest(method, params) {
@@ -2096,14 +2329,13 @@ function createDesktopIpcClient({
     }
 
     const requestId = `remodex-${now().toString(36)}-${Math.random().toString(16).slice(2)}`;
-    const envelope = {
-      type: "request",
+    const envelope = buildIpcRequestEnvelope({
       requestId,
-      sourceClientId: method === "initialize" ? "initializing-client" : clientId || "remodex-bridge",
-      version: METHOD_VERSION_BY_NAME.get(method) || 1,
       method,
-      params: params || {},
-    };
+      params,
+      clientId,
+      initializing: method === "initialize",
+    });
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -2165,28 +2397,30 @@ function createDesktopIpcClient({
     });
   }
 
+  function sendBroadcast(method, params, { targetClientIds } = {}) {
+    ensureConnected();
+    if (!socket || socket.destroyed || !clientId) {
+      return false;
+    }
+    const envelope = {
+      type: "broadcast",
+      method,
+      sourceClientId: clientId,
+      params: params || {},
+      version: METHOD_VERSION_BY_NAME.get(method) || 1,
+    };
+    if (Array.isArray(targetClientIds) && targetClientIds.length > 0) {
+      envelope.targetClientIds = targetClientIds;
+    }
+    writeEnvelope(envelope);
+    return true;
+  }
+
   function handleData(chunk) {
     if (chunk.length > 0) {
       lastActivityAt = now();
     }
-    readBuffer = Buffer.concat([readBuffer, chunk]);
-    while (readBuffer.length >= FRAME_HEADER_BYTES) {
-      const frameLength = readBuffer.readUInt32LE(0);
-      if (frameLength > MAX_FRAME_BYTES) {
-        close();
-        return;
-      }
-      if (readBuffer.length < FRAME_HEADER_BYTES + frameLength) {
-        return;
-      }
-
-      const payload = readBuffer.slice(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + frameLength).toString("utf8");
-      readBuffer = readBuffer.slice(FRAME_HEADER_BYTES + frameLength);
-      const envelope = safeParseJSON(payload);
-      if (envelope) {
-        dispatchEnvelope(envelope);
-      }
-    }
+    frameReader.push(chunk);
   }
 
   function dispatchEnvelope(envelope) {
@@ -2240,12 +2474,15 @@ function createDesktopIpcClient({
     onEnvelope(envelope);
   }
 
-  function handleClose() {
+  function handleClose(closedSocket) {
+    if (socket && socket !== closedSocket) {
+      return;
+    }
     socket = null;
     clientId = "";
     isConnecting = false;
     lastActivityAt = 0;
-    readBuffer = Buffer.alloc(0);
+    frameReader.reset();
     for (const waiter of pendingRequests.values()) {
       clearTimeout(waiter.timeout);
       waiter.reject(new Error("Desktop IPC connection closed."));
@@ -2279,6 +2516,9 @@ function createDesktopIpcClient({
   }
 
   return {
+    get clientId() {
+      return clientId;
+    },
     ensureConnected,
     isConnected() {
       return Boolean(socket && !socket.destroyed && clientId);
@@ -2290,6 +2530,7 @@ function createDesktopIpcClient({
     },
     sendRequest,
     sendDiscoveryRequest,
+    sendBroadcast,
     close,
   };
 }
@@ -2310,7 +2551,7 @@ function desktopFollowerPayloadForResponse(route, responseMessage) {
       method,
       params: {
         conversationId: route.threadId,
-        requestId: route.requestId,
+        requestId: route.desktopRequestId ?? route.requestId,
         response: {
           answers,
         },
@@ -2488,7 +2729,9 @@ function projectPendingDesktopAction(threadId, request) {
   }
 
   return {
-    id: requestId,
+    // Keep the original JSON-RPC scalar for the relay request and the Desktop
+    // follower reply. requestIdKey is only an internal map/deduplication key.
+    id: request.id,
     method,
     params: {
       ...params,

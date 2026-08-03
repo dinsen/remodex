@@ -1,13 +1,20 @@
 // FILE: desktop-ipc-shared.test.js
-// Purpose: Unit tests for the shared injected-context filters applied to mirrored user items.
+// Purpose: Unit tests for the shared desktop IPC primitives (injected-context filters, socket path resolution).
 // Layer: Unit test
 // Exports: node:test suite
-// Depends on: node:test, ../src/desktop-ipc-shared
+// Depends on: node:test, node:fs, node:net, node:os, node:path, ../src/desktop-ipc-shared
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
 const {
   isContextualUserText,
+  isThreadTurnStateProbeRequest,
+  resolveDefaultIpcSocketPath,
+  resolveIpcSocketPathCandidates,
   responseItemMessageText,
   sanitizeUserInputEntries,
   sanitizeUserRoleItem,
@@ -53,6 +60,51 @@ test("filters AGENTS.md instructions concatenated with registered context fragme
     assert.equal(isContextualUserText(text), true, suffix);
     assert.equal(visibleUserPromptText(text), "", suffix);
   }
+});
+
+test("filters a desktop opener that chains several injected fragments", () => {
+  // Verbatim shape of the first user item Codex Desktop writes for a new
+  // thread: the blob opens with one fragment kind and closes with another, so
+  // a single start/end pair check leaves the whole preamble visible.
+  const text = [
+    "<recommended_plugins>",
+    "Here is a list of plugins that are available but not installed.",
+    "",
+    "- Figma (figma@openai-curated-remote)",
+    "- Slack (slack@openai-curated-remote)",
+    "</recommended_plugins>",
+    "# AGENTS.md instructions for /Users/me/proj",
+    "",
+    "<INSTRUCTIONS>",
+    "## Goal Mode",
+    "</INSTRUCTIONS>",
+    "<environment_context>",
+    "  <cwd>/Users/me/proj</cwd>",
+    "</environment_context>",
+  ].join("\n");
+
+  assert.equal(isContextualUserText(text), true);
+  assert.equal(visibleUserPromptText(text), "");
+});
+
+test("keeps the real request that trails an injected preamble", () => {
+  const preamble = "<recommended_plugins>\n- Figma (figma@openai-curated-remote)\n</recommended_plugins>\n"
+    + "<environment_context>\n  <cwd>/Users/me/proj</cwd>\n</environment_context>\n\n";
+
+  assert.equal(isContextualUserText(`${preamble}check the 0.6.1 release`), false);
+  assert.equal(visibleUserPromptText(`${preamble}check the 0.6.1 release`), "check the 0.6.1 release");
+  assert.equal(
+    visibleUserPromptText("<skill>\n<name>release-check</name>\n</skill>\nrun it for 0.6.1"),
+    "run it for 0.6.1"
+  );
+});
+
+test("leaves an unterminated reserved marker visible instead of swallowing the message", () => {
+  // Only bounded fragments are runtime-owned. A prompt that merely opens with
+  // reserved markup is still the user's text.
+  const text = "<environment_context> is this tag reserved? I want to use it in my docs";
+  assert.equal(isContextualUserText(text), false);
+  assert.equal(visibleUserPromptText(text), text);
 });
 
 test("does not expose a request delimiter that appears inside hidden context", () => {
@@ -264,4 +316,100 @@ test("drops fully contextual user items but preserves attachment-only items", ()
   assert.deepEqual(sanitizeUserRoleItem(attachment)?.content, [
     { type: "input_image", image_url: "data:image/png;base64,AAAA" },
   ]);
+});
+
+test("turn-state probe detection matches the marker and the legacy probe shape only", () => {
+  const probe = (params) => isThreadTurnStateProbeRequest({ method: "thread/turns/list", params });
+  assert.equal(probe({ threadId: "t", remodexTurnStateOnly: true }), true);
+  assert.equal(probe({ threadId: "t", limit: 8, sortDirection: "desc" }), true);
+  assert.equal(probe({ threadId: "t", limit: 8 }), true);
+  assert.equal(probe({ threadId: "t", limit: 5, sortDirection: "desc" }), false);
+  assert.equal(probe({ threadId: "t", limit: 8, sortDirection: "asc" }), false);
+  assert.equal(probe({ threadId: "t", limit: 8, sortDirection: "desc", cursor: "page-2" }), false);
+  assert.equal(probe({ threadId: "t", limit: 8, remodexRequireCanonical: true }), false);
+  // History pages and other methods never look like the probe.
+  assert.equal(
+    isThreadTurnStateProbeRequest({ method: "thread/read", params: { threadId: "t", limit: 8 } }),
+    false
+  );
+});
+
+test("filters an AGENTS.md header carrying several instruction blocks", () => {
+  // Nested AGENTS.md files chain one <INSTRUCTIONS> block per file under a
+  // single header; stopping at the first close leaked the rest into the bubble.
+  const preamble = [
+    "# AGENTS.md instructions for /Users/me/proj",
+    "",
+    "<INSTRUCTIONS>",
+    "root rules",
+    "</INSTRUCTIONS>",
+    "<INSTRUCTIONS>",
+    "nested package rules",
+    "</INSTRUCTIONS>",
+  ].join("\n");
+
+  assert.equal(isContextualUserText(preamble), true);
+  assert.equal(visibleUserPromptText(preamble), "");
+  assert.equal(visibleUserPromptText(`${preamble}\n\nship 0.6.1`), "ship 0.6.1");
+});
+
+// The Codex bus moved from the temp directory into the Codex home directory,
+// and both locations are still in the wild.
+function withIsolatedIpcEnvironment(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-ipc-env-"));
+  const codexHome = path.join(root, "codex-home");
+  const tempDir = path.join(root, "tmp");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  const previous = { CODEX_HOME: process.env.CODEX_HOME, TMPDIR: process.env.TMPDIR };
+  process.env.CODEX_HOME = codexHome;
+  process.env.TMPDIR = tempDir;
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const [codexHomeSocket, legacySocket] = resolveIpcSocketPathCandidates();
+  return { codexHomeSocket, legacySocket };
+}
+
+async function listenOnSocket(t, socketPath) {
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+}
+
+test("resolves the Codex home socket before the legacy temp socket", { skip: process.platform === "win32" }, (t) => {
+  const { codexHomeSocket, legacySocket } = withIsolatedIpcEnvironment(t);
+
+  assert.equal(codexHomeSocket, path.join(process.env.CODEX_HOME, "ipc", "ipc.sock"));
+  assert.equal(legacySocket, path.join(os.tmpdir(), "codex-ipc", `ipc-${process.getuid()}.sock`));
+  // With no bus running, the fallback router listens on the current location so
+  // a desktop starting later finds it.
+  assert.equal(resolveDefaultIpcSocketPath(), codexHomeSocket);
+});
+
+test("joins the legacy temp socket when only that bus is listening", { skip: process.platform === "win32" }, async (t) => {
+  const { legacySocket } = withIsolatedIpcEnvironment(t);
+
+  await listenOnSocket(t, legacySocket);
+
+  assert.equal(resolveDefaultIpcSocketPath(), legacySocket);
+});
+
+test("prefers the Codex home bus when both sockets are listening", { skip: process.platform === "win32" }, async (t) => {
+  const { codexHomeSocket, legacySocket } = withIsolatedIpcEnvironment(t);
+
+  await listenOnSocket(t, legacySocket);
+  await listenOnSocket(t, codexHomeSocket);
+
+  assert.equal(resolveDefaultIpcSocketPath(), codexHomeSocket);
 });

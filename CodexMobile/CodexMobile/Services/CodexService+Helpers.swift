@@ -120,6 +120,8 @@ extension CodexService {
             localMetadata: existing.metadata
         )
         if merged.forkedFromThreadId == nil { merged.forkedFromThreadId = existing.forkedFromThreadId }
+        if merged.worktreeOriginPath == nil { merged.worktreeOriginPath = existing.worktreeOriginPath }
+        if merged.threadSource == nil { merged.threadSource = existing.threadSource }
         if merged.parentThreadId == nil { merged.parentThreadId = existing.parentThreadId }
         if merged.agentId == nil { merged.agentId = existing.agentId }
         if merged.agentNickname == nil { merged.agentNickname = existing.agentNickname }
@@ -563,6 +565,9 @@ extension CodexService {
                 createdAt: existing?.createdAt ?? placeholderTimestamp,
                 updatedAt: existing?.updatedAt ?? placeholderTimestamp,
                 cwd: existing?.cwd ?? parentThread?.cwd,
+                // Inherited with the cwd so a subagent of a worktree chat stays in the same
+                // sidebar group as its parent instead of splitting off into its own project.
+                worktreeOriginPath: existing?.worktreeOriginPath ?? parentThread?.worktreeOriginPath,
                 metadata: existing?.metadata,
                 parentThreadId: parentThreadId,
                 agentId: agent.agentId,

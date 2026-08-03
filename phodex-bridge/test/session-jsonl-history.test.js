@@ -39,6 +39,8 @@ test("parseSessionJsonlMetadata reads desktop thread cwd", () => {
   assert.deepEqual(parseSessionJsonlMetadata(content), {
     threadId: "thread-jsonl-meta",
     cwd: "/Users/test/Project",
+    forkedFromId: "",
+    threadSource: "",
   });
 });
 
@@ -375,6 +377,108 @@ test("bounded JSONL history rejects a tail that does not contain a complete turn
   });
 
   assert.equal(page, null);
+});
+
+test("parseSessionJsonlTurns hides the injected preamble Codex Desktop writes before the prompt", () => {
+  // Regression: the desktop opener packs several injected fragments into one
+  // user response item, so the whole preamble became the thread's first bubble
+  // and pushed the real prompt down.
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-25T00:39:28.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-opener" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:39:30.000Z",
+      type: "response_item",
+      payload: {
+        id: "injected-preamble",
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "<recommended_plugins>\n- Figma (figma@openai-curated-remote)\n</recommended_plugins>",
+          },
+          {
+            type: "input_text",
+            text: "# AGENTS.md instructions for /Users/me/proj\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>",
+          },
+          {
+            type: "input_text",
+            text: "<environment_context>\n  <cwd>/Users/me/proj</cwd>\n</environment_context>",
+          },
+        ],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-opener" },
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:39:30.100Z",
+      type: "response_item",
+      payload: {
+        id: "real-prompt",
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "check the 0.6.1 release" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-opener" },
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:41:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: "turn-opener" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-opener" });
+  const serialized = JSON.stringify(turns);
+
+  assert.equal(serialized.includes("recommended_plugins"), false);
+  assert.equal(serialized.includes("AGENTS.md instructions"), false);
+  assert.equal(serialized.includes("environment_context"), false);
+  const userItems = turns[0].items.filter((item) => item.role === "user");
+  assert.equal(userItems.length, 1);
+  assert.equal(userItems[0].content[0].text, "check the 0.6.1 release");
+});
+
+test("parseSessionJsonlTurns keeps the real request when it shares an item with injected context", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-07-25T00:39:28.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-mixed" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:39:30.000Z",
+      type: "response_item",
+      payload: {
+        id: "mixed-opener",
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "<recommended_plugins>\n- Figma (figma@openai-curated-remote)\n</recommended_plugins>",
+          },
+          { type: "input_text", text: "check the 0.6.1 release" },
+        ],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-mixed" },
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-25T00:41:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: "turn-mixed" },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-mixed" });
+  const userItems = turns[0].items.filter((item) => item.role === "user");
+
+  assert.equal(JSON.stringify(turns).includes("recommended_plugins"), false);
+  assert.equal(userItems.length, 1);
+  assert.deepEqual(userItems[0].content, [{ type: "input_text", text: "check the 0.6.1 release" }]);
 });
 
 test("parseSessionJsonlTurns keeps the active turn when a parallel sibling turn completes", () => {
@@ -1259,6 +1363,138 @@ test("parseSessionJsonlTurns adds readable messages for generic tool calls", () 
       toolName: "view_image",
     },
   ]);
+});
+
+test("parseSessionJsonlTurns unwraps exec orchestration and suppresses cell waits", () => {
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:06.000Z",
+      type: "session_meta",
+      payload: { id: "thread-wrapped-command", cwd: "/repo" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:07.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-wrapped-command" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:08.000Z",
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        name: "exec",
+        call_id: "call-outer-exec",
+        status: "completed",
+        input: [
+          "const result = await tools.exec_command({",
+          "  cmd: \"gh run view 30709849174 --json status,conclusion\",",
+          "  workdir: \"/repo\",",
+          "});",
+          "text(result.output);",
+        ].join("\n"),
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:09.000Z",
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call_output",
+        call_id: "call-outer-exec",
+        output: [{ type: "input_text", text: "Script completed\nOutput:\ncompleted" }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:10.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "wait",
+        call_id: "call-cell-wait",
+        arguments: JSON.stringify({ cell_id: "382", yield_time_ms: 30000 }),
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:11.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call-cell-wait",
+        output: "completed",
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-wrapped-command" });
+  const visibleTools = turns[0].items.filter((item) => (
+    item.type === "commandExecution" || item.type === "tool_call"
+  ));
+
+  assert.deepEqual(visibleTools.map((item) => ({
+    type: item.type,
+    name: item.name,
+    command: item.command,
+    cwd: item.cwd,
+  })), [{
+    type: "commandExecution",
+    name: "exec_command",
+    command: "gh run view 30709849174 --json status,conclusion",
+    cwd: "/repo",
+  }]);
+  assert.equal(turns[0].items.some((item) => item.name === "exec" || item.name === "wait"), false);
+});
+
+test("parseSessionJsonlTurns restores wrapped terminal, patch, and plan activity", () => {
+  const patch = "*** Begin Patch\n*** Update File: app.js\n@@\n-old\n+new\n*** End Patch";
+  const content = [
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:07.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-wrapped-tools" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:08.000Z",
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        name: "exec",
+        call_id: "call-terminal",
+        status: "completed",
+        input: "const result = await tools.write_stdin({session_id: 33518, chars: \"\"}); text(result.output);",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-01T17:24:09.000Z",
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        name: "exec",
+        call_id: "call-patch-and-plan",
+        status: "completed",
+        input: [
+          `const patch = ${JSON.stringify(patch)};`,
+          "text(await tools.apply_patch(patch));",
+          "text(await tools.update_plan({explanation: \"Finished\", plan:[",
+          "  {step: \"Fix projection\", status: \"completed\"},",
+          "]}));",
+        ].join("\n"),
+      },
+    }),
+  ].join("\n");
+
+  const turns = parseSessionJsonlTurns(content, { threadId: "thread-wrapped-tools" });
+  const items = turns[0].items;
+
+  assert.equal(items.some((item) => (
+    item.type === "tool_call"
+      && item.tool_name === "write_stdin"
+      && item.message === "Write to terminal"
+  )), true);
+  assert.equal(items.some((item) => item.type === "fileChange" && item.changes?.[0]?.path === "app.js"), true);
+  assert.equal(items.some((item) => (
+    item.type === "plan"
+      && item.explanation === "Finished"
+      && item.plan?.[0]?.step === "Fix projection"
+  )), true);
 });
 
 test("parseSessionJsonlTurns restores view_image tool output as imageView without inline data", () => {

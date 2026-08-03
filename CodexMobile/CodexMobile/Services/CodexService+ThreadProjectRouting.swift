@@ -73,7 +73,7 @@ extension CodexService {
             threadId: normalizedThreadId,
             projectPath: normalizedProjectPath
         )
-        if CodexThread.projectIconSystemName(for: normalizedProjectPath) == "arrow.triangle.branch" {
+        if CodexThread.isManagedWorktreePath(normalizedProjectPath) {
             rememberAssociatedManagedWorktreePath(normalizedProjectPath, for: normalizedThreadId)
         }
 
@@ -96,7 +96,7 @@ extension CodexService {
                 projectPath: resumedThread?.normalizedProjectPath
             )
         } catch {
-            if shouldAllowProjectRebindWithoutResume(error) {
+            if isMissingRolloutError(error) {
                 // Keep the local worktree switch even if the runtime has not materialized a rollout yet.
                 // The immediate sync is safe because thread/read and thread/resume server merges
                 // are both wrapped by applyingAuthoritativeProjectPath(...) until the runtime
@@ -149,6 +149,23 @@ extension CodexService {
             associatedManagedWorktreePathByThreadID.removeValue(forKey: normalizedThreadId)
         }
         persistAssociatedManagedWorktreePaths()
+    }
+
+    // The bridge resolves worktree ownership on the next thread list, but the chat that just moved
+    // into a fresh worktree is on screen now: record the checkout it came from so the sidebar keeps
+    // it under that project immediately instead of flashing a separate worktree project row.
+    func rememberWorktreeOriginPath(_ originPath: String?, forThreadId threadId: String) {
+        guard let normalizedThreadId = normalizedInterruptIdentifier(threadId) ?? normalizedThreadIdValue(threadId),
+              let normalizedOriginPath = normalizedStoredProjectPath(originPath),
+              !CodexThread.isManagedWorktreePath(normalizedOriginPath),
+              var currentThread = thread(for: normalizedThreadId),
+              currentThread.isManagedWorktreeProject,
+              currentThread.worktreeOriginPath != normalizedOriginPath else {
+            return
+        }
+
+        currentThread.worktreeOriginPath = normalizedOriginPath
+        upsertThread(currentThread)
     }
 
     func currentAuthoritativeProjectPath(for threadId: String?) -> String? {
@@ -211,7 +228,7 @@ extension CodexService {
         let canonicalCurrentPath = canonicalRepoIdentifier(for: currentProjectPath) ?? currentProjectPath
         let canonicalObservedPath = canonicalRepoIdentifier(for: observedProjectPath) ?? observedProjectPath
         guard canonicalCurrentPath == canonicalObservedPath,
-              CodexThread.projectIconSystemName(for: canonicalObservedPath) == "arrow.triangle.branch" else {
+              CodexThread.isManagedWorktreePath(canonicalObservedPath) else {
             return false
         }
 
@@ -231,20 +248,6 @@ extension CodexService {
         return true
     }
 
-    // Some local runtimes reject the immediate worktree rebind until a rollout exists
-    // for the new cwd. Keep the local project switch instead of bouncing the user back.
-    func shouldAllowProjectRebindWithoutResume(_ error: Error) -> Bool {
-        let message: String
-        if let serviceError = error as? CodexServiceError,
-           case .rpcError(let rpcError) = serviceError {
-            message = rpcError.message.lowercased()
-        } else {
-            message = error.localizedDescription.lowercased()
-        }
-
-        return message.contains("no rollout found")
-            || message.contains("no rollout file found")
-    }
 }
 
 private extension CodexService {

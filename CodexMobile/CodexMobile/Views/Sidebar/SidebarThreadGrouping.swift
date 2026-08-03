@@ -98,6 +98,7 @@ enum SidebarThreadGrouping {
         projectlessRootPaths: [String] = [],
         projectSource: SidebarProjectSource = .recentThreadProjects,
         configuredProjectChoices: [SidebarProjectChoice] = [],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:],
         now _: Date = Date(),
         calendar _: Calendar = .current
     ) -> [SidebarThreadGroup] {
@@ -127,9 +128,14 @@ enum SidebarThreadGrouping {
                 from: projectThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
                 projectSource: projectSource,
-                configuredProjectChoices: configuredProjectChoices
+                configuredProjectChoices: configuredProjectChoices,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
             ))
-            if let chatGroup = makeRootlessChatGroup(from: chatThreads, excludingPinnedThreadIDs: pinnedThreadIDSet) {
+            if let chatGroup = makeRootlessChatGroup(
+                from: chatThreads,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ) {
                 groups.append(chatGroup)
             }
         case .projects:
@@ -137,10 +143,15 @@ enum SidebarThreadGrouping {
                 from: scopedThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
                 projectSource: projectSource,
-                configuredProjectChoices: configuredProjectChoices
+                configuredProjectChoices: configuredProjectChoices,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
             ))
         case .chats:
-            if let chatGroup = makeRootlessChatGroup(from: scopedThreads, excludingPinnedThreadIDs: pinnedThreadIDSet) {
+            if let chatGroup = makeRootlessChatGroup(
+                from: scopedThreads,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ) {
                 groups.append(chatGroup)
             }
         }
@@ -228,16 +239,29 @@ enum SidebarThreadGrouping {
         ).map(\.id)
     }
 
-    private static func makeProjectGroup(projectKey: String, threads: [CodexThread]) -> SidebarThreadGroup {
-        let sortedThreads = sortThreadsByRecentActivity(threads)
-        let representativeThread = sortedThreads.first
-        let sortDate = representativeThread?.updatedAt ?? representativeThread?.createdAt ?? .distantPast
+    // The group speaks for the project, not for whichever chat happens to sort first: a worktree
+    // chat at the top must still show the source project's name, icon, and new-chat target.
+    private static func makeProjectGroup(
+        projectKey: String,
+        projectPath: String?,
+        threads: [CodexThread],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+    ) -> SidebarThreadGroup {
+        let sortedThreads = sortThreadsByRecentActivity(
+            threads,
+            runBadgeStateByThreadID: runBadgeStateByThreadID
+        )
+        // The first thread can be an old chat lifted by its run state, so the group's
+        // recency comes from the newest activity anywhere in the group instead.
+        let sortDate = threads
+            .compactMap { $0.updatedAt ?? $0.createdAt }
+            .max() ?? .distantPast
         return SidebarThreadGroup(
             id: "project:\(projectKey)",
-            label: representativeThread?.projectDisplayName ?? CodexThread.noProjectDisplayName,
+            label: CodexThread.projectDisplayLabel(for: projectPath),
             kind: .project,
             sortDate: sortDate,
-            projectPath: representativeThread?.normalizedProjectPath,
+            projectPath: projectPath,
             threads: sortedThreads
         )
     }
@@ -246,15 +270,21 @@ enum SidebarThreadGrouping {
         projectPath: String,
         label: String,
         sortDate: Date,
-        threads: [CodexThread]
+        threads: [CodexThread],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
     ) -> SidebarThreadGroup {
-        let sortedThreads = sortThreadsByRecentActivity(threads)
-        let latestThread = sortedThreads.first
+        let sortedThreads = sortThreadsByRecentActivity(
+            threads,
+            runBadgeStateByThreadID: runBadgeStateByThreadID
+        )
+        let latestThreadDate = threads
+            .compactMap { $0.updatedAt ?? $0.createdAt }
+            .max()
         return SidebarThreadGroup(
             id: projectGroupID(forProjectPath: projectPath),
             label: configuredProjectLabel(label, projectPath: projectPath),
             kind: .project,
-            sortDate: latestThread?.updatedAt ?? latestThread?.createdAt ?? sortDate,
+            sortDate: latestThreadDate ?? sortDate,
             projectPath: projectPath,
             threads: sortedThreads,
             includesDescendantProjectPaths: true
@@ -263,13 +293,17 @@ enum SidebarThreadGrouping {
 
     private static func makeRootlessChatGroup(
         from threads: [CodexThread],
-        excludingPinnedThreadIDs pinnedThreadIDs: Set<String>
+        excludingPinnedThreadIDs pinnedThreadIDs: Set<String>,
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
     ) -> SidebarThreadGroup? {
         let liveThreads = threads.filter {
             $0.syncState != .archivedLocal && !pinnedThreadIDs.contains($0.id)
         }
-        let sortedThreads = sortThreadsByRecentActivity(liveThreads)
-        guard let firstThread = sortedThreads.first else {
+        let sortedThreads = sortThreadsByRecentActivity(
+            liveThreads,
+            runBadgeStateByThreadID: runBadgeStateByThreadID
+        )
+        guard !sortedThreads.isEmpty else {
             return nil
         }
 
@@ -277,7 +311,9 @@ enum SidebarThreadGrouping {
             id: "chats:rootless",
             label: "Chats",
             kind: .chat,
-            sortDate: firstThread.updatedAt ?? firstThread.createdAt ?? .distantPast,
+            sortDate: liveThreads
+                .compactMap { $0.updatedAt ?? $0.createdAt }
+                .max() ?? .distantPast,
             projectPath: nil,
             threads: sortedThreads
         )
@@ -407,25 +443,31 @@ enum SidebarThreadGrouping {
         from threads: [CodexThread],
         excludingPinnedThreadIDs pinnedThreadIDs: Set<String> = [],
         projectSource: SidebarProjectSource = .recentThreadProjects,
-        configuredProjectChoices: [SidebarProjectChoice] = []
+        configuredProjectChoices: [SidebarProjectChoice] = [],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:]
     ) -> [SidebarThreadGroup] {
         var liveThreadsByProject: [String: [CodexThread]] = [:]
+        var projectPathByGroupKey: [String: String] = [:]
         let configuredProjectScopes = normalizedConfiguredProjectScopes(configuredProjectChoices)
 
         for thread in threads where thread.syncState != .archivedLocal {
             guard !pinnedThreadIDs.contains(thread.id) else {
                 continue
             }
+
             if projectSource == .configuredProjects {
                 guard let configuredProjectScope = configuredProjectScope(
-                    containing: thread.projectKey,
+                    containing: thread.projectGroupKey,
                     scopes: configuredProjectScopes
                 ) else {
                     continue
                 }
                 liveThreadsByProject[configuredProjectScope.projectPath, default: []].append(thread)
             } else {
-                liveThreadsByProject[thread.projectKey, default: []].append(thread)
+                liveThreadsByProject[thread.projectGroupKey, default: []].append(thread)
+                if let projectGroupPath = thread.projectGroupPath {
+                    projectPathByGroupKey[thread.projectGroupKey] = projectGroupPath
+                }
             }
         }
 
@@ -439,13 +481,19 @@ enum SidebarThreadGrouping {
                     projectPath: scope.projectPath,
                     label: scope.choice.label,
                     sortDate: scope.choice.sortDate,
-                    threads: projectThreads
+                    threads: projectThreads,
+                    runBadgeStateByThreadID: runBadgeStateByThreadID
                 )
                 return (group.id, group)
             })
         } else {
             groupsByID = Dictionary(uniqueKeysWithValues: liveThreadsByProject.map { projectKey, projectThreads in
-                let group = makeProjectGroup(projectKey: projectKey, threads: projectThreads)
+                let group = makeProjectGroup(
+                    projectKey: projectKey,
+                    projectPath: projectPathByGroupKey[projectKey],
+                    threads: projectThreads,
+                    runBadgeStateByThreadID: runBadgeStateByThreadID
+                )
                 return (group.id, group)
             })
         }
@@ -483,12 +531,12 @@ enum SidebarThreadGrouping {
                     return lhsOrder < rhsOrder
                 }
 
-                return compareProjectGroupsByRecentActivity(lhs, rhs)
+                return compareProjectGroupsByRecentActivity(lhs, rhs, runBadgeStateByThreadID: runBadgeStateByThreadID)
             }
         }
 
         return groupsByID.values.sorted { lhs, rhs in
-            compareProjectGroupsByRecentActivity(lhs, rhs)
+            compareProjectGroupsByRecentActivity(lhs, rhs, runBadgeStateByThreadID: runBadgeStateByThreadID)
         }
     }
 
@@ -567,7 +615,20 @@ enum SidebarThreadGrouping {
         }
     }
 
-    private static func compareProjectGroupsByRecentActivity(_ lhs: SidebarThreadGroup, _ rhs: SidebarThreadGroup) -> Bool {
+    private static func compareProjectGroupsByRecentActivity(
+        _ lhs: SidebarThreadGroup,
+        _ rhs: SidebarThreadGroup,
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:]
+    ) -> Bool {
+        // A project whose chat is running (or waiting on the user) outranks purely
+        // newer projects: threads are already tier-sorted, so each group's urgency
+        // is whatever its first thread carries.
+        let lhsTier = sidebarActivityTier(of: lhs.threads.first, in: runBadgeStateByThreadID)
+        let rhsTier = sidebarActivityTier(of: rhs.threads.first, in: runBadgeStateByThreadID)
+        if lhsTier != rhsTier {
+            return lhsTier < rhsTier
+        }
+
         if lhs.sortDate != rhs.sortDate {
             return lhs.sortDate > rhs.sortDate
         }
@@ -586,7 +647,7 @@ enum SidebarThreadGrouping {
         guard group.includesDescendantProjectPaths,
               let projectPath = group.projectPath,
               let normalizedProjectPath = CodexThread.normalizedFilesystemProjectPath(projectPath),
-              let normalizedThreadPath = CodexThread.normalizedFilesystemProjectPath(thread.projectKey) else {
+              let normalizedThreadPath = CodexThread.normalizedFilesystemProjectPath(thread.projectGroupPath) else {
             return projectGroupID(for: thread) == group.id
         }
 
@@ -620,7 +681,7 @@ enum SidebarThreadGrouping {
     }
 
     private static func projectGroupID(for thread: CodexThread) -> String {
-        projectGroupID(forProjectPath: thread.projectKey)
+        "project:\(thread.projectGroupKey)"
     }
 
     private static func codexManagedWorktreeTailComponents(_ components: [String]) -> [String]? {
@@ -706,14 +767,45 @@ enum SidebarThreadGrouping {
         }
     }
 
-    private static func sortThreadsByRecentActivity(_ threads: [CodexThread]) -> [CodexThread] {
+    private static func sortThreadsByRecentActivity(
+        _ threads: [CodexThread],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:]
+    ) -> [CodexThread] {
         threads.sorted { lhs, rhs in
+            // Recency alone buries the chats the user cares about most: an orchestrating
+            // run can sit idle for an hour while the worktree runs it spawned keep
+            // writing, so the still-running chat would sink below its own children.
+            let lhsTier = sidebarActivityTier(of: lhs, in: runBadgeStateByThreadID)
+            let rhsTier = sidebarActivityTier(of: rhs, in: runBadgeStateByThreadID)
+            if lhsTier != rhsTier {
+                return lhsTier < rhsTier
+            }
             let lhsDate = lhs.updatedAt ?? lhs.createdAt ?? .distantPast
             let rhsDate = rhs.updatedAt ?? rhs.createdAt ?? .distantPast
             if lhsDate != rhsDate {
                 return lhsDate > rhsDate
             }
             return lhs.id < rhs.id
+        }
+    }
+
+    // Ordering tier for a sidebar row: active work first, unread outcomes next,
+    // everything else (including ambient goal states) by recency alone.
+    private static func sidebarActivityTier(
+        of thread: CodexThread?,
+        in runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+    ) -> Int {
+        guard let thread, let badgeState = runBadgeStateByThreadID[thread.id] else {
+            return 2
+        }
+
+        switch badgeState {
+        case .running, .waitingOnUser:
+            return 0
+        case .ready, .failed:
+            return 1
+        case .goalActive, .goalAttention:
+            return 2
         }
     }
 

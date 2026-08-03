@@ -4,12 +4,17 @@
 
 const fs = require("fs");
 const { buildApplyPatchFileChangeItem } = require("./apply-patch-changes");
+const {
+  expandExecWrapperToolCall,
+  isOrchestrationWaitCall,
+} = require("./codex-tool-wrapper");
 const { terminalEventClosesTrackedTurn } = require("./rollout-turn-semantics");
 const {
   buildRemodexSourceItemKey,
   isContextualUserText,
   isUserRoleItem,
   responseItemMessageText: sharedResponseItemMessageText,
+  sanitizeUserRoleItem,
   visibleUserPromptText,
 } = require("./desktop-ipc-shared");
 
@@ -165,7 +170,7 @@ function readSessionJsonlMetadataFromFile(filePath, {
   metadataHeadBytes = DEFAULT_SESSION_JSONL_METADATA_HEAD_BYTES,
 } = {}) {
   if (!filePath) {
-    return { threadId: "", cwd: "" };
+    return emptySessionJsonlMetadata();
   }
   if (!supportsBoundedSessionJsonlReads(fsModule)) {
     return parseSessionJsonlMetadata(fsModule.readFileSync(filePath, "utf8"));
@@ -174,7 +179,7 @@ function readSessionJsonlMetadataFromFile(filePath, {
   const stat = fsModule.statSync(filePath);
   const snapshotSize = Math.max(0, Number(stat?.size) || 0);
   if (snapshotSize === 0) {
-    return { threadId: "", cwd: "" };
+    return emptySessionJsonlMetadata();
   }
   const fileHandle = fsModule.openSync(filePath, "r");
   try {
@@ -185,10 +190,21 @@ function readSessionJsonlMetadataFromFile(filePath, {
       fsModule
     );
     const metadata = parseSessionJsonlInitialMetadata(head.toString("utf8"));
-    return { threadId: metadata.threadId, cwd: metadata.cwd };
+    return {
+      threadId: metadata.threadId,
+      cwd: metadata.cwd,
+      forkedFromId: metadata.forkedFromId,
+      threadSource: metadata.threadSource,
+    };
   } finally {
     fsModule.closeSync(fileHandle);
   }
+}
+
+// Every exit path of readSessionJsonlMetadataFromFile returns this shape so callers
+// can read provenance without knowing which branch produced the result.
+function emptySessionJsonlMetadata() {
+  return { threadId: "", cwd: "", forkedFromId: "", threadSource: "" };
 }
 
 function supportsBoundedSessionJsonlReads(fsModule) {
@@ -286,6 +302,11 @@ function parseSessionJsonlInitialMetadata(content) {
   let threadId = "";
   let cwd = "";
   let timeZone = "";
+  // Provenance app-server keeps in the rollout but leaves null on thread/list
+  // rows: without it a forked automation thread is indistinguishable from the
+  // origin it copied its name and preview from.
+  let forkedFromId = "";
+  let threadSource = "";
   const raw = String(content || "");
   let lineStart = 0;
   while (lineStart < raw.length) {
@@ -313,18 +334,24 @@ function parseSessionJsonlInitialMetadata(content) {
       timeZone = normalizeString(payload?.timezone)
         || normalizeString(payload?.timeZone)
         || normalizeString(payload?.time_zone);
+      forkedFromId = normalizeString(payload?.forked_from_id)
+        || normalizeString(payload?.forkedFromId);
+      threadSource = normalizeString(payload?.thread_source)
+        || normalizeString(payload?.threadSource);
       break;
     } catch {
       // Metadata is expected at the head; an incomplete oversized line is not trusted.
     }
   }
-  return { threadId, cwd, timeZone };
+  return { threadId, cwd, timeZone, forkedFromId, threadSource };
 }
 
 // Extracts thread-level context that app-server history can omit for desktop-origin runs.
 function parseSessionJsonlMetadata(content) {
   let threadId = "";
   let cwd = "";
+  let forkedFromId = "";
+  let threadSource = "";
 
   const raw = String(content || "");
   let lineStart = 0;
@@ -357,13 +384,17 @@ function parseSessionJsonlMetadata(content) {
     cwd ||= normalizeString(payload?.cwd)
       || normalizeString(payload?.current_working_directory)
       || normalizeString(payload?.working_directory);
+    forkedFromId ||= normalizeString(payload?.forked_from_id)
+      || normalizeString(payload?.forkedFromId);
+    threadSource ||= normalizeString(payload?.thread_source)
+      || normalizeString(payload?.threadSource);
 
     if (threadId && cwd) {
       break;
     }
   }
 
-  return { threadId, cwd };
+  return { threadId, cwd, forkedFromId, threadSource };
 }
 
 function parseSessionJsonlThreadSummary(content, {
@@ -696,36 +727,39 @@ function parseSessionJsonlTurns(content, {
       if (!payload) {
         continue;
       }
-      rememberToolCallForHistory(payload, toolCallsByCallId);
-      if (shouldSkipResponseItemForHistory(payload, skippedCallIds)) {
-        continue;
-      }
-      const turn = ensureTurn(
-        turns,
-        turnsById,
-        responseItemTurnId(payload) || activeTurnId || `turn-line-${sourceLineNumber}`,
-        sessionThreadId,
-        entry.timestamp
-      );
-      applyHistoryTimeZone(turn, sessionTimeZone);
-      const item = normalizeResponseItemForHistory(payload, sourceLineNumber, {
-        cwd: sessionCwd,
-        toolCallsByCallId,
-      });
-      if (item) {
-        if (shouldSkipDuplicateProposedPlanMessage(turn, item)) {
+      const projectedPayloads = expandExecWrapperToolCall(payload);
+      for (const projectedPayload of projectedPayloads) {
+        rememberToolCallForHistory(projectedPayload, toolCallsByCallId);
+        if (shouldSkipResponseItemForHistory(projectedPayload, skippedCallIds)) {
           continue;
         }
-        const itemTimestamp = historyItemTimestamp(item, entry.timestamp);
-        if (itemTimestamp && !item.createdAt) {
-          item.createdAt = itemTimestamp;
+        const turn = ensureTurn(
+          turns,
+          turnsById,
+          responseItemTurnId(projectedPayload) || activeTurnId || `turn-line-${sourceLineNumber}`,
+          sessionThreadId,
+          entry.timestamp
+        );
+        applyHistoryTimeZone(turn, sessionTimeZone);
+        const item = normalizeResponseItemForHistory(projectedPayload, sourceLineNumber, {
+          cwd: sessionCwd,
+          toolCallsByCallId,
+        });
+        if (item) {
+          if (shouldSkipDuplicateProposedPlanMessage(turn, item)) {
+            continue;
+          }
+          const itemTimestamp = historyItemTimestamp(item, entry.timestamp);
+          if (itemTimestamp && !item.createdAt) {
+            item.createdAt = itemTimestamp;
+          }
+          if (itemTimestamp && !item.timestamp) {
+            item.timestamp = itemTimestamp;
+          }
+          applyHistoryTimeZone(item, sessionTimeZone);
+          applyHistoryAssistantSourceAlias(item, turn.id, assistantAliasOccurrencesByBaseKey);
+          addHistoryItemToTurn(turn, item);
         }
-        if (itemTimestamp && !item.timestamp) {
-          item.timestamp = itemTimestamp;
-        }
-        applyHistoryTimeZone(item, sessionTimeZone);
-        applyHistoryAssistantSourceAlias(item, turn.id, assistantAliasOccurrencesByBaseKey);
-        addHistoryItemToTurn(turn, item);
       }
     }
   }
@@ -1000,7 +1034,10 @@ function normalizeResponseItemForHistory(payload, lineNumber, { cwd = "", toolCa
     item.role = "assistant";
   }
 
-  return item;
+  // A single user item can carry injected context next to the real request.
+  // Sanitize here so history readers (including the thread/read JSONL merge,
+  // which runs after the relay sanitizer) never rebuild the hidden fragments.
+  return isUserRoleItem(item) ? sanitizeUserRoleItem(item) : item;
 }
 
 function applyHistoryAssistantSourceAlias(item, turnId, occurrencesByBaseKey = new Map()) {
@@ -1441,6 +1478,13 @@ function shouldSkipResponseItemForHistory(payload, skippedCallIds) {
   const callId = normalizeString(payload.call_id) || normalizeString(payload.callId);
 
   if (type === "tool_call_output" && callId && skippedCallIds.has(callId)) {
+    return true;
+  }
+
+  if (type === "tool_call" && isOrchestrationWaitCall(payload)) {
+    if (callId) {
+      skippedCallIds.add(callId);
+    }
     return true;
   }
 

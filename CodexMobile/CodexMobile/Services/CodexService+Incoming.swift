@@ -2092,6 +2092,41 @@ extension CodexService {
             return false
         }
 
+        if eventType == "background_event",
+           let itemId = firstNonEmptyString([
+               firstStringValue(in: payload, keys: ["itemId", "item_id", "call_id", "callId"]),
+               firstStringValue(in: paramsObject, keys: ["itemId", "item_id", "call_id", "callId"]),
+           ]),
+           let rawStatus = firstNonEmptyString([
+               firstStringValue(in: payload, keys: ["status"]),
+               firstStringValue(in: paramsObject, keys: ["status"]),
+           ]) {
+            let isCompleted = normalizedToolActivityStatus(
+                rawStatus,
+                isCompleted: false
+            ) != "Running"
+
+            if isCompleted {
+                completeStreamingSystemItemMessage(
+                    threadId: threadId,
+                    turnId: turnId,
+                    itemId: itemId,
+                    kind: .toolActivity,
+                    text: line
+                )
+            } else {
+                upsertStreamingSystemItemMessage(
+                    threadId: threadId,
+                    turnId: turnId,
+                    itemId: itemId,
+                    kind: .toolActivity,
+                    text: line,
+                    isStreaming: true
+                )
+            }
+            return true
+        }
+
         appendEssentialActivityLine(threadId: threadId, turnId: turnId, line: line)
         return true
     }
@@ -2335,7 +2370,7 @@ extension CodexService {
     ) -> Bool {
         guard itemType == "reasoning"
             || itemType == "filechange"
-            || itemType == "toolcall"
+            || isGenericToolCallItemType(itemType)
             || itemType == "commandexecution"
             || itemType == "collabagenttoolcall"
             || itemType == "collabtoolcall"
@@ -2374,7 +2409,7 @@ extension CodexService {
         case "filechange":
             kind = .fileChange
             body = decodeFileChangeItemBody(itemObject)
-        case "toolcall":
+        case let toolType where isGenericToolCallItemType(toolType):
             if let resolvedBody = decodeToolCallFileChangeBody(itemObject, isCompleted: isCompleted) {
                 kind = .fileChange
                 body = resolvedBody
@@ -2766,7 +2801,7 @@ extension CodexService {
             if let diff = extractToolCallUnifiedDiff(from: itemObject), looksLikePatchText(diff) {
                 return normalizedUnifiedPatchPayload(diff)
             }
-        case "toolcall":
+        case let toolType where isGenericToolCallItemType(toolType):
             if let diff = extractToolCallUnifiedDiff(from: itemObject), looksLikePatchText(diff) {
                 return normalizedUnifiedPatchPayload(diff)
             }
@@ -3324,71 +3359,20 @@ extension CodexService {
         itemObject: IncomingParamsObject?,
         fallbackText: String?
     ) -> Bool {
-        guard let itemObject else {
-            return looksLikePatchText(fallbackText ?? "")
+        guard let itemObject,
+              isWorkspaceFileMutationToolCall(itemObject) else {
+            return false
         }
-
-        let descriptor = toolCallDescriptor(from: itemObject)
-        let normalizedDescriptor = descriptor
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "")
-            .replacingOccurrences(of: "-", with: "")
-            .replacingOccurrences(of: " ", with: "")
-
-        let hasToolHint = normalizedDescriptor.contains("filechange")
-            || normalizedDescriptor.contains("applypatch")
-            || normalizedDescriptor.contains("patchapply")
-            || normalizedDescriptor.contains("diff")
-            || normalizedDescriptor.contains("edit")
-            || normalizedDescriptor.contains("write")
-            || normalizedDescriptor.contains("rename")
-            || normalizedDescriptor.contains("delete")
-            || normalizedDescriptor.contains("remove")
-            || normalizedDescriptor.contains("create")
-            || normalizedDescriptor.contains("add")
-            || normalizedDescriptor.contains("move")
 
         let hasStructuredChanges = extractToolCallChanges(from: itemObject) != nil
         let hasDiffPayload = extractToolCallUnifiedDiff(from: itemObject).map(looksLikePatchText) ?? false
         let hasPatchLikeText = looksLikePatchText(fallbackText ?? "")
 
-        return (hasToolHint && (hasStructuredChanges || hasDiffPayload || hasPatchLikeText))
-            || hasDiffPayload
-            || hasPatchLikeText
+        return hasStructuredChanges || hasDiffPayload || hasPatchLikeText
     }
 
     private func toolCallDescriptor(from itemObject: IncomingParamsObject) -> String {
-        let nestedTool = itemObject["tool"]?.objectValue
-        let nestedCall = itemObject["call"]?.objectValue
-        var parts = [
-            itemObject["kind"]?.stringValue,
-            itemObject["name"]?.stringValue,
-            itemObject["tool"]?.stringValue,
-            itemObject["tool_name"]?.stringValue,
-            itemObject["toolName"]?.stringValue,
-            itemObject["title"]?.stringValue,
-            nestedTool?["kind"]?.stringValue,
-            nestedTool?["name"]?.stringValue,
-            nestedTool?["type"]?.stringValue,
-            nestedTool?["title"]?.stringValue,
-            nestedCall?["kind"]?.stringValue,
-            nestedCall?["name"]?.stringValue,
-            nestedCall?["type"]?.stringValue,
-            nestedCall?["title"]?.stringValue,
-        ]
-        if let recursiveToolName = firstString(forKey: "tool_name", in: .object(itemObject)) {
-            parts.append(recursiveToolName)
-        }
-        if let recursiveKind = firstString(forKey: "kind", in: .object(itemObject)) {
-            parts.append(recursiveKind)
-        }
-        if let recursiveName = firstString(forKey: "name", in: .object(itemObject)) {
-            parts.append(recursiveName)
-        }
-        return parts
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
+        toolCallIdentityDescriptor(from: itemObject)
     }
 
     // Bridge-tagged replayed buffer events must never revive running UI; only live

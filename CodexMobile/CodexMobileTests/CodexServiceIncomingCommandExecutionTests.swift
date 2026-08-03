@@ -199,6 +199,155 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(history[0].turnId, turnID)
     }
 
+    func testLiveGitHubPullRequestDiffStaysToolActivity() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "item": .object(gitHubPullRequestToolItem()),
+            ])
+        )
+
+        let messages = service.messages(for: threadID)
+        XCTAssertTrue(messages.filter { $0.kind == .fileChange }.isEmpty)
+        XCTAssertEqual(messages.filter { $0.kind == .toolActivity }.count, 1)
+    }
+
+    func testHistoryGitHubPullRequestDiffStaysToolActivity() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        let history = service.decodeMessagesFromThreadRead(
+            threadId: threadID,
+            threadObject: [
+                "createdAt": .string("2026-08-02T01:17:41Z"),
+                "turns": .array([
+                    .object([
+                        "id": .string(turnID),
+                        "items": .array([.object(gitHubPullRequestToolItem())]),
+                    ]),
+                ]),
+            ]
+        )
+
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history[0].kind, .toolActivity)
+        XCTAssertFalse(history[0].text.contains("Path: unknown"))
+    }
+
+    func testHistoryMergeRemovesPersistedGitHubDiffCardFromCanonicalMCPToolCall() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let legacyCard = CodexMessage(
+            threadId: threadID,
+            role: .system,
+            kind: .fileChange,
+            text: "Status: completed\n\nPath: unknown\nKind: update\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```",
+            turnId: turnID,
+            itemId: "github-fetch-pr"
+        )
+        let history = service.decodeMessagesFromThreadRead(
+            threadId: threadID,
+            threadObject: [
+                "createdAt": .string("2026-08-02T01:17:41Z"),
+                "turns": .array([
+                    .object([
+                        "id": .string(turnID),
+                        "items": .array([.object(gitHubPullRequestToolItem())]),
+                    ]),
+                ]),
+            ]
+        )
+
+        let migrated = service.mergeHistoryMessages([legacyCard], history)
+
+        XCTAssertEqual(migrated.count, 1)
+        XCTAssertEqual(migrated[0].kind, .toolActivity)
+        XCTAssertEqual(migrated[0].itemId, "github-fetch-pr")
+        XCTAssertFalse(migrated[0].text.contains("Path: unknown"))
+    }
+
+    func testHistoryApplyPatchToolStillRestoresFileChange() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let patch = """
+        diff --git a/README.md b/README.md
+        --- a/README.md
+        +++ b/README.md
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+
+        let history = service.decodeMessagesFromThreadRead(
+            threadId: threadID,
+            threadObject: [
+                "createdAt": .string("2026-08-02T01:17:41Z"),
+                "turns": .array([
+                    .object([
+                        "id": .string(turnID),
+                        "items": .array([
+                            .object([
+                                "id": .string("apply-patch"),
+                                "type": .string("toolCall"),
+                                "name": .string("apply_patch"),
+                                "status": .string("completed"),
+                                "result": .object(["diff": .string(patch)]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history[0].kind, .fileChange)
+        XCTAssertTrue(history[0].text.contains("Path: README.md"))
+    }
+
+    func testHistoryMergeRemovesPersistedGitHubDiffFileChangeCard() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "github-fetch-pr"
+        let legacyCard = CodexMessage(
+            threadId: threadID,
+            role: .system,
+            kind: .fileChange,
+            text: "Status: completed\n\nPath: unknown\nKind: update\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```",
+            turnId: turnID,
+            itemId: itemID
+        )
+        let canonicalActivity = CodexMessage(
+            threadId: threadID,
+            role: .system,
+            kind: .toolActivity,
+            text: "Completed github.fetch_pr",
+            turnId: turnID,
+            itemId: itemID
+        )
+
+        let migrated = service.mergeHistoryMessages([legacyCard], [canonicalActivity])
+        XCTAssertEqual(migrated.count, 1)
+        XCTAssertEqual(migrated[0].kind, .toolActivity)
+        XCTAssertFalse(migrated[0].text.contains("Path: unknown"))
+
+        let deduplicated = service.mergeHistoryMessages(
+            [legacyCard, canonicalActivity],
+            [canonicalActivity]
+        )
+        XCTAssertEqual(deduplicated.count, 1)
+        XCTAssertEqual(deduplicated[0].kind, .toolActivity)
+    }
+
     func testHistoryCompletedAtAliasAndTimezoneRestoreMessageTimestamp() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -524,6 +673,60 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
             $0.role == .system && $0.kind == .toolActivity
         }
         XCTAssertTrue(toolRows.isEmpty)
+    }
+
+    func testBackgroundToolActivityLifecycleCompletesMatchingRow() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let callID = "call-\(UUID().uuidString)"
+
+        service.handleNotification(
+            method: "turn/started",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+            ])
+        )
+        service.handleNotification(
+            method: "codex/event/background_event",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "call_id": .string(callID),
+                "itemId": .string(callID),
+                "status": .string("inProgress"),
+                "message": .string("Writing to terminal"),
+            ])
+        )
+
+        var toolRows = service.messages(for: threadID).filter {
+            $0.role == .system && $0.kind == .toolActivity
+        }
+        XCTAssertEqual(toolRows.count, 1)
+        XCTAssertEqual(toolRows[0].itemId, callID)
+        XCTAssertEqual(toolRows[0].text, "Writing to terminal")
+        XCTAssertTrue(toolRows[0].isStreaming)
+
+        service.handleNotification(
+            method: "codex/event/background_event",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+                "call_id": .string(callID),
+                "itemId": .string(callID),
+                "status": .string("completed"),
+                "message": .string("Wrote to terminal"),
+            ])
+        )
+
+        toolRows = service.messages(for: threadID).filter {
+            $0.role == .system && $0.kind == .toolActivity
+        }
+        XCTAssertEqual(toolRows.count, 1)
+        XCTAssertEqual(toolRows[0].itemId, callID)
+        XCTAssertEqual(toolRows[0].text, "Wrote to terminal")
+        XCTAssertFalse(toolRows[0].isStreaming)
     }
 
     func testEssentialReadEventUsesToolActivityInsteadOfThinking() {
@@ -4818,5 +5021,29 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         // Keep instances alive for the process lifetime so assertions can run deterministically.
         Self.retainedServices.append(service)
         return service
+    }
+
+    private func gitHubPullRequestToolItem() -> [String: JSONValue] {
+        [
+            "id": .string("github-fetch-pr"),
+            // App-server history uses the concrete MCP item type. Desktop IPC
+            // may project the same item to `toolCall`, so production accepts both.
+            "type": .string("mcpToolCall"),
+            "status": .string("completed"),
+            "server": .string("codex_apps"),
+            "tool": .string("github.fetch_pr"),
+            "result": .object([
+                "content": .array([
+                    .object([
+                        "type": .string("text"),
+                        "text": .string("Action completed."),
+                    ]),
+                ]),
+                "structuredContent": .object([
+                    "title": .string("fix(pi): normalize extension model metadata"),
+                    "diff": .string("@@ -1 +1 @@\n-old\n+new"),
+                ]),
+            ]),
+        ]
     }
 }

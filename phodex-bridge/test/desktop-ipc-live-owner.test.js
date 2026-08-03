@@ -214,6 +214,119 @@ test("live owner broadcasts Remodex-owned thread snapshots over Desktop IPC", as
   assert.equal(broadcast.params.change.conversationState.turns[0].items[0].text, "Hello");
 });
 
+test("live owner confirms Desktop follow handshakes and sends an immediate baseline", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-follow-");
+  const frames = [];
+  const followerChanges = [];
+  let serverSocket = null;
+
+  const server = net.createServer((socket) => {
+    serverSocket = socket;
+    attachFrameReader(socket, (frame) => {
+      frames.push(frame);
+      if (frame.method === "initialize") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: "initialize",
+          handledByClientId: "router",
+          result: { clientId: "remodex-owner-follow" },
+        });
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    snapshotDebounceMs: 1,
+    sendCodexRequest: async () => ({ ok: true }),
+    sendRawCodexMessage() {},
+    onFollowerStateChanged(threadId, following) {
+      followerChanges.push({ threadId, following });
+    },
+  });
+  t.after(() => {
+    owner.stopAll();
+    server.close();
+    serverSocket?.destroy();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  owner.observeInbound(JSON.stringify({
+    id: "thread-follow-start",
+    method: "thread/start",
+    params: {
+      cwd: "/tmp/project",
+    },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "thread-follow-start",
+    result: {
+      thread: {
+        id: "thread-follow-handshake",
+        sessionId: "thread-follow-handshake",
+        preview: "hello",
+        ephemeral: false,
+        modelProvider: "openai",
+        createdAt: 1,
+        updatedAt: 1,
+        status: { type: "idle" },
+        cwd: "/tmp/project",
+        turns: [],
+      },
+    },
+  }));
+  await waitForMessage(frames, (frame) => frame.method === "initialize");
+  await waitForMessage(
+    frames,
+    (frame) => frame.method === "thread-stream-following-status-requested"
+      && frame.params?.conversationId === "thread-follow-handshake"
+  );
+
+  writeFrame(serverSocket, {
+    type: "broadcast",
+    method: "thread-stream-following-changed",
+    sourceClientId: "desktop-follower",
+    version: 1,
+    params: {
+      hostId: "local",
+      conversationId: "thread-follow-handshake",
+      following: true,
+    },
+  });
+
+  await waitFor(() => followerChanges.length === 1);
+  assert.deepEqual(followerChanges, [{
+    threadId: "thread-follow-handshake",
+    following: true,
+  }]);
+  await waitForMessage(
+    frames,
+    (frame) => frame.method === "thread-stream-state-changed"
+      && frame.params?.conversationId === "thread-follow-handshake"
+  );
+
+  writeFrame(serverSocket, {
+    type: "broadcast",
+    method: "thread-stream-following-changed",
+    sourceClientId: "desktop-follower",
+    version: 1,
+    params: {
+      hostId: "local",
+      conversationId: "thread-follow-handshake",
+      following: false,
+    },
+  });
+
+  await waitFor(() => followerChanges.length === 2);
+  assert.deepEqual(followerChanges[1], {
+    threadId: "thread-follow-handshake",
+    following: false,
+  });
+});
+
 test("live owner broadcasts patches after the first owned thread snapshot", async (t) => {
   const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-patches-");
   const frames = [];
@@ -452,6 +565,74 @@ test("live owner starts a local IPC router when no Codex IPC socket exists", asy
       },
     },
   }]);
+});
+
+test("live owner replays a pending sidebar announcement when Desktop joins its fallback router", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-sidebar-replay-");
+  const desktopFrames = [];
+  let desktopSocket = null;
+
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    sidebarRefreshDelayMs: 5,
+    snapshotDebounceMs: 1,
+    reconnectMs: 10,
+    requestTimeoutMs: 500,
+    sendCodexRequest: async () => ({ ok: true }),
+    sendRawCodexMessage() {},
+  });
+  t.after(() => {
+    owner.stopAll();
+    desktopSocket?.destroy();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  owner.observeInbound(JSON.stringify({
+    method: "turn/start",
+    params: {
+      threadId: "thread-sidebar-replay",
+      input: [],
+    },
+  }));
+
+  await waitFor(() => fs.existsSync(socketPath));
+  // Let the first announcement attempt run while only the bridge-owned router
+  // is present. It must remain pending rather than count that write as delivery.
+  await wait(30);
+  owner.observeInbound(JSON.stringify({
+    method: "thread/unsubscribe",
+    params: { threadId: "thread-sidebar-replay" },
+  }));
+  assert.equal(
+    owner.isThreadOwned("thread-sidebar-replay"),
+    false,
+    "sidebar metadata must outlive released stream ownership"
+  );
+
+  desktopSocket = net.createConnection(socketPath);
+  attachFrameReader(desktopSocket, (frame) => desktopFrames.push(frame));
+  await new Promise((resolve) => desktopSocket.once("connect", resolve));
+  writeFrame(desktopSocket, {
+    type: "request",
+    requestId: "desktop-sidebar-replay-init",
+    sourceClientId: "initializing-client",
+    version: 1,
+    method: "initialize",
+    params: { clientType: "vscode" },
+  });
+  await waitFor(() => desktopFrames.some(
+    (frame) => frame.type === "response"
+      && frame.requestId === "desktop-sidebar-replay-init"
+  ));
+
+  const announcement = await waitForMessage(
+    desktopFrames,
+    (frame) => frame.type === "broadcast"
+      && frame.method === "thread-unarchived"
+      && frame.params?.conversationId === "thread-sidebar-replay"
+  );
+  assert.equal(announcement.version, 1);
+  assert.equal(announcement.params.hostId, "local");
 });
 
 test("live owner seeds existing thread snapshots from thread reads before ownership", async (t) => {
@@ -1417,9 +1598,18 @@ test("live owner hydrates existing threads before first mobile-owned snapshot", 
   assert.equal(codexRequests.length, 1);
   assert.deepEqual(codexRequests[0], {
     method: "thread/read",
-    params: { threadId: "thread-hydrate" },
+    params: {
+      threadId: "thread-hydrate",
+      includeTurns: true,
+    },
   });
-  assert.equal(frames.some((frame) => frame.type === "broadcast"), false);
+  assert.equal(
+    frames.some((frame) => (
+      frame.type === "broadcast"
+      && frame.method === "thread-stream-state-changed"
+    )),
+    false
+  );
 
   resolveThreadRead({
     thread: {
@@ -2688,6 +2878,7 @@ test("live owner applies Desktop runtime overrides to later follower turn starts
 test("live owner serves follower load-complete-history with a fresh snapshot revision", async (t) => {
   const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-load-history-");
   const frames = [];
+  const codexRequests = [];
   let serverSocket = null;
 
   const server = net.createServer((socket) => {
@@ -2718,6 +2909,7 @@ test("live owner serves follower load-complete-history with a fresh snapshot rev
     socketPath,
     snapshotDebounceMs: 1,
     async sendCodexRequest(method, params) {
+      codexRequests.push({ method, params });
       if (method === "thread/read") {
         return {
           thread: {
@@ -2763,6 +2955,11 @@ test("live owner serves follower load-complete-history with a fresh snapshot rev
   );
   assert.equal(response.resultType, "success");
   assert.equal(typeof response.result.revision, "number");
+  assert.ok(codexRequests.some((request) => (
+    request.method === "thread/read"
+    && request.params?.threadId === "thread-history"
+    && request.params?.includeTurns === true
+  )));
 
   // The snapshot carrying that revision must have been broadcast, complete
   // with hydrated history, so the Desktop follower can render it.
@@ -2896,7 +3093,7 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
     conversationId: "thread-settings",
     hasUnreadTurn: false,
   });
-  assert.equal(readBroadcast.version, 1);
+  assert.equal(readBroadcast.version, 2);
 });
 
 test("live owner runs Desktop queued follow-ups between turns", async (t) => {
@@ -3342,6 +3539,109 @@ test("live owner announces phone threads to the Desktop sidebar once", async (t)
   }));
   await wait(30);
   assert.equal(announcementCount(), before);
+});
+
+test("live owner replays an early sidebar announcement after rollout materialization", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-sidebar-materialized-");
+  const frames = [];
+  let serverSocket = null;
+
+  const server = net.createServer((socket) => {
+    serverSocket = socket;
+    attachFrameReader(socket, (frame) => {
+      frames.push(frame);
+      if (frame.method === "initialize") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: "initialize",
+          handledByClientId: "router",
+          result: { clientId: "remodex-owner-test" },
+        });
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    owner.stopAll();
+    server.close();
+    serverSocket?.destroy();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    snapshotDebounceMs: 1,
+    sidebarRefreshDelayMs: 5,
+    sendCodexRequest: async () => ({ ok: true }),
+    sendRawCodexMessage() {},
+  });
+  const announcementCount = () => frames.filter((frame) => (
+    frame.type === "broadcast"
+      && frame.method === "thread-unarchived"
+      && frame.params?.conversationId === "thread-sidebar-race"
+  )).length;
+
+  owner.observeInbound(JSON.stringify({
+    id: "sidebar-race-turn-1",
+    method: "turn/start",
+    params: {
+      threadId: "thread-sidebar-race",
+      input: [{ type: "text", text: "hi" }],
+    },
+  }));
+  await waitForMessage(
+    frames,
+    (frame) => frame.type === "broadcast"
+      && frame.method === "thread-unarchived"
+      && frame.params?.conversationId === "thread-sidebar-race"
+  );
+  assert.equal(announcementCount(), 1);
+
+  owner.observeOutbound(JSON.stringify({
+    method: "item/started",
+    params: {
+      threadId: "thread-sidebar-race",
+      turnId: "turn-sidebar-race",
+      item: { id: "user-sidebar-race", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+    },
+  }));
+  await waitFor(() => announcementCount() === 2);
+
+  // item/completed for the same persisted user item must not create an
+  // unbounded refresh loop.
+  owner.observeOutbound(JSON.stringify({
+    method: "item/completed",
+    params: {
+      threadId: "thread-sidebar-race",
+      turnId: "turn-sidebar-race",
+      item: { id: "user-sidebar-race", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+    },
+  }));
+  await wait(20);
+  assert.equal(announcementCount(), 2);
+
+  // Completion is the final bounded fallback for app-server/catalog write races.
+  owner.observeOutbound(JSON.stringify({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-sidebar-race",
+      turn: { id: "turn-sidebar-race", items: [], status: "completed" },
+    },
+  }));
+  await waitFor(() => announcementCount() === 3);
+
+  owner.observeInbound(JSON.stringify({
+    id: "sidebar-race-turn-2",
+    method: "turn/start",
+    params: {
+      threadId: "thread-sidebar-race",
+      input: [{ type: "text", text: "again" }],
+    },
+  }));
+  await wait(20);
+  assert.equal(announcementCount(), 3);
 });
 
 test("live owner keeps ownership when peer sends non-owner patch broadcasts", async (t) => {

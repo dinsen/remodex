@@ -57,7 +57,9 @@ const {
 const { createBridgeSecureTransport } = require("./secure-transport");
 const { createRolloutLiveMirrorController } = require("./rollout-live-mirror");
 const {
+  buildCompleteThreadReadParams,
   isContextualUserText,
+  isThreadTurnStateProbeRequest,
   isUserRoleItem,
   readUserItemText,
   sanitizeUserRoleItem,
@@ -69,6 +71,9 @@ const {
 } = require("./desktop-ipc-action-follower");
 const { createDesktopIpcLiveOwner } = require("./desktop-ipc-live-owner");
 const { createThreadRuntimeSettingsStore } = require("./thread-runtime-settings-store");
+const { createThreadListProvenanceEnricher } = require("./thread-list-provenance");
+const { createWorktreeOriginEnricher } = require("./worktree-origin");
+const { forEachThreadRowInResponse } = require("./thread-row-enrichment");
 const { version: bridgePackageVersion = "" } = require("../package.json");
 const {
   MINIMUM_SUPPORTED_IOS_APP_VERSION,
@@ -460,6 +465,27 @@ function createThreadTurnsListFastPageCoordinator({
       canonicalRequest,
       fetchCanonical
     );
+    let timeoutId = null;
+    const deadline = new Promise((resolveDeadline) => {
+      timeoutId = setTimeoutImpl(() => resolveDeadline({ deadline: true }), waitMs);
+    });
+    const first = await Promise.race([canonicalOutcomePromise, deadline]);
+    if (timeoutId != null) {
+      clearTimeoutImpl(timeoutId);
+    }
+
+    if (first?.ok && !isEmptyTurnsListResponse(first.response)) {
+      forgetCanonicalFirstPage(canonicalFirstPageCacheKey, canonicalOutcomePromise);
+      return {
+        source: "canonical",
+        response: rebindThreadTurnsListResponseId(first.response, request.id),
+        usesJsonl: false,
+      };
+    }
+
+    // Deadline hit, canonical error, or an empty canonical page: only now pay
+    // for the synchronous rollout read, so a fast canonical response never
+    // blocks behind it and never delays itself.
     let jsonlFallback = null;
     try {
       jsonlFallback = await readJsonl(request);
@@ -481,38 +507,6 @@ function createThreadTurnsListFastPageCoordinator({
         source: "canonical",
         response: rebindThreadTurnsListResponseId(response, request.id),
         usesJsonl: false,
-      };
-    }
-
-    let timeoutId = null;
-    const deadline = new Promise((resolveDeadline) => {
-      timeoutId = setTimeoutImpl(() => resolveDeadline({ deadline: true }), waitMs);
-    });
-    const first = await Promise.race([canonicalOutcomePromise, deadline]);
-    if (timeoutId != null) {
-      clearTimeoutImpl(timeoutId);
-    }
-
-    if (first?.ok && !isEmptyTurnsListResponse(first.response)) {
-      if (shouldPreferJsonlFirstPage(first.response, jsonlFallback.response)) {
-        const token = rememberHandoff(threadId, canonicalOutcomePromise, jsonlFallback);
-        return {
-          source: "jsonl",
-          response: buildJsonlCanonicalHandoffResponse(
-            jsonlFallback.response,
-            request.id,
-            token,
-            firstTurnsListTurnId(jsonlFallback.response)
-          ),
-          usesJsonl: true,
-        };
-      }
-      forgetCanonicalFirstPage(canonicalFirstPageCacheKey, canonicalOutcomePromise);
-      return {
-        source: "canonical",
-        response: rebindThreadTurnsListResponseId(first.response, request.id),
-        usesJsonl: false,
-        jsonlFallback,
       };
     }
 
@@ -559,6 +553,33 @@ function threadTurnsListHandoffDescriptor(cursor) {
     return null;
   }
   return { anchorTurnId, token };
+}
+
+// The bounded canonical page can read a busy mirrored run as closed for a
+// beat, which used to flap the phone's running state. When the rollout mirror
+// is actively tailing a real turn, ride its id along on the turn-state probe
+// as an advisory field; history pages stay untouched.
+function annotateTurnStateProbeWithMirrorActiveTurn(request, response, getMirrorActiveTurnId) {
+  if (!isThreadTurnStateProbeRequest(request)) {
+    return response;
+  }
+  const params = request?.params || {};
+  const threadId = normalizeNonEmptyString(params.threadId)
+    || normalizeNonEmptyString(params.thread_id);
+  const mirrorActiveTurnId = threadId ? getMirrorActiveTurnId?.(threadId) : null;
+  const result = response?.result;
+  if (!mirrorActiveTurnId || !result || typeof result !== "object" || Array.isArray(result)) {
+    return response;
+  }
+  // Page responses can come from the fast-page cache: never mutate a shared
+  // object, or the annotation would outlive the mirror on later replays.
+  return {
+    ...response,
+    result: {
+      ...result,
+      remodexMirrorActiveTurnId: mirrorActiveTurnId,
+    },
+  };
 }
 
 function canonicalThreadTurnsListRequest(request) {
@@ -614,21 +635,6 @@ function buildJsonlCanonicalHandoffResponse(response, requestId, token, anchorTu
       remodexCanonicalHandoff: true,
     },
   };
-}
-
-function shouldPreferJsonlFirstPage(canonicalResponse, jsonlResponse) {
-  const canonicalResult = canonicalResponse?.result;
-  const jsonlResult = jsonlResponse?.result;
-  const canonicalTurnsKey = findTurnsListResultKey(canonicalResult);
-  const jsonlTurnsKey = findTurnsListResultKey(jsonlResult);
-  if (!canonicalTurnsKey || !jsonlTurnsKey) {
-    return false;
-  }
-  const jsonlTurn = jsonlResult[jsonlTurnsKey]?.[0];
-  const jsonlTurnId = turnListTurnIdentifier(jsonlTurn);
-  return Boolean(jsonlTurnId)
-    && !canonicalResult[canonicalTurnsKey].some((turn) => turnListTurnIdentifier(turn) === jsonlTurnId)
-    && shouldMergeLatestJsonlTurn(jsonlTurn);
 }
 
 function firstTurnsListTurnId(response) {
@@ -739,7 +745,10 @@ function startBridge({
   const relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
   const notificationSecret = randomBytes(24).toString("hex");
   const desktopRefresher = new CodexDesktopRefresher({
-    enabled: config.refreshEnabled,
+    // IPC snapshots are accepted only after Codex mounts the route and
+    // announces itself as a follower. Auto-follow performs that one-time
+    // activation; refreshEnabled still controls the legacy reload workaround.
+    enabled: config.refreshEnabled || config.desktopAutoFollowEnabled === true,
     // With IPC live sync streaming content, deep-link refreshes are only needed
     // to navigate Desktop onto the phone-driven thread, not to reload content.
     navigationOnly: config.desktopIpcLiveSyncEnabled,
@@ -782,6 +791,8 @@ function startBridge({
   const jsonlTurnsListRolloutMissCacheByThread = new Map();
   const threadTurnsListFastPageCoordinator = createThreadTurnsListFastPageCoordinator();
   const threadRuntimeSettingsStore = createThreadRuntimeSettingsStore();
+  const threadListProvenanceEnricher = createThreadListProvenanceEnricher();
+  const worktreeOriginEnricher = createWorktreeOriginEnricher();
   const trackedForwardedRequestMethods = new Set([
     "account/login/start",
     "account/login/cancel",
@@ -847,7 +858,7 @@ function startBridge({
     ? createDesktopIpcActionFollower({
       sendApplicationResponse,
       readConversationState: async (threadId) => seedConversationStateFromThreadRead(
-        await sendCodexRequest("thread/read", { threadId })
+        await sendCodexRequest("thread/read", buildCompleteThreadReadParams(threadId))
       ),
       forwardToLocalCodex: (rawMessage) => {
         observeDesktopIpcLiveOwnerInbound(rawMessage);
@@ -860,6 +871,9 @@ function startBridge({
       runtimeSettingsStore: threadRuntimeSettingsStore,
       socketPath: config.desktopIpcSocketPath || undefined,
       snapshotDebounceMs: config.desktopIpcSnapshotDebounceMs,
+      onFollowerStateChanged(threadId, following) {
+        desktopRefresher.handleFollowerStateChanged(threadId, following);
+      },
     })
     : null;
   const desktopIpcLiveOwner = !config.codexEndpoint
@@ -872,6 +886,9 @@ function startBridge({
       runtimeSettingsStore: threadRuntimeSettingsStore,
       socketPath: config.desktopIpcSocketPath || undefined,
       snapshotDebounceMs: config.desktopIpcSnapshotDebounceMs,
+      onFollowerStateChanged(threadId, following) {
+        desktopRefresher.handleFollowerStateChanged(threadId, following);
+      },
     })
     : null;
   let contextUsageWatcher = null;
@@ -1125,7 +1142,6 @@ function startBridge({
       stopContextUsageWatcher();
       // Relay reconnects are transport-only: keep local live observers running
       // so their output can enter secure replay and catch up on the next resume.
-      desktopRefresher.handleTransportReset();
       scheduleRelayReconnect(code);
     });
 
@@ -1366,15 +1382,7 @@ function startBridge({
           }),
           readJsonl: (jsonlRequest) => maybeBuildJsonlThreadTurnsListFallback(jsonlRequest, null),
         });
-        let responsePayload = selection.response;
-        if (selection.source === "canonical" && selection.jsonlFallback?.response?.result) {
-          responsePayload = maybeMergeLatestJsonlTurnIntoTurnsListResponse(
-            request,
-            selection.response,
-            selection.jsonlFallback.response.result
-          ) || selection.response;
-        }
-        sendBridgeManagedThreadTurnsListResponse(request, responsePayload, respondOnce, {
+        sendBridgeManagedThreadTurnsListResponse(request, selection.response, respondOnce, {
           skipJsonlArtifactAugmentation: selection.usesJsonl,
         });
       } catch (error) {
@@ -1465,6 +1473,11 @@ function startBridge({
   function sendBridgeManagedThreadTurnsListResponse(request, response, sendResponse, {
     skipJsonlArtifactAugmentation = false,
   } = {}) {
+    response = annotateTurnStateProbeWithMirrorActiveTurn(
+      request,
+      response,
+      (threadId) => rolloutLiveMirror?.getActiveTurnId(threadId) || null
+    );
     const finalSanitizeContext = buildThreadTurnsListRelaySanitizeContext(request, {
       skipJsonlArtifactAugmentation,
     });
@@ -1786,7 +1799,12 @@ function startBridge({
     if (trackedRequest.method === "thread/list"
       || trackedRequest.method === "thread/read"
       || trackedRequest.method === "thread/resume") {
-      threadRuntimeSettingsStore.enrichResponse(trackedRequest.method, parsed);
+      // One walk over the rows for both enrichers instead of one traversal each.
+      forEachThreadRowInResponse(trackedRequest.method, parsed, (thread) => {
+        threadRuntimeSettingsStore.attachToThread(thread);
+        threadListProvenanceEnricher.attachToThread(thread);
+        worktreeOriginEnricher.attachToThread(thread);
+      });
       normalizedMessage = JSON.stringify(parsed);
     }
 
@@ -5689,6 +5707,7 @@ function shouldSuppressRolloutMirrorForThread(
 }
 
 module.exports = {
+  annotateTurnStateProbeWithMirrorActiveTurn,
   buildThreadTurnsListRelaySanitizeContext,
   buildHeartbeatBridgeStatus,
   canonicalThreadTurnsListRequest,

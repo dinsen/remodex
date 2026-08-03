@@ -130,6 +130,8 @@ struct SidebarThreadRowView: View {
 
             expansionToggleButton
 
+            SidebarThreadSourceLabel(thread: thread, pointSize: 17)
+
             SidebarThreadStatusIcon(thread: thread, pointSize: 17)
 
             if thread.isUsingGoal {
@@ -144,7 +146,7 @@ struct SidebarThreadRowView: View {
                     .truncationMode(.tail)
             }
 
-            if let runBadgeState, runBadgeState.isVisibleInSidebar {
+            if let runBadgeState {
                 SidebarThreadRunBadgeView(state: runBadgeState)
                     .frame(width: 28, alignment: .trailing)
             }
@@ -173,6 +175,8 @@ struct SidebarThreadRowView: View {
     private var subagentTrailingMeta: some View {
         HStack(spacing: 4) {
             expansionToggleButton
+
+            SidebarThreadSourceLabel(thread: thread, pointSize: 11)
 
             SidebarThreadStatusIcon(thread: thread, pointSize: 11)
 

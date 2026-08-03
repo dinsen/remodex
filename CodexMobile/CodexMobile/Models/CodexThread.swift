@@ -67,6 +67,30 @@ enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case archivedLocal
 }
 
+// Who created the session, when it was not the user. Scheduled runs are the common case
+// and carry no extra meaning worth a word in a sidebar row, so they render as the clock
+// glyph Synara already uses for automations; named kinds keep their short text.
+enum CodexThreadAutomationSource: Hashable, Sendable {
+    case scheduled
+    case pullRequestFix
+
+    var label: String {
+        switch self {
+        case .scheduled: return "Automation"
+        case .pullRequestFix: return "PR fix"
+        }
+    }
+
+    // Spoken form for rows that show a glyph or a clipped capsule instead of the
+    // full label.
+    var accessibilityDescription: String {
+        switch self {
+        case .scheduled: return "Started by automation"
+        case .pullRequestFix: return "Started by PR fix automation"
+        }
+    }
+}
+
 struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var title: String?
@@ -75,8 +99,16 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var createdAt: Date?
     var updatedAt: Date?
     var cwd: String?
+    // Checkout that owns `cwd` when the chat runs inside a Codex-managed worktree. The bridge
+    // resolves it from the worktree's Git link so the sidebar can keep worktree chats inside the
+    // project they were cut from instead of showing a second, look-alike project row.
+    var worktreeOriginPath: String?
     var metadata: [String: JSONValue]?
     var forkedFromThreadId: String?
+    // Why the session exists ("user", "automation", "pull_request_fix_automation", …).
+    // Desktop automations fork a thread and inherit its name, so the sidebar needs this
+    // to tell the copy apart from the chat the user actually started.
+    var threadSource: String?
     var parentThreadId: String?
     var agentId: String?
     var agentNickname: String?
@@ -101,8 +133,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         cwd: String? = nil,
+        worktreeOriginPath: String? = nil,
         metadata: [String: JSONValue]? = nil,
         forkedFromThreadId: String? = nil,
+        threadSource: String? = nil,
         parentThreadId: String? = nil,
         agentId: String? = nil,
         agentNickname: String? = nil,
@@ -124,8 +158,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.cwd = Self.normalizeProjectPath(cwd)
+        self.worktreeOriginPath = Self.normalizeProjectPath(worktreeOriginPath)
         self.metadata = metadata
         self.forkedFromThreadId = Self.normalizeIdentifier(forkedFromThreadId)
+        self.threadSource = Self.normalizeIdentifier(threadSource)
         self.parentThreadId = Self.normalizeIdentifier(parentThreadId)
         self.agentId = Self.normalizeIdentifier(agentId)
         self.agentNickname = Self.normalizeIdentifier(agentNickname)
@@ -155,11 +191,15 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case cwd
         case cwdSnake = "current_working_directory"
         case cwdWorkingDirectory = "working_directory"
+        case worktreeOriginPath
+        case worktreeOriginPathSnake = "worktree_origin_path"
         case metadata
         case forkedFromThreadId
         case forkedFromId = "forkedFromId"
         case forkedFromThreadIdSnake = "forked_from_thread_id"
         case forkedFromIdSnake = "forked_from_id"
+        case threadSource
+        case threadSourceSnake = "thread_source"
         case parentThreadId
         case parentThreadIdSnake = "parent_thread_id"
         case agentId
@@ -202,11 +242,21 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata)
         cwd = Self.decodeStringIfPresent(from: container, keys: [.cwd, .cwdSnake, .cwdWorkingDirectory])
             ?? Self.decodeProjectPath(from: metadata)
+        worktreeOriginPath = Self.decodeStringIfPresent(
+            from: container,
+            keys: [.worktreeOriginPath, .worktreeOriginPathSnake]
+        )
         forkedFromThreadId = Self.decodeThreadIdentity(
             from: container,
             metadata: metadata,
             keys: [.forkedFromThreadId, .forkedFromId, .forkedFromThreadIdSnake, .forkedFromIdSnake],
             metadataKeys: ["forkedFromThreadId", "forked_from_thread_id", "forkedFromId", "forked_from_id"]
+        )
+        threadSource = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.threadSource, .threadSourceSnake],
+            metadataKeys: ["threadSource", "thread_source"]
         )
         parentThreadId = Self.decodeThreadIdentity(
             from: container,
@@ -277,8 +327,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(Self.normalizeProjectPath(cwd), forKey: .cwd)
+        try container.encodeIfPresent(Self.normalizeProjectPath(worktreeOriginPath), forKey: .worktreeOriginPath)
         try container.encodeIfPresent(metadata, forKey: .metadata)
         try container.encodeIfPresent(Self.normalizeIdentifier(forkedFromThreadId), forKey: .forkedFromThreadId)
+        try container.encodeIfPresent(Self.normalizeIdentifier(threadSource), forKey: .threadSource)
         try container.encodeIfPresent(Self.normalizeIdentifier(parentThreadId), forKey: .parentThreadId)
         try container.encodeIfPresent(Self.normalizeIdentifier(agentId), forKey: .agentId)
         try container.encodeIfPresent(Self.normalizeIdentifier(agentNickname), forKey: .agentNickname)
@@ -360,6 +412,17 @@ extension CodexThread {
     // Fork badges use ancestry rather than cwd heuristics so local/worktree routing stays independent.
     var isForkedThread: Bool {
         forkedFromThreadId != nil
+    }
+
+    // Desktop automations fork a thread and inherit its name, so the sidebar would
+    // otherwise show two rows with identical titles. The source next to the fork badge
+    // tells them apart; user-started sessions stay unmarked.
+    var automationSource: CodexThreadAutomationSource? {
+        switch threadSource?.lowercased() {
+        case "pull_request_fix_automation": return .pullRequestFix
+        case "automation": return .scheduled
+        default: return nil
+        }
     }
 
     var preferredSubagentLabel: String? {
@@ -461,9 +524,20 @@ extension CodexThread {
         return nil
     }
 
-    // Stable key for grouping threads by project.
-    var projectKey: String {
-        normalizedProjectPath ?? Self.noProjectGroupKey
+    // A managed worktree is a checkout of the project it was cut from, not a project of its own,
+    // so it groups under its origin the way the desktop app does. Falls back to the worktree path
+    // when the origin is unknown (older bridge, or a worktree that no longer exists on disk).
+    var projectGroupPath: String? {
+        guard isManagedWorktreeProject, let normalizedOriginPath = Self.normalizeProjectPath(worktreeOriginPath) else {
+            return normalizedProjectPath
+        }
+
+        return normalizedOriginPath
+    }
+
+    // Stable key for grouping threads by the project a chat belongs to.
+    var projectGroupKey: String {
+        projectGroupPath ?? Self.noProjectGroupKey
     }
 
     // User-facing project label shown in the sidebar section header.
@@ -473,7 +547,17 @@ extension CodexThread {
 
     // Reuses the same worktree detection across the sidebar, toolbar, and composer affordances.
     var isManagedWorktreeProject: Bool {
-        Self.projectIconSystemName(for: normalizedProjectPath) == "remodex.worktree"
+        Self.isManagedWorktreePath(normalizedProjectPath)
+    }
+
+    // Single source of truth for "this path is a Codex-managed worktree", so callers never have
+    // to compare against the glyph name the sidebar happens to use for it.
+    static func isManagedWorktreePath(_ normalizedProjectPath: String?) -> Bool {
+        guard let normalizedProjectPath else {
+            return false
+        }
+
+        return codexManagedWorktreeToken(for: normalizedProjectPath) != nil
     }
 
     // Distinguishes Codex-managed worktrees from the main repo in compact sidebar UIs.
@@ -495,7 +579,7 @@ extension CodexThread {
             return "bubble.left.and.bubble.right"
         }
 
-        return codexManagedWorktreeToken(for: normalizedProjectPath) == nil ? "folder" : "remodex.worktree"
+        return isManagedWorktreePath(normalizedProjectPath) ? "remodex.worktree" : "folder"
     }
 
     // Shared path gate for every flow that needs to decide whether a cwd represents a real local project.

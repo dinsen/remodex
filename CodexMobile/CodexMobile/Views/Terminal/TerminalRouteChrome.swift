@@ -5,6 +5,7 @@
 // Depends on: SwiftUI, RemodexTerminalTheme, TerminalUIModels, AdaptiveGlassModifier
 
 import SwiftUI
+import UIKit
 
 // MARK: - Navigation title
 
@@ -16,7 +17,7 @@ struct TerminalRouteTitle: View {
     var body: some View {
         VStack(spacing: 1) {
             Text(topLine)
-                .font(.system(size: 13, weight: .bold))
+                .font(AppFont.system(size: 13, weight: .bold))
                 .foregroundStyle(Color(hexString: theme.foreground))
                 .lineLimit(1)
 
@@ -221,32 +222,29 @@ private struct TerminalRouteKeySegment: View {
     // Tap = toggle pending modifier; long-press surfaces the system menu so the
     // user can switch between cmd/shift/alt/ctrl without remembering a gesture.
     private var modifierSegment: some View {
-        Menu {
-            Picker(
-                selection: Binding<TerminalPendingModifier>(
-                    get: { action.modifier ?? .ctrl },
-                    set: { newValue in
-                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
-                        onSelectModifier(newValue)
-                    }
-                ),
-                label: Text("Modifier key")
-            ) {
-                ForEach(TerminalPendingModifier.allCases, id: \.self) { modifier in
-                    RemodexIcon.menuLabel(modifier.menuTitle, systemName: modifier.menuSymbolName)
-                        .tag(modifier)
-                }
-            }
-            .pickerStyle(.inline)
-        } label: {
-            segmentLabel
-        } primaryAction: {
+        Button {
             HapticFeedback.shared.triggerImpactFeedback(style: .light)
             onAction(action)
+        } label: {
+            segmentLabel
         }
-        .menuOrder(.fixed)
         .buttonStyle(.plain)
         .disabled(!isEnabled)
+        .uiKitContextMenu {
+            UIMenu(
+                options: [.singleSelection],
+                children: TerminalPendingModifier.allCases.map { modifier in
+                    UIAction(
+                        title: modifier.menuTitle,
+                        image: RemodexIcon.menuUIImage(systemName: modifier.menuSymbolName),
+                        state: modifier == (action.modifier ?? .ctrl) ? .on : .off
+                    ) { _ in
+                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                        onSelectModifier(modifier)
+                    }
+                }
+            )
+        }
         .accessibilityLabel("\(action.label) modifier")
         .accessibilityHint("Tap to arm. Long-press to choose between cmd, shift, alt, and ctrl.")
     }
@@ -565,17 +563,17 @@ struct TerminalRouteUnavailableView: View {
                 .foregroundStyle(Color(hexString: theme.foreground))
 
             Text(title)
-                .font(.system(size: 15, weight: .bold))
+                .font(AppFont.system(size: 15, weight: .bold))
                 .foregroundStyle(Color(hexString: theme.foreground))
 
             Text(detail)
-                .font(.system(size: 12))
+                .font(AppFont.system(size: 12))
                 .foregroundStyle(Color(hexString: theme.mutedForeground))
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 28)
 
             Button("SSH connection", action: action)
-                .font(.system(size: 12, weight: .bold))
+                .font(AppFont.system(size: 12, weight: .bold))
                 .buttonStyle(.borderedProminent)
                 .padding(.top, 4)
         }

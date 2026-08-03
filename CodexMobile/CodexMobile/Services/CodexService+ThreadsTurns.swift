@@ -281,7 +281,7 @@ extension CodexService {
                     )
                 }
                 if let normalizedProjectPath = thread.normalizedProjectPath,
-                   CodexThread.projectIconSystemName(for: normalizedProjectPath) == "arrow.triangle.branch" {
+                   CodexThread.isManagedWorktreePath(normalizedProjectPath) {
                     rememberAssociatedManagedWorktreePath(normalizedProjectPath, for: thread.id)
                 }
                 activeThreadId = thread.id
@@ -1164,7 +1164,9 @@ private extension CodexService {
 
         return pendingApprovals.remove(at: exactIndex)
     }
+}
 
+extension CodexService {
     func normalizedApprovalThreadIdentifier(_ rawValue: String?) -> String? {
         guard let rawValue else {
             return nil
@@ -1299,6 +1301,9 @@ extension CodexService {
             // Avoid the server's narrower default sourceKinds so multi-project history
             // includes threads started from the app-server flow as well.
             "sourceKinds": .array(sourceKinds.map(JSONValue.string)),
+            // The app-server defaults to created_at, which can exclude an old thread
+            // with recent activity from this capped sidebar window.
+            "sortKey": .string("updated_at"),
             "cursor": cursor,
         ]
         if let limit {
@@ -1703,8 +1708,6 @@ extension CodexService {
                     setProtectedRunningFallback(true, for: normalizedThreadID)
                 } else {
                     let existingTurnID = activeTurnID(for: normalizedThreadID)
-                    let latestTurnClosesExistingRun = existingTurnID != nil
-                        && snapshot.latestTurnID == existingTurnID
                     let hasUnconfirmedProtectedRun = (
                         protectedRunningFallbackThreadIDs.contains(normalizedThreadID)
                             || pendingReconnectRunContinuityThreadIDs.contains(normalizedThreadID)
@@ -1716,11 +1719,21 @@ extension CodexService {
                         }
                         return true
                     }
-                    if latestTurnClosesExistingRun {
-                        clearRunningState(for: normalizedThreadID)
-                    } else if isDesktopMirroredRunning(normalizedThreadID),
+                    // On a busy mirrored thread the bounded snapshot often reads the
+                    // still-streaming latest turn as non-interruptible for a beat.
+                    // Closing the run on that read alone (even when the snapshot's
+                    // latest turn matches the tracked one) makes the running state
+                    // flap on every probe, so the stale-snapshot grace guard decides
+                    // here too. A snapshot whose latest turn IS the tracked one is
+                    // positive closure evidence and only gets the short grace.
+                    let snapshotClosesTrackedTurn = existingTurnID != nil
+                        && snapshot.latestTurnID == existingTurnID
+                    if isDesktopMirroredRunning(normalizedThreadID),
                        threadHasActiveOrRunningTurn(normalizedThreadID),
-                       shouldPreserveDesktopMirroredRunningAfterStaleSnapshot(for: normalizedThreadID) {
+                       shouldPreserveDesktopMirroredRunningAfterStaleSnapshot(
+                           for: normalizedThreadID,
+                           snapshotClosesTrackedTurn: snapshotClosesTrackedTurn
+                       ) {
                         markThreadAsRunning(normalizedThreadID)
                         if let existingTurnID {
                             setProtectedRunningFallback(false, for: normalizedThreadID)
@@ -3443,11 +3456,25 @@ extension CodexService {
                         ?? resultObject["turns"]?.arrayValue
                         ?? []
                 ).compactMap { $0.objectValue }
-                return turnStateSnapshot(
+                let snapshot = turnStateSnapshot(
                     from: turnObjects,
                     newestFirst: true,
                     knownParallelTurnIDs: knownParallelTurnIDs(for: threadId)
                 )
+                // The bridge's rollout mirror rides its actively-tailed turn id
+                // along on the probe. It is fresher than the bounded canonical
+                // page, which can read a busy run as closed for a beat, so honor
+                // it whenever the page itself found nothing interruptible.
+                if snapshot.interruptibleTurnID == nil,
+                   !snapshot.hasInterruptibleTurnWithoutID,
+                   let mirrorActiveTurnID = normalizedInterruptIdentifier(
+                       resultObject["remodexMirrorActiveTurnId"]?.stringValue
+                   ),
+                   !Self.isSyntheticPlaceholderTurnID(mirrorActiveTurnID),
+                   turnTerminalState(for: mirrorActiveTurnID, threadId: threadId) == nil {
+                    return (mirrorActiveTurnID, false, snapshot.latestTurnID)
+                }
+                return snapshot
             } catch {
                 if shouldFallbackTurnSnapshotToThreadRead(error) {
                     debugSyncLog("thread/turns/list unavailable for fresh thread=\(threadId); resolving stop state via thread/read")

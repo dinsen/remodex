@@ -224,30 +224,18 @@ private struct SettingsAppearanceCard: View {
 
     var body: some View {
         SettingsCard(title: "Appearance") {
-            Picker("Font", selection: $appFontStyle) {
-                ForEach(AppFont.Style.allCases) { style in
-                    Text(style.title).tag(style)
-                }
-            }
-            .pickerStyle(.menu)
-            .tint(settingsAccentColor)
+            SettingsMenuPickerRow(
+                title: "Font",
+                value: appFontStyle.title,
+                options: AppFont.Style.allCases.map { style in
+                    SettingsMenuPickerOption(value: style, title: style.title)
+                },
+                selection: $appFontStyle
+            )
 
             HStack {
                 Text("Message Bubble")
-                Menu {
-                    ForEach(UserBubbleColor.allCases) { color in
-                        Button {
-                            userBubbleColorRawValue = color.rawValue
-                        } label: {
-                            Label {
-                                Text(color.title)
-                            } icon: {
-                                Image(uiImage: color.menuSwatchImage)
-                                    .renderingMode(.original)
-                            }
-                        }
-                    }
-                } label: {
+                UIKitMenuButton {
                     HStack {
                         Spacer()
                         Circle()
@@ -256,6 +244,19 @@ private struct SettingsAppearanceCard: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 28, alignment: .trailing)
                     .contentShape(Rectangle())
+                } menu: {
+                    UIMenu(
+                        options: [.singleSelection],
+                        children: UserBubbleColor.allCases.map { color in
+                            UIAction(
+                                title: color.title,
+                                image: color.menuSwatchImage,
+                                state: color == selectedUserBubbleColor ? .on : .off
+                            ) { _ in
+                                userBubbleColorRawValue = color.rawValue
+                            }
+                        }
+                    )
                 }
                 .accessibilityLabel("Message Bubble color")
                 .accessibilityValue(selectedUserBubbleColor.title)
@@ -477,7 +478,7 @@ private struct SettingsPetCompanionSection: View {
                 HStack(spacing: 8) {
                     Text("Companion Pet")
                     Text("BETA")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(AppFont.caption2(weight: .semibold))
                         .tracking(0.5)
                         .foregroundStyle(settingsAccentColor)
                         .padding(.horizontal, 6)
@@ -497,13 +498,14 @@ private struct SettingsPetCompanionSection: View {
                             : "No local pets found in ~/.codex/pets."
                     )
                 } else {
-                    Picker("Pet", selection: selectedPetBinding) {
-                        ForEach(petStore.availablePets) { pet in
-                            Text(pet.displayName).tag(pet.id)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .tint(settingsAccentColor)
+                    SettingsMenuPickerRow(
+                        title: "Pet",
+                        value: petStore.selectedPet?.displayName ?? "None",
+                        options: petStore.availablePets.map { pet in
+                            SettingsMenuPickerOption(value: pet.id, title: pet.displayName)
+                        },
+                        selection: selectedPetBinding
+                    )
                 }
 
                 if let errorMessage = petStore.errorMessage {

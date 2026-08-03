@@ -193,6 +193,13 @@ extension CodexService {
         } catch is CancellationError {
             return
         } catch {
+            // A capped thread/list timing out while the socket still accepts writes is the
+            // signature of a half-open connection: recover the transport instead of polling
+            // a dead peer every cycle.
+            if isConnected, isAppInForeground, isRecoverableTransientConnectionError(error) {
+                handleReceiveError(error)
+                return
+            }
             presentConnectionErrorIfNeeded(error)
         }
     }
@@ -909,6 +916,23 @@ extension CodexService {
         return message.contains("thread not found") || message.contains("unknown thread")
     }
 
+    // The runtime writes a thread's rollout file with its first turn, so `thread/resume`
+    // fails this way for a chat that exists but has never run one — and for a chat that
+    // just moved to a new cwd. The thread itself is fine; there is simply nothing to
+    // restore yet, so callers keep going instead of surfacing an error.
+    func isMissingRolloutError(_ error: Error) -> Bool {
+        let message: String
+        if let serviceError = error as? CodexServiceError,
+           case .rpcError(let rpcError) = serviceError {
+            message = rpcError.message.lowercased()
+        } else {
+            message = error.localizedDescription.lowercased()
+        }
+
+        return message.contains("no rollout found")
+            || message.contains("no rollout file found")
+    }
+
     // Preserves locally derived metadata keys (for example repo context) when server payload is sparse.
     func mergedThreadMetadata(
         serverMetadata: [String: JSONValue]?,
@@ -938,6 +962,17 @@ extension CodexService {
             || runningThreadIDs.contains(threadId)
             || protectedRunningFallbackThreadIDs.contains(threadId)
             || desktopMirroredRunningThreadIDs.contains(threadId)
+    }
+
+    // Only exact thread matches count: approvals that arrive without a thread id are
+    // routed to the open chat at prompt time and must not badge an unrelated row.
+    func threadHasPendingApproval(_ threadId: String) -> Bool {
+        guard let normalizedThreadID = normalizedApprovalThreadIdentifier(threadId) else {
+            return false
+        }
+        return pendingApprovals.contains {
+            normalizedApprovalThreadIdentifier($0.threadId) == normalizedThreadID
+        }
     }
 
     // Keeps short-lived background execution alive when a run is still in flight.

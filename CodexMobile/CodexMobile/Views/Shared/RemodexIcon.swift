@@ -17,9 +17,10 @@ enum RemodexIcon {
         "arrow.up.right.square": "central-fork-code",
         "at": "central-at",
         "bell.badge": "central-bell-2",
-        // Single source for the fast-mode glyph: every fast-mode affordance
-        // renders the solid Central `zap` (same artwork Synara uses).
-        "bolt": "central-zap",
+        // Fast-mode glyph pair (same artwork Synara uses): the outline
+        // `central-icons-reversed` zap for the off state, the solid
+        // `central-icons-fill` zap for the on state.
+        "bolt": "central-zap-outline",
         "bolt.fill": "central-zap",
         "brain": "central-brain",
         "bubble.left.and.bubble.right": "central-bubble-5",
@@ -84,7 +85,13 @@ enum RemodexIcon {
         "qrcode": "central-qr-code",
         "qrcode.viewfinder": "central-scan-code",
         "remodex.agent": "central-robot",
-        "remodex.auto-review": "central-shield-check-3",
+        // Same glyph Synara puts on scheduled automations, so a chat an automation
+        // started reads the same on both surfaces.
+        "remodex.automation": "central-clock",
+        // "Approve for me" is a sandbox, not a verdict: the shield keeps the security
+        // family and the brackets say the guard is the one reading the command. Every
+        // surface resolves it through this one name so Codex and Remodex never drift.
+        "remodex.auto-review": "central-shield-code",
         "remodex.branch": "central-branch",
         "remodex.changes": "changes",
         "remodex.plan-mode": "central-planning",
@@ -195,14 +202,9 @@ enum RemodexIcon {
         return resized.withRenderingMode(.alwaysTemplate)
     }
 
-    // Larger than the ~17pt body-equivalent SF Symbol menu glyph: the
-    // Central artwork's thin stroke reads visually smaller than an SF Symbol
-    // at the same point size, so bumping to 20pt gives the custom glyphs
-    // the "a little bolder than native" feel the design calls for without
-    // going back to the original 24pt mismatch this helper was introduced
-    // to fix.
+    // Keep custom menu artwork on the same compact metric as native symbols.
     private static var menuGlyphPointSize: CGFloat {
-        UIFontMetrics.default.scaledValue(for: 20)
+        AppMenuPresentation.glyphPointSize
     }
 }
 
