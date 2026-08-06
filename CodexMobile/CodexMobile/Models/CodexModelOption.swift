@@ -230,9 +230,14 @@ private enum CodexModelCapabilityResolver {
             return advertised
         }
 
-        var result = advertised
+        let allowedEfforts = Set(fallbackEfforts)
+        var result = advertised.filter {
+            allowedEfforts.contains(
+                $0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
+        }
         var seen = Set(
-            advertised.map {
+            result.map {
                 $0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             }
         )

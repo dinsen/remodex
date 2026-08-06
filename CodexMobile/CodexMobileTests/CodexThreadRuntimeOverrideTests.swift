@@ -268,7 +268,7 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(service.runtimeModelIdentifierForTurn(), "gpt-5.6-terra")
     }
 
-    func testModelListRefreshUsesGPT55WhenGPT56FamilyIsUnavailable() {
+    func testFallbackModelUsesGPT55WhenProvidedModelsExcludeGPT56Family() {
         let service = makeService()
         service.availableModels = [makeGPT55Model(), makeModel()]
         service.normalizeRuntimeSelectionsAfterModelsUpdate()
@@ -313,6 +313,48 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(
             service.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort),
             ["low", "medium", "high", "xhigh", "max"]
+        )
+    }
+
+    func testModelListDoesNotDuplicateAdvertisedGPT56Models() async throws {
+        let service = makeService()
+        service.requestTransportOverride = { method, _ in
+            XCTAssertEqual(method, "model/list")
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "items": .array([
+                        .object([
+                            "id": .string("gpt-5.6-sol"),
+                            "model": .string("gpt-5.6-sol"),
+                            "displayName": .string("Runtime GPT-5.6 Sol"),
+                            "supportsFastMode": .bool(true),
+                            "supportedReasoningEfforts": .array([.string("medium")]),
+                            "defaultReasoningEffort": .string("medium"),
+                        ]),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        try await service.listModels()
+
+        XCTAssertEqual(
+            service.availableModels.filter { $0.id == "gpt-5.6-sol" }.count,
+            1
+        )
+        XCTAssertEqual(
+            service.availableModels.first { $0.id == "gpt-5.6-sol" }?.displayName,
+            "Runtime GPT-5.6 Sol"
+        )
+        XCTAssertEqual(
+            Set(service.availableModels.map(\.id)).intersection(Set([
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ])).count,
+            3
         )
     }
 
@@ -366,6 +408,20 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
             service.supportedReasoningEffortsForSelectedModel()
                 .contains { $0.reasoningEffort == "xhigh" }
         )
+    }
+
+    func testGPT55DoesNotAllowMaxReasoning() {
+        let service = makeService()
+        service.availableModels = [makeGPT55Model()]
+        service.setSelectedModelId("gpt-5.5")
+        service.setSelectedReasoningEffort("max")
+
+        XCTAssertEqual(
+            service.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort),
+            ["medium", "high", "low", "xhigh"]
+        )
+        XCTAssertEqual(service.selectedReasoningEffort, "medium")
+        XCTAssertEqual(service.selectedReasoningEffortForSelectedModel(), "medium")
     }
 
     func testRuntimeOptionRefreshAppliesDesktopRuntimeDefaultsOnDemand() async {
