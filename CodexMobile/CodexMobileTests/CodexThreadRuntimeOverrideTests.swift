@@ -277,6 +277,45 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(service.runtimeModelIdentifierForTurn(), "gpt-5.5")
     }
 
+    func testModelListAddsGPT56ModelsWhenBridgeOmitsThem() async throws {
+        let service = makeService()
+        service.requestTransportOverride = { method, _ in
+            XCTAssertEqual(method, "model/list")
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "items": .array([
+                        .object([
+                            "id": .string("gpt-5.5"),
+                            "model": .string("gpt-5.5"),
+                            "displayName": .string("GPT-5.5"),
+                            "supportsFastMode": .bool(true),
+                            "supportedReasoningEfforts": .array([
+                                .string("medium"),
+                                .string("high"),
+                            ]),
+                            "defaultReasoningEffort": .string("medium"),
+                        ]),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        try await service.listModels()
+
+        let orderedModels = TurnComposerMetaMapper.orderedModels(from: service.availableModels)
+        XCTAssertEqual(
+            orderedModels.prefix(3).map(\.id),
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        )
+        XCTAssertEqual(service.selectedModelId, "gpt-5.6-sol")
+        XCTAssertEqual(
+            service.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort),
+            ["low", "medium", "high", "xhigh", "max"]
+        )
+    }
+
     func testGPT56ModelsAreFirstClassRuntimeMenuModels() {
         let orderedModels = TurnComposerMetaMapper.orderedModels(
             from: [

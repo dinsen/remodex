@@ -29,6 +29,13 @@ private enum RuntimeSelectionDefaults {
     static let modelId = "gpt-5.6-sol"
     static let fallbackModelIds = [modelId, "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
     static let reasoningEffort = "medium"
+    static let reasoningEfforts = ["low", "medium", "high", "xhigh", "max"]
+
+    private static let seededModelDefinitions: [(id: String, displayName: String)] = [
+        ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    ]
 
     static func reasoningEffort(for unresolvedModelId: String?) -> String? {
         guard let unresolvedModelId,
@@ -36,6 +43,33 @@ private enum RuntimeSelectionDefaults {
             return nil
         }
         return reasoningEffort
+    }
+
+    static func modelOptions(merging advertisedModels: [CodexModelOption]) -> [CodexModelOption] {
+        var result = advertisedModels
+        var knownIdentifiers = Set(
+            advertisedModels.flatMap { model in
+                [model.id, model.model].map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+            }
+        )
+
+        for definition in seededModelDefinitions where knownIdentifiers.insert(definition.id).inserted {
+            result.append(CodexModelOption(
+                id: definition.id,
+                model: definition.id,
+                displayName: definition.displayName,
+                description: "",
+                isDefault: definition.id == modelId,
+                supportsFastMode: true,
+                supportedReasoningEfforts: reasoningEfforts.map {
+                    CodexReasoningEffortOption(reasoningEffort: $0, description: "")
+                },
+                defaultReasoningEffort: reasoningEffort
+            ))
+        }
+        return result
     }
 }
 
@@ -200,11 +234,12 @@ extension CodexService {
                 ?? []
 
             let decodedModels = items.compactMap { decodeModel(CodexModelOption.self, from: $0) }
-            availableModels = decodedModels
+            let runtimeModels = RuntimeSelectionDefaults.modelOptions(merging: decodedModels)
+            availableModels = runtimeModels
             modelsErrorMessage = nil
             normalizeRuntimeSelectionsAfterModelsUpdate()
 
-            debugRuntimeLog("model/list success count=\(decodedModels.count)")
+            debugRuntimeLog("model/list success count=\(runtimeModels.count)")
         } catch {
             handleModelListFailure(error)
             throw error
