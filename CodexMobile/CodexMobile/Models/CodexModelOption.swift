@@ -184,14 +184,19 @@ struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
 private enum CodexModelCapabilityResolver {
     // Mirrors the desktop capability table only when older bridges omit explicit model speed metadata.
     private static let staticFastModeModelIdentifiers: Set<String> = [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.2-codex",
         "gpt-5.2",
     ]
-    // Older model/list payloads can omit GPT-5.5's full reasoning menu even though desktop supports it.
     private static let staticReasoningEffortsByModelIdentifier: [String: [String]] = [
+        "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
+        "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
+        "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
         "gpt-5.5": ["low", "medium", "high", "xhigh"],
     ]
 
