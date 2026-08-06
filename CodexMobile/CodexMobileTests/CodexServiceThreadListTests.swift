@@ -421,6 +421,11 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertFalse(service.pendingRuntimeOptionRefresh)
         XCTAssertNil(service.runtimeOptionRefreshTask)
         XCTAssertNil(service.runtimeOptionRefreshToken)
+        XCTAssertEqual(
+            TurnComposerMetaMapper.orderedModels(from: service.availableModels).prefix(3).map(\.id),
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        )
+        XCTAssertEqual(service.selectedModelId, "gpt-5.6-sol")
     }
 
     func testSortThreadsUsesUpdatedAtBeforeCreatedAtFallback() {
