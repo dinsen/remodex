@@ -1,6 +1,6 @@
 # Native Codex Pins Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution rule:** Do not use subagents. Execute coding and commands in a separate user-visible Codex task with GPT-5.6 Luna at Max reasoning. Review the implementation in a separate read-only Codex task with GPT-5.6 Sol at High reasoning. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make Codex's native `Pinned` section the sole writable source of truth and show its root threads once, in native order, above all projects in the iOS sidebar.
 
@@ -11,6 +11,14 @@
 **Approved design:** `Docs/superpowers/specs/2026-08-10-native-codex-pins-design.md`
 
 ---
+
+## Task workflow
+
+1. Create one isolated implementation task with GPT-5.6 Luna at Max reasoning. Give it this plan, the approved design, repository instructions, acceptance criteria, verification commands, risks, and non-goals.
+2. Keep all coding, shell commands, commits, and test execution in that implementation task. Do not delegate any step to a subagent.
+3. After implementation and targeted verification, create a separate GPT-5.6 Sol task at High reasoning. Give it the approved design, this plan, the implementation commit range, the diff, and test evidence. Keep this review task read-only.
+4. If Sol finds a verified issue, send the finding back to the Luna implementation task. Let Luna fix and verify it, then ask the same Sol review task to review the new diff.
+5. Finish only after Sol explicitly approves. Then archive both tasks and remove only the task-owned worktree after confirming that all intended changes are committed.
 
 ## Task 1: Preserve section queries and metadata through the local relay
 
@@ -385,9 +393,11 @@ Confirm manually from the diff:
 - pinned roots render only once above Projects with filled root-only icons;
 - no selected-repository filtering or hosted-service assumptions were introduced.
 
-- [ ] **Step 4: Request an independent implementation review**
+- [ ] **Step 4: Request an independent Sol High implementation review**
 
-Use `superpowers:requesting-code-review` with the approved spec and this plan. Resolve only verified findings, rerunning the smallest affected tests after each fix.
+Create a separate read-only Codex task using GPT-5.6 Sol with High reasoning. Provide the approved spec, this plan, the implementation commit range, final diff, and exact test evidence. Ask it to verify spec alignment, migration safety, refresh/mutation ordering, relay ordering, UI hierarchy, and remaining risks.
+
+If it finds a verified issue, send the finding to the GPT-5.6 Luna Max implementation task. Let Luna make the fix and run the smallest affected tests. Return the updated diff and evidence to the same Sol review task. Do not use subagents at any point.
 
 - [ ] **Step 5: Record final evidence**
 
