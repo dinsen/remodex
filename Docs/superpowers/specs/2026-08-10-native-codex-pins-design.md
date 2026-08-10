@@ -11,9 +11,10 @@ Remodex keeps a separate, Mac-scoped list of locally pinned thread IDs and snaps
 Codex app-server 0.147.0 exposes persisted thread sections through its experimental protocol:
 
 - `threadSection/list` lists sections, including the user-visible `Pinned` section.
+- `threadSection/create` creates a section from `{ "name": "Pinned" }`.
 - `thread/list` accepts `sectionId` and `sortKey: "section_position"`.
 - thread rows can contain `section` and `sectionEnteredAt` metadata.
-- `thread/section/move` moves a thread into a section or removes it by passing a null section ID.
+- `thread/section/move` accepts `threadId`, nullable `sectionId`, and optional nullable `beforeThreadId`. A null section ID removes the thread from its section; `beforeThreadId` inserts it before an existing thread and omission appends it.
 
 ## Source of truth
 
@@ -38,28 +39,37 @@ During thread synchronization, Remodex will:
 
 This native pin refresh runs with the existing thread refresh lifecycle, including reconnect, foreground recovery, pull-to-refresh, and sidebar refresh. A pinned thread omitted by the normal recent-thread page must still appear from the dedicated pinned query.
 
+If section lookup succeeds and no Pinned section exists, that is a confirmed empty native pin list. Clear stale native pin IDs and snapshots. Do not create an empty section unless migration or a Pin action needs one.
+
 ## Legacy migration
 
 Existing iOS-only pins migrate into Codex once section support is available:
 
-1. Resolve the native Pinned section, creating it only when migration or a new Pin action requires one.
-2. Move every legacy locally pinned root into that section without removing native pins.
-3. Refresh the native pinned list.
-4. Clear the legacy pin IDs and snapshots only after all moves and the refresh succeed.
+1. Resolve the native Pinned section with `threadSection/list`, creating it through `threadSection/create` only when migration or a new Pin action requires one.
+2. Refresh the native Pinned section before each migration attempt.
+3. Form a deduplicated legacy-only list by removing IDs already present natively while preserving legacy order.
+4. Move legacy-only roots in reverse order. Each `thread/section/move` uses the current first pinned root as `beforeThreadId`, producing `legacy order + existing native order` without reordering an already-native thread.
+5. Recompute the missing legacy-only IDs after any retry and move only those IDs.
+6. Refresh the native pinned list.
+7. Clear the legacy pin IDs and snapshots only after every legacy ID is confirmed in the native section.
 
-If any step fails, keep all legacy migration data and retry during a later sync. This makes the migration idempotent and prevents partial data loss. Once cleared, local pins cannot reappear as an independent source of truth.
+If any step fails, keep all legacy migration data and retry during a later sync. While migration is pending, the displayed order is a deduplicated `legacy order + last confirmed native order`, so pins neither disappear nor appear twice during a partial migration. This union is a temporary read-only compatibility view; new Pin and Unpin actions remain native mutations. Pin and Unpin actions wait for the serialized migration attempt, and if migration is still incomplete the action fails with the synchronization error instead of creating more local state.
+
+Re-reading native state and skipping IDs already present makes migration idempotent. Once every legacy ID is confirmed and legacy storage is cleared, local pins cannot reappear as an independent source of truth.
 
 ## Pin and Unpin actions
 
 The existing long-press menu remains the interaction surface.
 
-- **Pin:** resolve or create the Pinned section, then call `thread/section/move` for the root thread. Insert it before the current first pinned root so the newest pin appears first.
-- **Unpin:** call `thread/section/move` with a null section ID.
+- **Pin:** resolve or create the Pinned section, then call `thread/section/move` with the root `threadId`, the Pinned `sectionId`, and the current first pinned root as `beforeThreadId`. The newest pin appears first.
+- **Unpin:** call `thread/section/move` with the root `threadId` and a null `sectionId`; omit `beforeThreadId`.
 - Serialize pin mutations so rapid actions cannot reorder or overwrite one another.
-- Do not change the visible grouping until Codex confirms the mutation and the native pin refresh succeeds.
+- Do not change the visible grouping before Codex confirms the move.
 - Keep the existing restriction that archived threads and subagent threads cannot be pinned directly.
 
 After a confirmed Unpin, the thread returns to its normal project group. After a confirmed Pin, it leaves that project group and appears only in the flat Pinned list.
+
+After a successful move response, apply that confirmed add or removal to the cached native pin view immediately, persist the confirmed cache, and then request a full native refresh. If the refresh fails, retain the response-confirmed UI change, expose the existing background-sync failure status, and retry reconciliation during the next normal sync. Do not report the confirmed Pin or Unpin as failed.
 
 ## Sidebar presentation
 
@@ -92,6 +102,18 @@ On an unsupported Codex runtime:
 - tell the user that Codex must be updated to synchronize pins.
 
 On timeouts or other mutation failures, keep the confirmed grouping unchanged and surface the existing user-visible error path. Never claim success before Codex confirms the move.
+
+### State transitions
+
+| Event | Displayed state | Persisted/migration state | User feedback |
+|---|---|---|---|
+| Section lookup succeeds with no Pinned section and no migration | Empty Pinned area | Clear stale native cache; do not create a section | None |
+| Section absent while migration or Pin needs it | Keep the last confirmed or migration-union view until creation succeeds | Create `Pinned`, then continue the serialized operation | Error only if creation fails |
+| Migration partially succeeds | Deduplicated legacy order followed by confirmed native order | Retain all legacy data; next attempt moves only missing IDs | Existing synchronization error path |
+| Pin or Unpin move fails | Unchanged confirmed view | Unchanged cache | Existing error path |
+| Pin or Unpin move succeeds, refresh succeeds | Fully refreshed native view | Replace confirmed cache | Success through the row move; no extra message |
+| Pin or Unpin move succeeds, refresh fails | Apply the response-confirmed add/removal | Persist the deterministic confirmed change; retry full refresh later | Expose the existing background-sync failure status, not a mutation failure |
+| Runtime rejects section APIs | Last confirmed cached view | Retain migration data; create no new local mutation | Tell the user to update Codex |
 
 ## Verification
 
