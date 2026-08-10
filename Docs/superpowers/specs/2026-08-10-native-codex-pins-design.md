@@ -124,9 +124,11 @@ Focused tests will cover:
 - merging older pinned rows that are absent from normal pagination;
 - excluding pinned roots and their visible descendants from project groups;
 - showing each pinned root exactly once above Projects;
+- the deduplicated temporary migration-union view;
 - legacy migration success, partial failure, retention, and retry;
 - creating the Pinned section only when required;
 - Pin and Unpin success, timeout, and unsupported-runtime behavior;
+- a successful Pin or Unpin followed by a failed full refresh;
 - serial mutation ordering;
 - the filled row pin and its accessibility semantics.
 
