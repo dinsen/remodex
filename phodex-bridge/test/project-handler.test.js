@@ -132,6 +132,45 @@ trust_level = "trusted"
   );
 });
 
+test("project/configuredProjects resolves Codex desktop project ids through local project roots", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectsRoot = path.join(homeDir, "projects");
+  const alphaProject = path.join(projectsRoot, "alpha");
+  const betaProject = path.join(projectsRoot, "beta");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "project-order": [
+      "local-beta",
+      "local-alpha",
+    ],
+    "local-projects": {
+      "local-alpha": {
+        id: "local-alpha",
+        name: "Alpha",
+        rootPaths: [alphaProject],
+      },
+      "local-beta": {
+        id: "local-beta",
+        name: "Beta",
+        rootPaths: [betaProject],
+      },
+    },
+  }));
+
+  const result = await projectConfiguredProjects({ codexHome, homeDir });
+
+  assert.deepEqual(
+    result.projects.map((project) => project.path),
+    [
+      fs.realpathSync(betaProject),
+      fs.realpathSync(alphaProject),
+    ]
+  );
+});
+
 test("project/configuredProjects falls back to saved workspace roots when project order is missing", async () => {
   const homeDir = makeTempHome();
   const codexHome = path.join(homeDir, ".codex");

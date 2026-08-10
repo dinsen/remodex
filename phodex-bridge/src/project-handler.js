@@ -206,13 +206,24 @@ async function readDesktopProjectRootOrder(codexHome, options = {}) {
   }
 
   const roots = Array.isArray(parsed?.["project-order"]) && parsed["project-order"].length > 0
-    ? parsed["project-order"]
+    ? desktopProjectOrderRootPaths(parsed["project-order"], parsed)
     : Array.isArray(parsed?.["electron-saved-workspace-roots"])
       ? parsed["electron-saved-workspace-roots"]
       : [];
   return roots
     .map((rootPath) => canonicalProjectOrderPath(rootPath))
     .filter(Boolean);
+}
+
+function desktopProjectOrderRootPaths(projectOrder, globalState) {
+  const localProjects = globalState?.["local-projects"] || {};
+  return projectOrder.flatMap((entry) => {
+    const projectId = readString(entry);
+    const rootPaths = projectId && Array.isArray(localProjects?.[projectId]?.rootPaths)
+      ? localProjects[projectId].rootPaths
+      : null;
+    return rootPaths?.length ? rootPaths : [entry];
+  });
 }
 
 function canonicalProjectOrderPath(projectPath) {
