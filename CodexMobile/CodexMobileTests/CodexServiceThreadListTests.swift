@@ -231,7 +231,7 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.threads.map(\.id), ["thread-active"])
     }
 
-    func testNativePinnedThreadsPreserveSectionOrder() async throws {
+    func testNativePinnedThreadListRetainsAllSourceKindsAndAscendingOrderOnRetry() async throws {
         let service = makeService()
         var threadListParams: [RPCObject] = []
         var threadListCallCount = 0
@@ -285,10 +285,10 @@ final class CodexServiceThreadListTests: XCTestCase {
         ])
         XCTAssertEqual(threadListParams.count, 3)
         XCTAssertTrue(threadListParams[0]["sourceKinds"]?.arrayValue?.compactMap(\.stringValue).contains("subAgent") == true)
-        XCTAssertEqual(
-            threadListParams[1]["sourceKinds"]?.arrayValue?.compactMap(\.stringValue),
-            ["cli", "vscode", "appServer", "exec", "unknown"]
-        )
+        XCTAssertEqual(threadListParams[0]["sourceKinds"]?.arrayValue?.compactMap(\.stringValue), service.threadListSourceKinds)
+        XCTAssertEqual(threadListParams[1]["sourceKinds"]?.arrayValue?.compactMap(\.stringValue), service.legacyThreadListSourceKinds)
+        XCTAssertEqual(threadListParams[2]["sourceKinds"]?.arrayValue?.compactMap(\.stringValue), service.legacyThreadListSourceKinds)
+        XCTAssertEqual(threadListParams.map { $0["cursor"] }, [.null, .null, .string("page-two")])
         XCTAssertEqual(threadListParams.map { $0["sectionId"]?.stringValue }, Array(repeating: "pinned-section", count: 3))
         XCTAssertEqual(threadListParams.map { $0["sortKey"]?.stringValue }, Array(repeating: "section_position", count: 3))
         XCTAssertEqual(
@@ -297,7 +297,173 @@ final class CodexServiceThreadListTests: XCTestCase {
         )
     }
 
-    func testMissingSectionClearsStaleNativeCacheWithoutCreation() async throws {
+    func testHostFallbackPreservesHostOrderWhenNativePinnedSectionIsEmpty() async throws {
+        let service = makeService()
+        var methods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            methods.append(method)
+            switch method {
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-a", "host-b"])
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: [])
+            case "threadSection/create", "thread/section/move":
+                XCTFail("Host compatibility must not mutate native sections")
+                return self.emptyRPCResponse()
+            default:
+                XCTFail("Unexpected method \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.synchronizeNativePins()
+
+        XCTAssertEqual(service.confirmedHostPinnedThreadIDs, ["host-a", "host-b"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-a", "host-b"])
+        XCTAssertEqual(service.pinnedStateAuthority, .hostCompatibility)
+        XCTAssertFalse(methods.contains("threadSection/create"))
+        XCTAssertFalse(methods.contains("thread/section/move"))
+    }
+
+    func testNativeAuthorityRequiresCompleteNativeEvidence() async throws {
+        let service = makeService()
+        service.confirmedNativePinnedThreadIDs = ["confirmed-native"]
+        service.rebuildEffectivePinnedThreadState()
+        var threadListCallCount = 0
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                threadListCallCount += 1
+                if threadListCallCount == 1 {
+                    return RPCMessage(
+                        id: .string(UUID().uuidString),
+                        result: .object(["nextCursor": .null]),
+                        includeJSONRPC: false
+                    )
+                }
+                return self.threadListResponse(ids: ["native-authoritative"])
+            case "bridge/hostPins/read":
+                throw CodexServiceError.disconnected
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        do {
+            try await service.synchronizeNativePins()
+            XCTFail("Expected malformed native result")
+        } catch {}
+
+        XCTAssertEqual(service.pinnedStateAuthority, .undecided)
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["confirmed-native"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["confirmed-native"])
+
+        try await service.synchronizeNativePins()
+
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["native-authoritative"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["native-authoritative"])
+    }
+
+    func testNativeAuthorityIgnoresStaleHostAfterLatch() async throws {
+        let service = makeService()
+        var nativeRefreshCount = 0
+        var hostReadCount = 0
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                nativeRefreshCount += 1
+                return self.threadListResponse(ids: nativeRefreshCount == 1 ? ["native-pin"] : [])
+            case "bridge/hostPins/read":
+                hostReadCount += 1
+                return self.hostPinsResponse(ids: ["stale-host-pin"])
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.synchronizeNativePins()
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.pinnedThreadIDs, ["native-pin"])
+
+        try await service.synchronizeNativePins()
+
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.pinnedThreadIDs, [])
+        XCTAssertEqual(service.confirmedHostPinnedThreadIDs, [])
+        XCTAssertEqual(hostReadCount, 0)
+    }
+
+    func testEmptyNativeAndEmptyHostLatchesNative() async throws {
+        let service = makeService()
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: [])
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: [])
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.synchronizeNativePins()
+
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.pinnedThreadIDs, [])
+        XCTAssertEqual(service.confirmedHostPinnedThreadIDs, [])
+    }
+
+    func testMissingMalformedRacingAndOfflineHostReadsRetainConfirmedState() async throws {
+        let service = makeService()
+        service.confirmedHostPinnedThreadIDs = ["host-confirmed", "host-second"]
+        service.confirmedHostPinnedThreadSnapshotsByRootID = [
+            "host-confirmed": [CodexThread(id: "host-confirmed", title: "Confirmed")],
+        ]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+
+        let hostErrors = ["host_pins_unavailable", "host_pins_malformed", "host_pins_racing"]
+        var hostErrorIndex = 0
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                if hostErrorIndex < hostErrors.count {
+                    let errorCode = hostErrors[hostErrorIndex]
+                    hostErrorIndex += 1
+                    throw CodexServiceError.rpcError(RPCError(
+                        code: -32000,
+                        message: "host pin read failed",
+                        data: .object(["errorCode": .string(errorCode)])
+                    ))
+                }
+                throw CodexServiceError.disconnected
+            case "thread/list":
+                return self.threadListResponse(ids: [])
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        for _ in 0..<4 {
+            try await service.synchronizeNativePins()
+            XCTAssertEqual(service.pinnedStateAuthority, .hostCompatibility)
+            XCTAssertEqual(service.pinnedThreadIDs, ["host-confirmed", "host-second"])
+            XCTAssertEqual(service.confirmedHostPinnedThreadIDs, ["host-confirmed", "host-second"])
+        }
+    }
+
+    func testMissingSectionRetainsConfirmedNativeCacheWithoutCreation() async throws {
         let service = makeService()
         service.confirmedNativePinnedThreadIDs = ["stale-pin"]
         service.confirmedNativePinnedThreadSnapshotsByRootID = [
@@ -307,6 +473,9 @@ final class CodexServiceThreadListTests: XCTestCase {
         var methods: [String] = []
         service.requestTransportOverride = { method, _ in
             methods.append(method)
+            if method == "bridge/hostPins/read" {
+                throw CodexServiceError.disconnected
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["data": .array([]), "nextCursor": .null]),
@@ -316,9 +485,9 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         try await service.synchronizeNativePins()
 
-        XCTAssertEqual(methods, ["threadSection/list"])
-        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, [])
-        XCTAssertEqual(service.pinnedThreadIDs, [])
+        XCTAssertEqual(methods, ["threadSection/list", "bridge/hostPins/read"])
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["stale-pin"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["stale-pin"])
     }
 
     func testLegacyStorageNeverCreatesOrMovesNativePins() async throws {
@@ -333,6 +502,9 @@ final class CodexServiceThreadListTests: XCTestCase {
         var methods: [String] = []
         service.requestTransportOverride = { method, _ in
             methods.append(method)
+            if method == "bridge/hostPins/read" {
+                return self.hostPinsResponse(ids: [])
+            }
             if method != "threadSection/list" {
                 XCTFail("Legacy storage must not trigger \(method)")
             }
@@ -345,7 +517,7 @@ final class CodexServiceThreadListTests: XCTestCase {
 
         try await service.synchronizeNativePins()
 
-        XCTAssertEqual(methods, ["threadSection/list"])
+        XCTAssertEqual(methods, ["threadSection/list", "bridge/hostPins/read"])
         XCTAssertEqual(service.pinnedThreadIDs, [])
     }
 
@@ -1318,6 +1490,43 @@ final class CodexServiceThreadListTests: XCTestCase {
             result: .object([
                 "data": .array([.object(["id": .string("pinned-section"), "name": .string("Pinned")])]),
                 "nextCursor": .null,
+            ]),
+            includeJSONRPC: false
+        )
+    }
+
+    private func emptyPinnedSectionListResponse() -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object([
+                "data": .array([]),
+                "nextCursor": .null,
+            ]),
+            includeJSONRPC: false
+        )
+    }
+
+    private func hostPinsResponse(ids: [String]) -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object([
+                "schemaVersion": .integer(1),
+                "source": .string("codex-host"),
+                "pinnedThreadIds": .array(ids.map(JSONValue.string)),
+            ]),
+            includeJSONRPC: false
+        )
+    }
+
+    private func threadReadResponse(id: String, title: String) -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object([
+                "thread": .object([
+                    "id": .string(id),
+                    "title": .string(title),
+                    "cwd": .string("/tmp/host-pin"),
+                ]),
             ]),
             includeJSONRPC: false
         )

@@ -38,6 +38,47 @@ private struct NativeThreadSection {
     let name: String
 }
 
+enum CodexNativePinAuthorityProbe: Equatable {
+    case complete([String])
+    case missingSection
+    case unsupported
+    case malformed
+    case incomplete
+}
+
+enum CodexHostPinAuthorityProbe: Equatable {
+    case valid([String])
+    case unavailable
+    case malformed
+    case racing
+    case unsupported
+}
+
+func codexPinnedStateAuthorityDecision(
+    native: CodexNativePinAuthorityProbe,
+    host: CodexHostPinAuthorityProbe,
+    current: CodexPinnedStateAuthority
+) -> CodexPinnedStateAuthority {
+    if current == .native {
+        return .native
+    }
+
+    switch native {
+    case .complete(let nativeIDs) where !nativeIDs.isEmpty:
+        return .native
+    case .complete(let nativeIDs):
+        if case .valid(let hostIDs) = host {
+            return hostIDs == nativeIDs ? .native : .hostCompatibility
+        }
+        return current
+    case .missingSection, .unsupported, .malformed, .incomplete:
+        if case .valid = host {
+            return .hostCompatibility
+        }
+        return current
+    }
+}
+
 extension CodexService {
     func synchronizeNativePins() async throws {
         try await withSerializedNativePinOperation {
@@ -67,24 +108,187 @@ extension CodexService {
     }
 
     private func synchronizeNativePinsWithoutSerialization() async throws {
+        var nativeProbe: CodexNativePinAuthorityProbe = .incomplete
+        var nativeThreads: [CodexThread] = []
+        var nativeError: Error?
+
         do {
             let section = try await resolveNativePinnedSection()
             guard let section else {
                 nativePinnedSectionID = nil
                 nativePinCapability = .available
-                replaceConfirmedNativePins(with: [])
-                return
+                nativeProbe = .missingSection
+                nativeThreads = []
+                return try await finishNativePinSynchronization(
+                    nativeProbe: nativeProbe,
+                    nativeThreads: nativeThreads,
+                    nativeError: nil
+                )
             }
 
             nativePinnedSectionID = section.id
             nativePinCapability = .available
-            try await refreshConfirmedNativePins(sectionID: section.id)
+            let threads = try await fetchNativePinnedThreads(sectionID: section.id)
+            nativeThreads = threads
+            nativeProbe = .complete(orderedUniqueThreadIDs(threads.map(\.id)))
         } catch {
             if isUnsupportedNativePinError(error) {
                 nativePinCapability = .unsupported
             }
-            throw error
+            nativeError = error
+            nativeThreads = []
+            nativeProbe = nativePinAuthorityProbe(for: error)
         }
+
+        try await finishNativePinSynchronization(
+            nativeProbe: nativeProbe,
+            nativeThreads: nativeThreads,
+            nativeError: nativeError
+        )
+    }
+
+    private func finishNativePinSynchronization(
+        nativeProbe: CodexNativePinAuthorityProbe,
+        nativeThreads: [CodexThread],
+        nativeError: Error?
+    ) async throws {
+        let shouldReadHost = pinnedStateAuthority != .native
+            && !isCompleteNonEmptyNativeProbe(nativeProbe)
+
+        let hostProbe: CodexHostPinAuthorityProbe
+        if shouldReadHost {
+            hostProbe = await readHostPinAuthorityProbe()
+        } else {
+            hostProbe = .unavailable
+        }
+
+        let nextAuthority = codexPinnedStateAuthorityDecision(
+            native: nativeProbe,
+            host: hostProbe,
+            current: pinnedStateAuthority
+        )
+
+        switch nextAuthority {
+        case .native:
+            if case .complete = nativeProbe {
+                commitConfirmedNativePins(nativeThreads)
+            }
+        case .hostCompatibility:
+            if case .valid(let hostIDs) = hostProbe {
+                commitConfirmedHostPins(hostIDs)
+            }
+        case .undecided:
+            rebuildEffectivePinnedThreadState()
+        }
+
+        if nativeError != nil,
+           !isCompleteNonEmptyNativeProbe(nativeProbe),
+           case .valid = hostProbe {
+            return
+        }
+        if let nativeError {
+            throw nativeError
+        }
+    }
+
+    private func isCompleteNonEmptyNativeProbe(_ probe: CodexNativePinAuthorityProbe) -> Bool {
+        guard case .complete(let ids) = probe else {
+            return false
+        }
+        return !ids.isEmpty
+    }
+
+    private func nativePinAuthorityProbe(for error: Error) -> CodexNativePinAuthorityProbe {
+        if isUnsupportedNativePinError(error) {
+            return .unsupported
+        }
+
+        guard let serviceError = error as? CodexServiceError,
+              case .invalidResponse(let message) = serviceError else {
+            return .incomplete
+        }
+        return message.localizedCaseInsensitiveContains("pagination") ? .incomplete : .malformed
+    }
+
+    private func readHostPinAuthorityProbe() async -> CodexHostPinAuthorityProbe {
+        do {
+            let response = try await sendRequest(
+                method: "bridge/hostPins/read",
+                params: .object([:]),
+                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+                timeoutMessage: "bridge/hostPins/read timed out while synchronizing pins."
+            )
+            if let error = response.error {
+                return hostPinAuthorityProbe(for: error)
+            }
+
+            guard let result = response.result?.objectValue,
+                  result["schemaVersion"]?.intValue == 1,
+                  result["source"]?.stringValue == "codex-host",
+                  let rawIDs = result["pinnedThreadIds"]?.arrayValue,
+                  rawIDs.count <= 512 else {
+                return .malformed
+            }
+
+            var seen: Set<String> = []
+            let ids = rawIDs.compactMap { value -> String? in
+                guard let id = value.stringValue,
+                      !id.isEmpty,
+                      id.count <= 256,
+                      seen.insert(id).inserted else {
+                    return nil
+                }
+                return id
+            }
+            guard ids.count == rawIDs.count else {
+                return .malformed
+            }
+            return .valid(ids)
+        } catch {
+            return hostPinAuthorityProbe(for: error)
+        }
+    }
+
+    private func hostPinAuthorityProbe(for error: Error) -> CodexHostPinAuthorityProbe {
+        if let serviceError = error as? CodexServiceError,
+           case .rpcError(let rpcError) = serviceError {
+            let errorCode = rpcError.data?.objectValue?["errorCode"]?.stringValue
+            switch errorCode {
+            case "host_pins_malformed":
+                return .malformed
+            case "host_pins_racing":
+                return .racing
+            case "host_pins_unavailable":
+                return .unavailable
+            default:
+                if rpcError.code == -32601 {
+                    return .unsupported
+                }
+            }
+        }
+        return .unavailable
+    }
+
+    private func commitConfirmedNativePins(_ threads: [CodexThread]) {
+        replaceConfirmedNativePinsCache(with: threads)
+        pinnedStateAuthority = .native
+        persistPinnedStateAuthority()
+        confirmedHostPinnedThreadIDs.removeAll()
+        confirmedHostPinnedThreadSnapshotsByRootID.removeAll()
+        defaults.removeObject(forKey: macScopedDefaultsKey(Self.hostPinnedThreadIDsDefaultsKey))
+        defaults.removeObject(forKey: macScopedDefaultsKey(Self.hostPinnedThreadSnapshotsDefaultsKey))
+        rebuildEffectivePinnedThreadState()
+    }
+
+    private func commitConfirmedHostPins(_ ids: [String]) {
+        confirmedHostPinnedThreadIDs = orderedUniqueThreadIDs(ids)
+        confirmedHostPinnedThreadSnapshotsByRootID = confirmedHostPinnedThreadSnapshotsByRootID.filter {
+            confirmedHostPinnedThreadIDs.contains($0.key)
+        }
+        persistConfirmedHostPinnedThreadState()
+        pinnedStateAuthority = .hostCompatibility
+        persistPinnedStateAuthority()
+        rebuildEffectivePinnedThreadState()
     }
 
     private func setThreadPinnedWithoutSerialization(_ threadID: String, pinned: Bool) async throws {
@@ -197,8 +401,27 @@ extension CodexService {
     }
 
     func rebuildEffectivePinnedThreadState() {
-        pinnedThreadIDs = orderedUniqueThreadIDs(confirmedNativePinnedThreadIDs)
-        pinnedThreadSnapshotsByRootID = confirmedNativePinnedThreadSnapshotsByRootID.filter {
+        let effectiveIDs: [String]
+        let effectiveSnapshots: [String: [CodexThread]]
+        switch pinnedStateAuthority {
+        case .native:
+            effectiveIDs = orderedUniqueThreadIDs(confirmedNativePinnedThreadIDs)
+            effectiveSnapshots = confirmedNativePinnedThreadSnapshotsByRootID
+        case .hostCompatibility:
+            effectiveIDs = orderedUniqueThreadIDs(confirmedHostPinnedThreadIDs)
+            effectiveSnapshots = confirmedHostPinnedThreadSnapshotsByRootID
+        case .undecided:
+            if !confirmedNativePinnedThreadIDs.isEmpty || confirmedHostPinnedThreadIDs.isEmpty {
+                effectiveIDs = orderedUniqueThreadIDs(confirmedNativePinnedThreadIDs)
+                effectiveSnapshots = confirmedNativePinnedThreadSnapshotsByRootID
+            } else {
+                effectiveIDs = orderedUniqueThreadIDs(confirmedHostPinnedThreadIDs)
+                effectiveSnapshots = confirmedHostPinnedThreadSnapshotsByRootID
+            }
+        }
+
+        pinnedThreadIDs = effectiveIDs
+        pinnedThreadSnapshotsByRootID = effectiveSnapshots.filter {
             pinnedThreadIDs.contains($0.key)
         }
     }
@@ -227,9 +450,40 @@ extension CodexService {
         }
     }
 
+    func persistConfirmedHostPinnedThreadState() {
+        confirmedHostPinnedThreadIDs = orderedUniqueThreadIDs(confirmedHostPinnedThreadIDs)
+        confirmedHostPinnedThreadSnapshotsByRootID = confirmedHostPinnedThreadSnapshotsByRootID.filter {
+            confirmedHostPinnedThreadIDs.contains($0.key)
+        }
+
+        let idsKey = macScopedDefaultsKey(Self.hostPinnedThreadIDsDefaultsKey)
+        let snapshotsKey = macScopedDefaultsKey(Self.hostPinnedThreadSnapshotsDefaultsKey)
+        if let encodedIDs = try? encoder.encode(confirmedHostPinnedThreadIDs) {
+            defaults.set(encodedIDs, forKey: idsKey)
+        }
+        if let encodedSnapshots = try? encoder.encode(confirmedHostPinnedThreadSnapshotsByRootID) {
+            defaults.set(encodedSnapshots, forKey: snapshotsKey)
+        }
+    }
+
+    func persistPinnedStateAuthority() {
+        guard let encodedAuthority = try? encoder.encode(pinnedStateAuthority) else {
+            return
+        }
+        defaults.set(
+            encodedAuthority,
+            forKey: macScopedDefaultsKey(Self.pinnedStateAuthorityDefaultsKey)
+        )
+    }
+
     private func resolveNativePinnedSection() async throws -> NativeThreadSection? {
         var cursor: JSONValue = .null
+        var seenCursors: Set<String> = []
         repeat {
+            if let cursorValue = cursor.stringValue,
+               !seenCursors.insert(cursorValue).inserted {
+                throw CodexServiceError.invalidResponse("threadSection/list pagination did not complete")
+            }
             let response = try await sendRequest(
                 method: "threadSection/list",
                 params: .object(["cursor": cursor, "limit": .integer(100)]),
@@ -286,17 +540,17 @@ extension CodexService {
         return section
     }
 
-    private func refreshConfirmedNativePins(sectionID: String) async throws {
-        let threads = try await fetchNativePinnedThreads(sectionID: sectionID)
-        replaceConfirmedNativePins(with: threads)
-    }
-
     private func fetchNativePinnedThreads(sectionID: String) async throws -> [CodexThread] {
         var threads: [CodexThread] = []
         var cursor: JSONValue = .null
         var sourceKinds = threadListSourceKinds
+        var seenCursors: Set<String> = []
 
         repeat {
+            if let cursorValue = cursor.stringValue,
+               !seenCursors.insert(cursorValue).inserted {
+                throw CodexServiceError.invalidResponse("Pinned thread/list pagination did not complete")
+            }
             let page: (threads: [CodexThread], nextCursor: JSONValue)
             do {
                 page = try await fetchNativePinnedThreadsPage(
@@ -355,10 +609,14 @@ extension CodexService {
         guard let rawThreads else {
             throw CodexServiceError.invalidResponse("Pinned thread/list response missing data array")
         }
-        return (await CodexThreadPageDecoder.decode(rawThreads), nativePinNextCursor(from: result))
+        let decodedThreads = await CodexThreadPageDecoder.decode(rawThreads)
+        guard decodedThreads.count == rawThreads.count else {
+            throw CodexServiceError.invalidResponse("Pinned thread/list response contained malformed data")
+        }
+        return (decodedThreads, nativePinNextCursor(from: result))
     }
 
-    private func replaceConfirmedNativePins(with threads: [CodexThread]) {
+    private func replaceConfirmedNativePinsCache(with threads: [CodexThread]) {
         confirmedNativePinnedThreadIDs = orderedUniqueThreadIDs(threads.map(\.id))
         var returnedThreadsByID: [String: [CodexThread]] = [:]
         for thread in threads where returnedThreadsByID[thread.id] == nil {
@@ -368,7 +626,6 @@ extension CodexService {
         }
         confirmedNativePinnedThreadSnapshotsByRootID = returnedThreadsByID
         persistConfirmedNativePinnedThreadState()
-        rebuildEffectivePinnedThreadState()
     }
 
     private func nativeThreadSection(from value: JSONValue) -> NativeThreadSection? {
