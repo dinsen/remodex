@@ -424,6 +424,23 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(service.selectedReasoningEffortForSelectedModel(), "medium")
     }
 
+    func testGPT55StaticReasoningFallbackDoesNotCrash() throws {
+        let payload = """
+        {
+          "slug": "gpt-5.5",
+          "name": "GPT-5.5",
+          "supportedReasoningEfforts": ["medium"]
+        }
+        """
+
+        let model = try JSONDecoder().decode(CodexModelOption.self, from: Data(payload.utf8))
+
+        XCTAssertEqual(
+            model.supportedReasoningEfforts.map(\.reasoningEffort),
+            ["medium", "low", "high", "xhigh"]
+        )
+    }
+
     func testRuntimeOptionRefreshAppliesDesktopRuntimeDefaultsOnDemand() async {
         let service = makeService()
         service.isConnected = true

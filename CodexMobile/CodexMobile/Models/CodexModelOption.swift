@@ -194,7 +194,6 @@ private enum CodexModelCapabilityResolver {
         "gpt-5.2",
     ]
     private static let staticReasoningEffortsByModelIdentifier: [String: [String]] = [
-        "gpt-5.5": ["low", "medium", "high", "xhigh"],
         "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
         "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
         "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
