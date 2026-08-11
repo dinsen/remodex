@@ -251,7 +251,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         ))
     }
 
-    func testDeletingThreadClearsPersistedPin() {
+    func testDeletingThreadPreservesConfirmedNativePin() {
         let suiteName = "CodexThreadRenamePersistenceTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Expected isolated UserDefaults suite")
@@ -268,13 +268,13 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
             ),
         ]
 
-        service.pinThread("thread-1")
+        seedConfirmedPin("thread-1", in: service)
         service.deleteThread("thread-1")
 
         let reloadedService = CodexService(defaults: defaults)
 
-        XCTAssertEqual(reloadedService.pinnedThreadIDs, [])
-        XCTAssertFalse(reloadedService.isThreadPinned("thread-1"))
+        XCTAssertEqual(reloadedService.pinnedThreadIDs, ["thread-1"])
+        XCTAssertTrue(reloadedService.isThreadPinned("thread-1"))
     }
 
     func testPinnedSnapshotRehydratesThreadWhenFreshServiceHasNoServerThreadsYet() {
@@ -295,7 +295,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 cwd: "/tmp/remodex"
             ),
         ]
-        service.pinThread("thread-1")
+        seedConfirmedPin("thread-1", in: service)
 
         let reloadedService = CodexService(defaults: defaults)
         reloadedService.reconcileLocalThreadsWithServer([])
@@ -323,7 +323,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 cwd: "/tmp/remodex"
             ),
         ]
-        service.pinThread("thread-1")
+        seedConfirmedPin("thread-1", in: service)
         service.renameThread("thread-1", name: "Phone Rename")
 
         let reloadedService = CodexService(defaults: defaults)
@@ -355,7 +355,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 parentThreadId: "root-thread"
             ),
         ]
-        service.pinThread("root-thread")
+        seedConfirmedPin("root-thread", in: service)
 
         service.archiveThread("child-thread")
 
@@ -426,5 +426,14 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         XCTAssertEqual(service.activeTurnIdByThread["running-thread"], "turn-live")
         XCTAssertEqual(service.activeTurnId, "turn-live")
         XCTAssertEqual(service.threadIdByTurnID["turn-live"], "running-thread")
+    }
+
+    private func seedConfirmedPin(_ threadID: String, in service: CodexService) {
+        service.confirmedNativePinnedThreadIDs = [threadID]
+        if let snapshot = service.threads.first(where: { $0.id == threadID }) {
+            service.confirmedNativePinnedThreadSnapshotsByRootID[threadID] = [snapshot]
+        }
+        service.persistConfirmedNativePinnedThreadState()
+        service.rebuildEffectivePinnedThreadState()
     }
 }

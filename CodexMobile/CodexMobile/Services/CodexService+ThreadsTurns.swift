@@ -131,8 +131,9 @@ extension CodexService {
         }
 
         if let limit {
+            let pinnedThreads = await refreshNativePinsForThreadHydration()
             let activeThreads = try await fetchCoalescedServerThreads(limit: limit)
-            applyThreadListHydration(activeThreads)
+            applyThreadListHydration(mergingPinnedThreads(pinnedThreads, into: activeThreads))
             return
         }
 
@@ -141,13 +142,16 @@ extension CodexService {
             return
         }
 
+        let pinnedThreads = await refreshNativePinsForThreadHydration()
         let fetchID = UUID()
         let task = Task { @MainActor in
             try await self.fetchServerThreads(
                 limit: self.initialVisibleThreadListLimit,
                 paginateLimitedPages: true
             ) { _, accumulatedThreads in
-                self.applyThreadListHydration(accumulatedThreads)
+                self.applyThreadListHydration(
+                    self.mergingPinnedThreads(pinnedThreads, into: accumulatedThreads)
+                )
             }
         }
         threadListFullHydrationTask = (id: fetchID, task: task)
@@ -166,6 +170,15 @@ extension CodexService {
         if activeThreadId == nil {
             activeThreadId = firstLiveThreadID()
         }
+    }
+
+    func mergingPinnedThreads(_ pinnedThreads: [CodexThread], into activeThreads: [CodexThread]) -> [CodexThread] {
+        var merged = activeThreads
+        var seen = Set(activeThreads.map(\.id))
+        for thread in pinnedThreads where seen.insert(thread.id).inserted {
+            merged.append(thread)
+        }
+        return merged
     }
 
     func cancelThreadListHydrationForInteractiveRequest() {

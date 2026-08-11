@@ -463,6 +463,263 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.nativePinCapability, .unsupported)
     }
 
+    func testPinMovesRootBeforeCurrentFirstPin() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        var serverPins = ["old-pin"]
+        var moveParams: RPCObject?
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                moveParams = params?.objectValue
+                serverPins = ["new-pin", "old-pin"]
+                return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.setThreadPinned("new-pin", pinned: true)
+
+        XCTAssertEqual(moveParams?["threadId"], .string("new-pin"))
+        XCTAssertEqual(moveParams?["sectionId"], .string("pinned-section"))
+        XCTAssertEqual(moveParams?["beforeThreadId"], .string("old-pin"))
+        XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
+    }
+
+    func testUnpinMovesRootToNullSection() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "old-pin")]
+        var serverPins = ["old-pin"]
+        var moveParams: RPCObject?
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                moveParams = params?.objectValue
+                serverPins = []
+                return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.setThreadPinned("old-pin", pinned: false)
+
+        XCTAssertEqual(moveParams?["sectionId"], .null)
+        XCTAssertNil(moveParams?["beforeThreadId"])
+        XCTAssertEqual(service.pinnedThreadIDs, [])
+    }
+
+    func testPinWaitsForLegacyMigration() async {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin")]
+        service.legacyPinnedThreadIDs = ["legacy-pin"]
+        service.rebuildEffectivePinnedThreadState()
+        var moveThreadIDs: [String] = []
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: [])
+            case "thread/section/move":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                moveThreadIDs.append(threadID)
+                throw CodexServiceError.rpcError(RPCError(code: -32000, message: "migration failed"))
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        do {
+            try await service.setThreadPinned("new-pin", pinned: true)
+            XCTFail("Expected migration failure")
+        } catch {}
+
+        XCTAssertEqual(moveThreadIDs, ["legacy-pin"])
+        XCTAssertFalse(service.pinnedThreadIDs.contains("new-pin"))
+    }
+
+    func testPinsDoNotChangeBeforeMoveConfirmation() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        var serverPins = ["old-pin"]
+        var moveStarted = false
+        var confirmMove: CheckedContinuation<Void, Never>?
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                moveStarted = true
+                await withCheckedContinuation { confirmMove = $0 }
+                serverPins = ["new-pin", "old-pin"]
+                return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        let mutation = Task { @MainActor in
+            try await service.setThreadPinned("new-pin", pinned: true)
+        }
+        await waitUntil { moveStarted }
+        XCTAssertEqual(service.pinnedThreadIDs, ["old-pin"])
+        confirmMove?.resume()
+        try await mutation.value
+        XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
+    }
+
+    func testMutationFailureLeavesConfirmedPinsUnchanged() async {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        service.confirmedNativePinnedThreadIDs = ["old-pin"]
+        service.rebuildEffectivePinnedThreadState()
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: ["old-pin"])
+            case "thread/section/move":
+                throw CodexServiceError.rpcError(RPCError(code: -32000, message: "move timed out"))
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        do {
+            try await service.setThreadPinned("new-pin", pinned: true)
+            XCTFail("Expected mutation failure")
+        } catch {}
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["old-pin"])
+    }
+
+    func testUnsupportedMutationRequestsCodexUpdate() async {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin")]
+        service.requestTransportOverride = { _, _ in
+            throw CodexServiceError.rpcError(RPCError(code: -32601, message: "Method not found"))
+        }
+
+        do {
+            try await service.setThreadPinned("new-pin", pinned: true)
+            XCTFail("Expected unsupported mutation")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Update Codex"))
+        }
+        XCTAssertEqual(service.pinnedThreadIDs, [])
+    }
+
+    func testSuccessfulMutationSurvivesFailedRefresh() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        var threadListCount = 0
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list":
+                threadListCount += 1
+                if threadListCount > 1 {
+                    throw CodexServiceError.rpcError(RPCError(code: -32000, message: "refresh failed"))
+                }
+                return self.threadListResponse(ids: ["old-pin"])
+            case "thread/section/move": return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.setThreadPinned("new-pin", pinned: true)
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
+        XCTAssertNotNil(service.lastErrorMessage)
+    }
+
+    func testPinMutationsAreSerialized() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "pin-a"), CodexThread(id: "pin-b")]
+        let recorder = NativePinRequestRecorder()
+        var serverPins: [String] = []
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                await recorder.record(threadID)
+                try await Task.sleep(nanoseconds: 20_000_000)
+                serverPins.removeAll { $0 == threadID }
+                serverPins.insert(threadID, at: 0)
+                return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        let first = Task { @MainActor in try await service.setThreadPinned("pin-a", pinned: true) }
+        await Task.yield()
+        let second = Task { @MainActor in try await service.setThreadPinned("pin-b", pinned: true) }
+        try await first.value
+        try await second.value
+
+        let recordedThreadIDs = await recorder.values()
+        XCTAssertEqual(recordedThreadIDs, ["pin-a", "pin-b"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["pin-b", "pin-a"])
+    }
+
+    func testStaleRefreshCannotOverwriteConfirmedMutation() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        var serverPins = ["old-pin"]
+        var firstRefreshStarted = false
+        var releaseFirstRefresh: CheckedContinuation<Void, Never>?
+        var threadListCount = 0
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list":
+                threadListCount += 1
+                if threadListCount == 1 {
+                    firstRefreshStarted = true
+                    await withCheckedContinuation { releaseFirstRefresh = $0 }
+                }
+                return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                serverPins.removeAll { $0 == threadID }
+                serverPins.insert(threadID, at: 0)
+                return self.emptyRPCResponse()
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        let refresh = Task { @MainActor in try await service.synchronizeNativePins() }
+        await waitUntil { firstRefreshStarted }
+        let mutation = Task { @MainActor in try await service.setThreadPinned("new-pin", pinned: true) }
+        releaseFirstRefresh?.resume()
+        try await refresh.value
+        try await mutation.value
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
+    }
+
+    func testPinnedHydrationMergesRowsOutsideRecentPage() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list":
+                if params?.objectValue?["sectionId"] != nil {
+                    return self.threadListResponse(ids: ["older-pinned"])
+                }
+                return self.threadListResponse(ids: ["recent-thread"])
+            default: return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.listThreads(limit: service.recentActiveThreadListLimit)
+
+        XCTAssertEqual(Set(service.threads.map(\.id)), Set(["recent-thread", "older-pinned"]))
+        XCTAssertEqual(service.pinnedThreadIDs, ["older-pinned"])
+    }
+
     func testListThreadsPublishesActiveThreadsFromSingleFetch() async throws {
         let service = makeService()
         service.isConnected = true
@@ -1031,7 +1288,9 @@ final class CodexServiceThreadListTests: XCTestCase {
                 cwd: "/Users/dev/project"
             ),
         ]
-        service.pinThread("pinned-thread")
+        service.confirmedNativePinnedThreadIDs = ["pinned-thread"]
+        service.confirmedNativePinnedThreadSnapshotsByRootID = ["pinned-thread": service.threads]
+        service.rebuildEffectivePinnedThreadState()
 
         service.renameThread("pinned-thread", name: "Renamed locally")
         service.reconcileLocalThreadsWithServer([
@@ -1164,6 +1423,32 @@ final class CodexServiceThreadListTests: XCTestCase {
         return service
     }
 
+    private func pinnedSectionListResponse() -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object([
+                "data": .array([.object(["id": .string("pinned-section"), "name": .string("Pinned")])]),
+                "nextCursor": .null,
+            ]),
+            includeJSONRPC: false
+        )
+    }
+
+    private func threadListResponse(ids: [String]) -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object([
+                "threads": .array(ids.map { .object(["id": .string($0)]) }),
+                "nextCursor": .null,
+            ]),
+            includeJSONRPC: false
+        )
+    }
+
+    private func emptyRPCResponse() -> RPCMessage {
+        RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+    }
+
     private func prepareThreadListCacheScope(_ service: CodexService, macDeviceID: String) {
         service.macScopedContextOverrideDeviceId = macDeviceID
         service.clearInMemoryMacScopedState()
@@ -1178,5 +1463,17 @@ final class CodexServiceThreadListTests: XCTestCase {
             }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+}
+
+private actor NativePinRequestRecorder {
+    private var recordedValues: [String] = []
+
+    func record(_ value: String) {
+        recordedValues.append(value)
+    }
+
+    func values() -> [String] {
+        recordedValues
     }
 }

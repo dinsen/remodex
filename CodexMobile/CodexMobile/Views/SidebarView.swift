@@ -806,12 +806,14 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 codex.renameThread(thread.id, name: newName)
             },
             onPinToggleThread: { thread in
-                if codex.isThreadPinned(thread.id) {
-                    codex.unpinThread(thread.id)
-                } else {
-                    codex.pinThread(thread.id)
+                let shouldPin = !codex.isThreadPinned(thread.id)
+                Task { @MainActor in
+                    do {
+                        try await codex.setThreadPinned(thread.id, pinned: shouldPin)
+                    } catch {
+                        createThreadErrorMessage = error.localizedDescription
+                    }
                 }
-                rebuildGroupedThreads()
             },
             onArchiveToggleThread: { thread in
                 if thread.syncState == .archivedLocal {

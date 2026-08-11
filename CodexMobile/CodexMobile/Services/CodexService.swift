@@ -824,6 +824,7 @@ final class CodexService {
     @ObservationIgnored var legacyPinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
     @ObservationIgnored var nativePinnedSectionID: String?
     @ObservationIgnored var nativePinCapability: NativePinCapability = .unknown
+    @ObservationIgnored let nativePinOperationGate = NativePinOperationGate()
     // Sidebar rows read this directly, so keep it observable even when thread metadata is unchanged.
     var snapshotOnlyPinnedThreadIDs: Set<String> = []
     @ObservationIgnored var stoppedTurnIDsByThread: [String: Set<String>] = [:]

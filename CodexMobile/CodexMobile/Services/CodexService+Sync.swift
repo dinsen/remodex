@@ -186,9 +186,10 @@ extension CodexService {
         do {
             // Poll only the newest page; full sidebar hydration runs as cursor pages in the background.
             let activeLimit = limit ?? initialVisibleThreadListLimit
+            let pinnedThreads = await refreshNativePinsForThreadHydration()
             let activeThreads = try await fetchCoalescedServerThreads(limit: activeLimit)
 
-            reconcileLocalThreadsWithServer(activeThreads)
+            reconcileLocalThreadsWithServer(mergingPinnedThreads(pinnedThreads, into: activeThreads))
             debugSyncLog("sync thread/list active=\(activeThreads.count) local=\(threads.count)")
         } catch is CancellationError {
             return
@@ -640,7 +641,7 @@ extension CodexService {
             // Archived chats leave the live sidebar, so their goal badge must go too.
             goalByThreadID.removeValue(forKey: threadId)
             if pinnedThreadIDs.contains(threadId) {
-                unpinThread(threadId)
+                prunePinnedThreadSnapshot(threadId)
             }
         } else {
             removeLocallyArchivedThreadID(threadId)
@@ -706,7 +707,7 @@ extension CodexService {
 
         removeLocallyArchivedThreadID(threadId)
         if pinnedThreadIDs.contains(threadId) {
-            unpinThread(threadId)
+            prunePinnedThreadSnapshot(threadId)
         }
         if persistAsDeleted {
             addLocallyDeletedThreadID(threadId)

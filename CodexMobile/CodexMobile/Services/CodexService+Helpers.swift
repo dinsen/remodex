@@ -252,36 +252,6 @@ extension CodexService {
         thread.title = persistedName
     }
 
-    // Keeps local-only sidebar pins durable across thread/list refreshes and app relaunches.
-    func pinThread(_ threadId: String) {
-        guard let pinnedRootThreadID = pinnedRootThreadID(for: threadId),
-              let snapshotThreads = snapshotThreadsForPinnedRoot(pinnedRootThreadID),
-              !snapshotThreads.isEmpty else {
-            return
-        }
-
-        pinnedThreadIDs.removeAll { $0 == pinnedRootThreadID }
-        pinnedThreadIDs.insert(pinnedRootThreadID, at: 0)
-        pinnedThreadSnapshotsByRootID[pinnedRootThreadID] = snapshotThreads
-        persistPinnedThreadState()
-    }
-
-    func unpinThread(_ threadId: String) {
-        guard let pinnedRootThreadID = pinnedRootThreadID(for: threadId) ?? normalizedForkThreadID(threadId) else {
-            return
-        }
-
-        let previousIDs = pinnedThreadIDs
-        let hadSnapshot = pinnedThreadSnapshotsByRootID[pinnedRootThreadID] != nil
-        pinnedThreadIDs.removeAll { $0 == pinnedRootThreadID }
-        pinnedThreadSnapshotsByRootID.removeValue(forKey: pinnedRootThreadID)
-        guard pinnedThreadIDs != previousIDs || hadSnapshot else {
-            return
-        }
-
-        persistPinnedThreadState()
-    }
-
     func isThreadPinned(_ threadId: String?) -> Bool {
         guard let pinnedRootThreadID = pinnedRootThreadID(for: threadId) else {
             return false
@@ -303,31 +273,50 @@ extension CodexService {
     // Keeps pinned snapshots fresh as live thread metadata changes, without depending on server pagination.
     func refreshPinnedThreadSnapshots() {
         guard !pinnedThreadIDs.isEmpty else {
-            if !pinnedThreadSnapshotsByRootID.isEmpty {
-                pinnedThreadSnapshotsByRootID.removeAll()
-                persistPinnedThreadState()
-            }
+            pinnedThreadSnapshotsByRootID.removeAll()
             return
         }
 
-        var nextSnapshots = pinnedThreadSnapshotsByRootID
-        var didMutate = false
-
-        for rootThreadID in pinnedThreadIDs {
+        var nextNativeSnapshots = confirmedNativePinnedThreadSnapshotsByRootID
+        for rootThreadID in confirmedNativePinnedThreadIDs {
             if let snapshotThreads = snapshotThreadsForPinnedRoot(rootThreadID),
-               !snapshotThreads.isEmpty,
-               nextSnapshots[rootThreadID] != snapshotThreads {
-                nextSnapshots[rootThreadID] = snapshotThreads
-                didMutate = true
+               !snapshotThreads.isEmpty {
+                nextNativeSnapshots[rootThreadID] = snapshotThreads
             }
         }
-
-        let validRootIDs = Set(pinnedThreadIDs)
-        let filteredSnapshots = nextSnapshots.filter { validRootIDs.contains($0.key) }
-        if filteredSnapshots != pinnedThreadSnapshotsByRootID || didMutate {
-            pinnedThreadSnapshotsByRootID = filteredSnapshots
-            persistPinnedThreadState()
+        nextNativeSnapshots = nextNativeSnapshots.filter { confirmedNativePinnedThreadIDs.contains($0.key) }
+        if nextNativeSnapshots != confirmedNativePinnedThreadSnapshotsByRootID {
+            confirmedNativePinnedThreadSnapshotsByRootID = nextNativeSnapshots
+            persistConfirmedNativePinnedThreadState()
         }
+
+        var nextLegacySnapshots = legacyPinnedThreadSnapshotsByRootID
+        for rootThreadID in legacyPinnedThreadIDs {
+            if let snapshotThreads = snapshotThreadsForPinnedRoot(rootThreadID),
+               !snapshotThreads.isEmpty {
+                nextLegacySnapshots[rootThreadID] = snapshotThreads
+            }
+        }
+        nextLegacySnapshots = nextLegacySnapshots.filter { legacyPinnedThreadIDs.contains($0.key) }
+        if nextLegacySnapshots != legacyPinnedThreadSnapshotsByRootID {
+            legacyPinnedThreadSnapshotsByRootID = nextLegacySnapshots
+            persistLegacyPinnedThreadSnapshots()
+        }
+        rebuildEffectivePinnedThreadState()
+    }
+
+    func prunePinnedThreadSnapshot(_ threadID: String) {
+        confirmedNativePinnedThreadSnapshotsByRootID = confirmedNativePinnedThreadSnapshotsByRootID.compactMapValues {
+            let remaining = $0.filter { $0.id != threadID }
+            return remaining.isEmpty ? nil : remaining
+        }
+        legacyPinnedThreadSnapshotsByRootID = legacyPinnedThreadSnapshotsByRootID.compactMapValues {
+            let remaining = $0.filter { $0.id != threadID }
+            return remaining.isEmpty ? nil : remaining
+        }
+        persistConfirmedNativePinnedThreadState()
+        persistLegacyPinnedThreadSnapshots()
+        rebuildEffectivePinnedThreadState()
     }
 
     // Restores a locally pinned chat by asking the runtime to resume it when the user opens the row.
@@ -388,33 +377,17 @@ extension CodexService {
         return injectedThreadIDs
     }
 
-    private func persistPinnedThreadState() {
-        let uniquePinnedThreadIDs = Array(NSOrderedSet(array: pinnedThreadIDs)) as? [String] ?? pinnedThreadIDs
-        pinnedThreadIDs = uniquePinnedThreadIDs
-
-        guard !uniquePinnedThreadIDs.isEmpty else {
-            pinnedThreadSnapshotsByRootID.removeAll()
-            defaults.removeObject(forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey))
-            defaults.removeObject(forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey))
+    private func persistLegacyPinnedThreadSnapshots() {
+        let key = macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey)
+        guard !legacyPinnedThreadSnapshotsByRootID.isEmpty,
+              let encodedSnapshots = try? encoder.encode(legacyPinnedThreadSnapshotsByRootID) else {
+            defaults.removeObject(forKey: key)
             return
         }
-
-        guard let encodedPinnedThreadIDs = try? encoder.encode(uniquePinnedThreadIDs) else {
-            return
-        }
-
-        defaults.set(encodedPinnedThreadIDs, forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey))
-
-        let filteredSnapshots = pinnedThreadSnapshotsByRootID.filter { uniquePinnedThreadIDs.contains($0.key) }
-        pinnedThreadSnapshotsByRootID = filteredSnapshots
-        guard let encodedSnapshots = try? encoder.encode(filteredSnapshots) else {
-            return
-        }
-
-        defaults.set(encodedSnapshots, forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey))
+        defaults.set(encodedSnapshots, forKey: key)
     }
 
-    private func pinnedRootThreadID(for threadId: String?) -> String? {
+    func pinnedRootThreadID(for threadId: String?) -> String? {
         guard let normalizedThreadId = normalizedForkThreadID(threadId) else {
             return nil
         }
@@ -464,7 +437,7 @@ extension CodexService {
         return currentThread.id
     }
 
-    private func snapshotThreadsForPinnedRoot(_ rootThreadID: String) -> [CodexThread]? {
+    func snapshotThreadsForPinnedRoot(_ rootThreadID: String) -> [CodexThread]? {
         let normalizedRootThreadID = normalizedForkThreadID(rootThreadID) ?? rootThreadID
         let subtreeThreadIDs = subtreeThreadIDs(for: normalizedRootThreadID)
         if !subtreeThreadIDs.isEmpty {

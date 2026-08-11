@@ -12,6 +12,27 @@ enum NativePinCapability: Equatable {
     case unsupported
 }
 
+actor NativePinOperationGate {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isLocked = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 private struct NativeThreadSection {
     let id: String
     let name: String
@@ -19,6 +40,33 @@ private struct NativeThreadSection {
 
 extension CodexService {
     func synchronizeNativePins() async throws {
+        try await withSerializedNativePinOperation {
+            try await self.synchronizeNativePinsWithoutSerialization()
+        }
+    }
+
+    func setThreadPinned(_ threadID: String, pinned: Bool) async throws {
+        try await withSerializedNativePinOperation {
+            try await self.setThreadPinnedWithoutSerialization(threadID, pinned: pinned)
+        }
+    }
+
+    func refreshNativePinsForThreadHydration() async -> [CodexThread] {
+        do {
+            try await synchronizeNativePins()
+        } catch {
+            lastErrorMessage = nativePinBackgroundErrorMessage(for: error)
+        }
+        return confirmedNativePinnedThreadsForHydration()
+    }
+
+    func confirmedNativePinnedThreadsForHydration() -> [CodexThread] {
+        var seen: Set<String> = []
+        return confirmedNativePinnedThreadIDs.flatMap { confirmedNativePinnedThreadSnapshotsByRootID[$0] ?? [] }
+            .filter { seen.insert($0.id).inserted }
+    }
+
+    private func synchronizeNativePinsWithoutSerialization() async throws {
         do {
             let section = try await resolveNativePinnedSection()
             guard let section else {
@@ -47,6 +95,115 @@ extension CodexService {
             }
             throw error
         }
+    }
+
+    private func setThreadPinnedWithoutSerialization(_ threadID: String, pinned: Bool) async throws {
+        guard let requestedThread = thread(for: threadID) else {
+            throw CodexServiceError.invalidInput("This chat is not available to pin.")
+        }
+        guard requestedThread.syncState != .archivedLocal else {
+            throw CodexServiceError.invalidInput("Archived chats cannot be pinned.")
+        }
+        guard !requestedThread.isSubagent else {
+            throw CodexServiceError.invalidInput("Subagent chats cannot be pinned directly.")
+        }
+
+        do {
+            try await synchronizeNativePinsWithoutSerialization()
+        } catch {
+            throw userFacingNativePinMutationError(error)
+        }
+
+        let rootThreadID = pinnedRootThreadID(for: threadID) ?? threadID
+        if pinned == confirmedNativePinnedThreadIDs.contains(rootThreadID) {
+            return
+        }
+
+        let section: NativeThreadSection
+        if let nativePinnedSectionID {
+            section = NativeThreadSection(id: nativePinnedSectionID, name: "Pinned")
+        } else if pinned {
+            do {
+                section = try await createNativePinnedSection()
+            } catch {
+                throw userFacingNativePinMutationError(error)
+            }
+        } else {
+            return
+        }
+
+        var params: RPCObject = ["threadId": .string(rootThreadID)]
+        if pinned {
+            params["sectionId"] = .string(section.id)
+            if let firstPinnedThreadID = confirmedNativePinnedThreadIDs.first {
+                params["beforeThreadId"] = .string(firstPinnedThreadID)
+            }
+        } else {
+            params["sectionId"] = .null
+        }
+
+        do {
+            _ = try await sendRequest(
+                method: "thread/section/move",
+                params: .object(params),
+                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+                timeoutMessage: "thread/section/move timed out while synchronizing pins."
+            )
+        } catch {
+            if isUnsupportedNativePinError(error) {
+                nativePinCapability = .unsupported
+            }
+            throw userFacingNativePinMutationError(error)
+        }
+
+        applyConfirmedNativePinMutation(rootThreadID: rootThreadID, pinned: pinned)
+
+        do {
+            try await synchronizeNativePinsWithoutSerialization()
+        } catch {
+            lastErrorMessage = nativePinBackgroundErrorMessage(for: error)
+        }
+    }
+
+    private func applyConfirmedNativePinMutation(rootThreadID: String, pinned: Bool) {
+        confirmedNativePinnedThreadIDs.removeAll { $0 == rootThreadID }
+        if pinned {
+            confirmedNativePinnedThreadIDs.insert(rootThreadID, at: 0)
+            confirmedNativePinnedThreadSnapshotsByRootID[rootThreadID] =
+                snapshotThreadsForPinnedRoot(rootThreadID) ?? [CodexThread(id: rootThreadID)]
+        } else {
+            confirmedNativePinnedThreadSnapshotsByRootID.removeValue(forKey: rootThreadID)
+        }
+        persistConfirmedNativePinnedThreadState()
+        rebuildEffectivePinnedThreadState()
+    }
+
+    private func withSerializedNativePinOperation<T>(
+        _ operation: @MainActor () async throws -> T
+    ) async throws -> T {
+        await nativePinOperationGate.acquire()
+        do {
+            let value = try await operation()
+            await nativePinOperationGate.release()
+            return value
+        } catch {
+            await nativePinOperationGate.release()
+            throw error
+        }
+    }
+
+    private func userFacingNativePinMutationError(_ error: Error) -> Error {
+        guard isUnsupportedNativePinError(error) else {
+            return error
+        }
+        return CodexServiceError.invalidInput("Update Codex to synchronize pins.")
+    }
+
+    private func nativePinBackgroundErrorMessage(for error: Error) -> String {
+        if isUnsupportedNativePinError(error) {
+            return "Update Codex to synchronize pins."
+        }
+        return "Pins could not be refreshed. The last confirmed pin state is still shown."
     }
 
     func rebuildEffectivePinnedThreadState() {
@@ -266,7 +423,10 @@ extension CodexService {
         confirmedNativePinnedThreadIDs = orderedUniqueThreadIDs(threads.map(\.id))
         var returnedThreadsByID: [String: [CodexThread]] = [:]
         for thread in threads where returnedThreadsByID[thread.id] == nil {
-            returnedThreadsByID[thread.id] = [thread]
+            let cachedSnapshot = confirmedNativePinnedThreadSnapshotsByRootID[thread.id]
+                ?? legacyPinnedThreadSnapshotsByRootID[thread.id]
+                ?? []
+            returnedThreadsByID[thread.id] = [thread] + cachedSnapshot.filter { $0.id != thread.id }
         }
         confirmedNativePinnedThreadSnapshotsByRootID = returnedThreadsByID
         persistConfirmedNativePinnedThreadState()
