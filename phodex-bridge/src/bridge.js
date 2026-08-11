@@ -1751,6 +1751,8 @@ function startBridge({
         sourceKinds: method === "thread/list" ? sourceKindsFromThreadListParams(parsed.params) : [],
         cursor: method === "thread/list" ? parsed.params?.cursor : undefined,
         limit: method === "thread/list" ? threadListLimitFromParams(parsed.params) : undefined,
+        sectionId: method === "thread/list" ? normalizeNonEmptyString(parsed.params?.sectionId) : "",
+        sortKey: method === "thread/list" ? normalizeNonEmptyString(parsed.params?.sortKey) : "",
         createdAt: Date.now(),
       };
       if (method === "thread/turns/list") {
@@ -3523,7 +3525,10 @@ function sanitizeThreadListForRelay(rawMessage, requestContext = {}) {
     return rawMessage;
   }
 
-  const { threads, didAugment } = augmentRelayThreadListWithJsonlThreads(result[threadsKey], requestContext);
+  const isSectionFiltered = Boolean(normalizeNonEmptyString(requestContext?.sectionId));
+  const { threads, didAugment } = isSectionFiltered
+    ? { threads: result[threadsKey], didAugment: false }
+    : augmentRelayThreadListWithJsonlThreads(result[threadsKey], requestContext);
   const { threads: compactedThreads, didCompact } = compactRelayThreadListItems(threads);
   if (!didAugment && !didCompact) {
     return rawMessage;
@@ -3575,6 +3580,8 @@ const RELAY_THREAD_LIST_MOBILE_KEYS = [
   "threadSource",
   "thread_source",
   "syncState",
+  "section",
+  "sectionEnteredAt",
 ];
 const RELAY_THREAD_LIST_MOBILE_KEY_SET = new Set(RELAY_THREAD_LIST_MOBILE_KEYS);
 const RELAY_THREAD_LIST_STRING_VALUE_MAX_CHARS = 2_048;
@@ -3583,6 +3590,7 @@ const RELAY_THREAD_LIST_DATE_KEYS = new Set([
   "created_at",
   "updatedAt",
   "updated_at",
+  "sectionEnteredAt",
 ]);
 
 const RELAY_THREAD_LIST_MOBILE_METADATA_KEYS = new Set([
@@ -3687,6 +3695,10 @@ function compactRelayThreadListValue(key, value) {
     return { value, didCompact: false };
   }
 
+  if (key === "section") {
+    return compactRelayThreadSection(value);
+  }
+
   if (typeof value === "string") {
     return compactRelayThreadListString(value);
   }
@@ -3696,6 +3708,32 @@ function compactRelayThreadListValue(key, value) {
   }
 
   return { value: undefined, didCompact: true };
+}
+
+function compactRelayThreadSection(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { value: undefined, didCompact: true };
+  }
+
+  const compacted = {};
+  let didCompact = Object.keys(value).some((key) => key !== "id" && key !== "name");
+  for (const key of ["id", "name"]) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      continue;
+    }
+    const { value: compactedValue, didCompact: didCompactValue } = typeof value[key] === "string"
+      ? compactRelayThreadListString(value[key])
+      : { value: undefined, didCompact: true };
+    didCompact = didCompact || didCompactValue;
+    if (compactedValue !== undefined) {
+      compacted[key] = compactedValue;
+    }
+  }
+
+  return {
+    value: Object.keys(compacted).length > 0 ? compacted : undefined,
+    didCompact,
+  };
 }
 
 function compactRelayThreadListString(value) {

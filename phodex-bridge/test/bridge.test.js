@@ -3256,6 +3256,75 @@ test("sanitizeThreadHistoryImagesForRelay compacts thread/list rows for mobile",
   assert.equal(sanitized.result.data[0].metadata.bulky, undefined);
 });
 
+test("sanitizeThreadHistoryImagesForRelay preserves section-filtered thread/list order and metadata", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-section-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const rolloutThreadId = "thread-local-rollout";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "08", "10");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionsDir, `rollout-2026-08-10T12-00-00-${rolloutThreadId}.jsonl`),
+    `${JSON.stringify({
+      timestamp: "2026-08-10T12:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: rolloutThreadId,
+        cwd: "/Users/test/projects/local-only",
+        source: "cli",
+      },
+    })}\n`,
+    "utf8"
+  );
+  invalidateRolloutLookupCache();
+
+  const sanitized = JSON.parse(sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "req-thread-list-section",
+    result: {
+      data: [
+        {
+          id: "pinned-first",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          section: { id: "pinned-section", name: "Pinned", extra: "drop-me" },
+          sectionEnteredAt: 1_786_383_000,
+        },
+        {
+          id: "pinned-second",
+          updatedAt: "2026-08-11T00:00:00.000Z",
+          section: { id: "pinned-section", name: "Pinned", extra: "drop-me" },
+          sectionEnteredAt: 1_786_383_000,
+        },
+      ],
+      nextCursor: null,
+    },
+  }), "thread/list", {
+    sectionId: "pinned-section",
+    sortKey: "section_position",
+    cursor: null,
+    limit: 100,
+  }));
+
+  assert.deepEqual(sanitized.result.data.map((thread) => thread.id), [
+    "pinned-first",
+    "pinned-second",
+  ]);
+  assert.equal(sanitized.result.remodexJsonlThreadListAugmented, undefined);
+  assert.deepEqual(sanitized.result.data[0].section, {
+    id: "pinned-section",
+    name: "Pinned",
+  });
+  assert.equal(sanitized.result.data[0].sectionEnteredAt, 1_786_383_000);
+});
+
 test("sanitizeThreadHistoryImagesForRelay preserves only compact goal status in thread/list rows", (t) => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-thread-list-goal-"));
   const previousCodexHome = process.env.CODEX_HOME;
