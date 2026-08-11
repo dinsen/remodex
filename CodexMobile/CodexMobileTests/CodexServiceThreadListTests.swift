@@ -291,6 +291,10 @@ final class CodexServiceThreadListTests: XCTestCase {
         )
         XCTAssertEqual(threadListParams.map { $0["sectionId"]?.stringValue }, Array(repeating: "pinned-section", count: 3))
         XCTAssertEqual(threadListParams.map { $0["sortKey"]?.stringValue }, Array(repeating: "section_position", count: 3))
+        XCTAssertEqual(
+            threadListParams.map { $0["sortDirection"]?.stringValue },
+            Array(repeating: "asc", count: 3)
+        )
     }
 
     func testMissingSectionClearsStaleNativeCacheWithoutCreation() async throws {

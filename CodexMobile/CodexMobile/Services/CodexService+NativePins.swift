@@ -333,6 +333,7 @@ extension CodexService {
             params: .object([
                 "sectionId": .string(sectionID),
                 "sortKey": .string("section_position"),
+                "sortDirection": .string("asc"),
                 "sourceKinds": .array(sourceKinds.map(JSONValue.string)),
                 "cursor": cursor,
                 "limit": .integer(100),
