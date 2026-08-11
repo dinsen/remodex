@@ -282,6 +282,12 @@ enum CodexConnectionPhase: Equatable, Sendable {
     case connected
 }
 
+enum CodexPinnedStateAuthority: String, Codable, Equatable, Sendable {
+    case undecided
+    case hostCompatibility
+    case native
+}
+
 enum CodexPendingThreadComposerAction: Equatable, Sendable {
     case codeReview(target: CodexPendingCodeReviewTarget)
 }
@@ -820,9 +826,19 @@ final class CodexService {
     @ObservationIgnored var pinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
     @ObservationIgnored var confirmedNativePinnedThreadIDs: [String] = []
     @ObservationIgnored var confirmedNativePinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
+    var confirmedHostPinnedThreadIDs: [String] = []
+    @ObservationIgnored var confirmedHostPinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
+    var pinnedStateAuthority: CodexPinnedStateAuthority = .undecided
     @ObservationIgnored var nativePinnedSectionID: String?
-    @ObservationIgnored var nativePinCapability: NativePinCapability = .unknown
+    var nativePinCapability: NativePinCapability = .unknown
     @ObservationIgnored let nativePinOperationGate = NativePinOperationGate()
+    var pinMutationDisabledReason: String? {
+        guard pinnedStateAuthority == .native,
+              nativePinCapability == .available else {
+            return "Update Codex to synchronize pins."
+        }
+        return nil
+    }
     // Sidebar rows read this directly, so keep it observable even when thread metadata is unchanged.
     var snapshotOnlyPinnedThreadIDs: Set<String> = []
     @ObservationIgnored var stoppedTurnIDsByThread: [String: Set<String>] = [:]
@@ -863,6 +879,9 @@ final class CodexService {
     static let pinnedThreadSnapshotsDefaultsKey = "codex.pinnedThreadSnapshots"
     static let nativePinnedThreadIDsDefaultsKey = "codex.nativePinnedThreadIDs"
     static let nativePinnedThreadSnapshotsDefaultsKey = "codex.nativePinnedThreadSnapshots"
+    static let hostPinnedThreadIDsDefaultsKey = "codex.hostPinnedThreadIDs"
+    static let hostPinnedThreadSnapshotsDefaultsKey = "codex.hostPinnedThreadSnapshots"
+    static let pinnedStateAuthorityDefaultsKey = "codex.pinnedStateAuthority"
     static let associatedManagedWorktreePathsDefaultsKey = "codex.associatedManagedWorktreePaths"
     static let turnTerminalStatesDefaultsKey = "codex.turnTerminalStates"
     static let threadHistoryPaginationStateDefaultsKey = "codex.threadHistoryPaginationState"
@@ -924,6 +943,9 @@ final class CodexService {
         self.associatedManagedWorktreePathByThreadID = [:]
         self.pinnedThreadIDs = []
         self.pinnedThreadSnapshotsByRootID = [:]
+        self.confirmedHostPinnedThreadIDs = []
+        self.confirmedHostPinnedThreadSnapshotsByRootID = [:]
+        self.pinnedStateAuthority = .undecided
 
         self.terminalStateByTurnID = [:]
 

@@ -166,7 +166,7 @@ final class CodexTrustedMacSelectionTests: XCTestCase {
         XCTAssertEqual(SecureStore.readString(for: CodexSecureKeys.lastTrustedMacDeviceId), freshMacID)
     }
 
-    func testTrustMacMigratesPinnedDefaultsFromCoalescedMacId() throws {
+    func testTrustMacDiscardsPinnedDefaultsFromCoalescedMacId() throws {
         let service = makeService()
         let staleMacID = "mac-stale-\(UUID().uuidString)"
         let freshMacID = "mac-fresh-\(UUID().uuidString)"
@@ -206,26 +206,17 @@ final class CodexTrustedMacSelectionTests: XCTestCase {
             displayName: nil
         )
 
-        let migratedPinnedIDsData = try XCTUnwrap(service.defaults.data(
-            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: freshMacID)
-        ))
-        let migratedPinnedIDs = try service.decoder.decode([String].self, from: migratedPinnedIDsData)
-        let migratedSnapshotsData = try XCTUnwrap(service.defaults.data(
-            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadSnapshotsDefaultsKey, macDeviceId: freshMacID)
-        ))
-        let migratedSnapshots = try service.decoder.decode([String: [CodexThread]].self, from: migratedSnapshotsData)
-
         XCTAssertNil(service.defaults.object(
             forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: staleMacID)
         ))
         XCTAssertNil(service.defaults.object(
             forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadSnapshotsDefaultsKey, macDeviceId: staleMacID)
         ))
-        XCTAssertEqual(migratedPinnedIDs, [freshThread.id, staleThread.id])
-        XCTAssertEqual(migratedSnapshots[freshThread.id]?.first?.title, freshThread.title)
-        XCTAssertEqual(migratedSnapshots[staleThread.id]?.first?.title, staleThread.title)
-        XCTAssertEqual(service.pinnedThreadIDs, [freshThread.id, staleThread.id])
-        XCTAssertEqual(service.pinnedThreadSnapshotsByRootID[staleThread.id]?.first?.title, staleThread.title)
+        XCTAssertNil(service.defaults.object(
+            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadSnapshotsDefaultsKey, macDeviceId: freshMacID)
+        ))
+        XCTAssertEqual(service.pinnedThreadIDs, [])
+        XCTAssertEqual(service.pinnedThreadSnapshotsByRootID, [:])
     }
 
     func testTrustMacMigratesLocalCachesFromCoalescedMacId() throws {

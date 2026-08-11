@@ -118,6 +118,8 @@ extension CodexService {
 
     func loadMacScopedDefaultsState(for macDeviceId: String?) {
         withApplyingMacScopedState {
+            discardLegacyPinnedDefaults(for: macDeviceId)
+
             if let savedThreadRuntimeOverrides = defaults.data(forKey: macScopedDefaultsKey(Self.threadRuntimeOverridesDefaultsKey, macDeviceId: macDeviceId)),
                let decodedThreadRuntimeOverrides = try? decoder.decode(
                    [String: CodexThreadRuntimeOverride].self,
@@ -152,13 +154,6 @@ extension CodexService {
                 renamedThreadNameByThreadID = [:]
             }
 
-            defaults.removeObject(
-                forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
-            )
-            defaults.removeObject(
-                forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
-            )
-
             if let savedNativePinnedThreadIDs = defaults.data(
                 forKey: macScopedDefaultsKey(Self.nativePinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
             ),
@@ -178,6 +173,50 @@ extension CodexService {
                 confirmedNativePinnedThreadSnapshotsByRootID = decodedNativePinnedThreadSnapshots
             } else {
                 confirmedNativePinnedThreadSnapshotsByRootID = [:]
+            }
+
+            if let savedHostPinnedThreadIDs = defaults.data(
+                forKey: macScopedDefaultsKey(Self.hostPinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedHostPinnedThreadIDs = try? decoder.decode([String].self, from: savedHostPinnedThreadIDs) {
+                confirmedHostPinnedThreadIDs = decodedHostPinnedThreadIDs
+            } else {
+                confirmedHostPinnedThreadIDs = []
+            }
+
+            if let savedHostPinnedThreadSnapshots = defaults.data(
+                forKey: macScopedDefaultsKey(Self.hostPinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedHostPinnedThreadSnapshots = try? decoder.decode(
+                   [String: [CodexThread]].self,
+                   from: savedHostPinnedThreadSnapshots
+               ) {
+                confirmedHostPinnedThreadSnapshotsByRootID = decodedHostPinnedThreadSnapshots
+            } else {
+                confirmedHostPinnedThreadSnapshotsByRootID = [:]
+            }
+
+            if let savedPinnedStateAuthority = defaults.data(
+                forKey: macScopedDefaultsKey(Self.pinnedStateAuthorityDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedPinnedStateAuthority = try? decoder.decode(
+                   CodexPinnedStateAuthority.self,
+                   from: savedPinnedStateAuthority
+               ) {
+                pinnedStateAuthority = decodedPinnedStateAuthority
+            } else {
+                pinnedStateAuthority = .undecided
+            }
+
+            if pinnedStateAuthority == .native {
+                confirmedHostPinnedThreadIDs.removeAll()
+                confirmedHostPinnedThreadSnapshotsByRootID.removeAll()
+                defaults.removeObject(
+                    forKey: macScopedDefaultsKey(Self.hostPinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
+                )
+                defaults.removeObject(
+                    forKey: macScopedDefaultsKey(Self.hostPinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
+                )
             }
 
             nativePinnedSectionID = nil
@@ -315,6 +354,9 @@ extension CodexService {
             pinnedThreadSnapshotsByRootID.removeAll()
             confirmedNativePinnedThreadIDs.removeAll()
             confirmedNativePinnedThreadSnapshotsByRootID.removeAll()
+            confirmedHostPinnedThreadIDs.removeAll()
+            confirmedHostPinnedThreadSnapshotsByRootID.removeAll()
+            pinnedStateAuthority = .undecided
             nativePinnedSectionID = nil
             nativePinCapability = .unknown
             snapshotOnlyPinnedThreadIDs.removeAll()
@@ -332,8 +374,6 @@ extension CodexService {
         migrateLegacyMacScopedDefaultsValue(for: Self.locallyDeletedThreadIDsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.forkedThreadOriginsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.renamedThreadNamesDefaultsKey)
-        migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadIDsDefaultsKey)
-        migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadSnapshotsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.nativePinnedThreadIDsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.nativePinnedThreadSnapshotsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.associatedManagedWorktreePathsDefaultsKey)
@@ -342,6 +382,7 @@ extension CodexService {
         migrateLegacyMacScopedDefaultsValue(for: Self.gptAccountSnapshotDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginStateDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.gptPendingLoginCallbackDefaultsKey)
+        discardLegacyPinnedDefaults(for: normalizedCurrentTrustedMacDeviceId)
     }
 
     // Moves local state saved under rotated bridge ids onto the freshly trusted device id.
@@ -355,6 +396,11 @@ extension CodexService {
             .filter { $0 != targetDeviceId }
         guard !sourceDeviceIds.isEmpty else {
             return false
+        }
+
+        discardLegacyPinnedDefaults(for: targetDeviceId)
+        for sourceDeviceId in sourceDeviceIds {
+            discardLegacyPinnedDefaults(for: sourceDeviceId)
         }
 
         var migratedDefaults = false
@@ -387,7 +433,7 @@ extension CodexService {
             as: [String: String].self
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
-            Self.pinnedThreadSnapshotsDefaultsKey,
+            Self.hostPinnedThreadSnapshotsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
             as: [String: [CodexThread]].self
@@ -428,12 +474,16 @@ extension CodexService {
             to: targetDeviceId
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataList(
-            Self.pinnedThreadIDsDefaultsKey,
+            Self.hostPinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataList(
             Self.nativePinnedThreadIDsDefaultsKey,
+            from: sourceDeviceIds,
+            to: targetDeviceId
+        ) || migratedDefaults
+        migratedDefaults = mergeMacScopedPinnedStateAuthority(
             from: sourceDeviceIds,
             to: targetDeviceId
         ) || migratedDefaults
@@ -537,6 +587,90 @@ private extension CodexService {
     // A restored running hint older than this is more likely a finished run than a
     // live one; the stale-snapshot grace policy still clears any wrong restore.
     static var desktopMirroredRunningRestoreMaxAge: TimeInterval { 180 }
+
+    func discardLegacyPinnedDefaults(for macDeviceId: String?) {
+        defaults.removeObject(forKey: Self.pinnedThreadIDsDefaultsKey)
+        defaults.removeObject(forKey: Self.pinnedThreadSnapshotsDefaultsKey)
+
+        guard let normalizedMacDeviceId = normalizedMacScopedDeviceId(macDeviceId) else {
+            return
+        }
+
+        defaults.removeObject(forKey: "\(Self.pinnedThreadIDsDefaultsKey).\(normalizedMacDeviceId)")
+        defaults.removeObject(forKey: "\(Self.pinnedThreadSnapshotsDefaultsKey).\(normalizedMacDeviceId)")
+    }
+
+    func mergeMacScopedPinnedStateAuthority(
+        from sourceDeviceIds: [String],
+        to targetDeviceId: String
+    ) -> Bool {
+        let targetKey = macScopedDefaultsKey(
+            Self.pinnedStateAuthorityDefaultsKey,
+            macDeviceId: targetDeviceId
+        )
+        let targetAuthority = decodedMacScopedPinnedStateAuthority(macDeviceId: targetDeviceId)
+        var resolvedAuthority = targetAuthority
+        var changed = false
+
+        for sourceDeviceId in sourceDeviceIds {
+            let sourceKey = macScopedDefaultsKey(
+                Self.pinnedStateAuthorityDefaultsKey,
+                macDeviceId: sourceDeviceId
+            )
+            if let sourceAuthority = decodedMacScopedPinnedStateAuthority(macDeviceId: sourceDeviceId) {
+                if resolvedAuthority == nil
+                    || authorityRank(sourceAuthority) > authorityRank(resolvedAuthority ?? .undecided) {
+                    resolvedAuthority = sourceAuthority
+                }
+            }
+            if defaults.object(forKey: sourceKey) != nil {
+                defaults.removeObject(forKey: sourceKey)
+                changed = true
+            }
+        }
+
+        guard let resolvedAuthority else {
+            return changed
+        }
+
+        if targetAuthority != resolvedAuthority,
+           let encodedAuthority = try? encoder.encode(resolvedAuthority) {
+            defaults.set(encodedAuthority, forKey: targetKey)
+            changed = true
+        }
+
+        if resolvedAuthority == .native {
+            defaults.removeObject(
+                forKey: macScopedDefaultsKey(Self.hostPinnedThreadIDsDefaultsKey, macDeviceId: targetDeviceId)
+            )
+            defaults.removeObject(
+                forKey: macScopedDefaultsKey(Self.hostPinnedThreadSnapshotsDefaultsKey, macDeviceId: targetDeviceId)
+            )
+        }
+
+        return changed
+    }
+
+    func decodedMacScopedPinnedStateAuthority(macDeviceId: String?) -> CodexPinnedStateAuthority? {
+        guard let data = defaults.data(
+            forKey: macScopedDefaultsKey(Self.pinnedStateAuthorityDefaultsKey, macDeviceId: macDeviceId)
+        ) else {
+            return nil
+        }
+
+        return try? decoder.decode(CodexPinnedStateAuthority.self, from: data)
+    }
+
+    func authorityRank(_ authority: CodexPinnedStateAuthority) -> Int {
+        switch authority {
+        case .undecided:
+            return 0
+        case .hostCompatibility:
+            return 1
+        case .native:
+            return 2
+        }
+    }
 
     // Saves which threads were still desktop-mirrored running (with last activity)
     // so a relaunch can paint the live indicator instead of a finished-looking
