@@ -539,6 +539,241 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.nativePinCapability, .unsupported)
     }
 
+    func testHostFallbackHydratesMissingRowsThroughThreadRead() async throws {
+        let service = makeService()
+        service.threads = []
+        var readParams: [RPCObject] = []
+        var mutationMethods: [String] = []
+        service.requestTransportOverride = { method, params in
+            mutationMethods.append(method)
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: [])
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-a", "host-b"])
+            case "thread/read":
+                let request = params?.objectValue ?? [:]
+                readParams.append(request)
+                let threadID = request["threadId"]?.stringValue ?? ""
+                return self.threadReadResponse(id: threadID, title: "Hydrated \(threadID)")
+            case "threadSection/create", "thread/section/move":
+                XCTFail("Host hydration must not mutate native sections")
+                return self.emptyRPCResponse()
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-a", "host-b"])
+        XCTAssertEqual(service.threads.map(\.id), ["host-a", "host-b"])
+        XCTAssertEqual(readParams, [
+            ["threadId": .string("host-a"), "includeTurns": .bool(false)],
+            ["threadId": .string("host-b"), "includeTurns": .bool(false)],
+        ])
+        XCTAssertFalse(mutationMethods.contains("threadSection/create"))
+        XCTAssertFalse(mutationMethods.contains("thread/section/move"))
+        XCTAssertNil(service.thread(for: "host-a")?.metadata)
+    }
+
+    func testHostHydrationPreservesOrderWhenThreadReadsCompleteOutOfOrder() async throws {
+        let service = makeService()
+        service.threads = []
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: [])
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-first", "host-second"])
+            case "thread/read":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                let title = threadID == "host-first" ? "First response" : "Second response"
+                return self.threadReadResponse(id: threadID, title: title)
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-first", "host-second"])
+        XCTAssertEqual(service.threads.map(\.id), ["host-first", "host-second"])
+    }
+
+    func testFailedHostRowReadKeepsPriorSnapshotAndRetriesLater() async throws {
+        let service = makeService()
+        service.threads = []
+        service.confirmedHostPinnedThreadIDs = ["host-stable", "host-retry"]
+        service.confirmedHostPinnedThreadSnapshotsByRootID = [
+            "host-stable": [CodexThread(id: "host-stable", title: "Prior snapshot")],
+        ]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var shouldFailRetryRead = true
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-stable", "host-retry"])
+            case "thread/read":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                if shouldFailRetryRead {
+                    shouldFailRetryRead = false
+                    throw CodexServiceError.rpcError(RPCError(code: -32000, message: "temporary read failure"))
+                }
+                return self.threadReadResponse(id: threadID, title: "Authoritative retry")
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-stable", "host-retry"])
+        XCTAssertEqual(service.confirmedHostPinnedThreadSnapshotsByRootID["host-stable"]?.first?.title, "Prior snapshot")
+        XCTAssertNil(service.confirmedHostPinnedThreadSnapshotsByRootID["host-retry"])
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(
+            service.confirmedHostPinnedThreadSnapshotsByRootID["host-retry"]?.first?.title,
+            "Authoritative retry"
+        )
+    }
+
+    func testHostHydrationUsesThreadReadWithoutJSONLFallback() async throws {
+        let service = makeService()
+        service.threads = []
+        var requests: [(method: String, params: RPCObject?)] = []
+        service.requestTransportOverride = { method, params in
+            requests.append((method, params?.objectValue))
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-authoritative"])
+            case "thread/read":
+                XCTAssertEqual(params?.objectValue, [
+                    "threadId": .string("host-authoritative"),
+                    "includeTurns": .bool(false),
+                ])
+                return self.threadReadResponse(id: "host-authoritative", title: "Server row")
+            default:
+                XCTFail("Unexpected fallback request \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(service.thread(for: "host-authoritative")?.title, "Server row")
+        XCTAssertEqual(requests.map(\.method), ["threadSection/list", "bridge/hostPins/read", "thread/read"])
+    }
+
+    func testHostFallbackRejectsPinWithoutCreatingOrMovingSection() async {
+        let service = makeService()
+        service.threads = [CodexThread(id: "host-pin")]
+        service.confirmedHostPinnedThreadIDs = ["host-pin"]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var methods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            methods.append(method)
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-pin"])
+            case "threadSection/create", "thread/section/move":
+                XCTFail("Host compatibility must not mutate native sections")
+                return self.emptyRPCResponse()
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        do {
+            try await service.setThreadPinned("host-pin", pinned: true)
+            XCTFail("Expected host compatibility mutation to be rejected")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Update Codex to synchronize pins.")
+        }
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-pin"])
+        XCTAssertFalse(methods.contains("threadSection/create"))
+        XCTAssertFalse(methods.contains("thread/section/move"))
+    }
+
+    func testHostFallbackRejectsUnpinWithoutChangingConfirmedOrder() async {
+        let service = makeService()
+        service.threads = [CodexThread(id: "host-first"), CodexThread(id: "host-second")]
+        service.confirmedHostPinnedThreadIDs = ["host-first", "host-second"]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var methods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            methods.append(method)
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-first", "host-second"])
+            case "threadSection/create", "thread/section/move":
+                XCTFail("Host compatibility must not mutate native sections")
+                return self.emptyRPCResponse()
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        do {
+            try await service.setThreadPinned("host-first", pinned: false)
+            XCTFail("Expected host compatibility mutation to be rejected")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Update Codex to synchronize pins.")
+        }
+
+        XCTAssertEqual(service.confirmedHostPinnedThreadIDs, ["host-first", "host-second"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["host-first", "host-second"])
+        XCTAssertFalse(methods.contains("threadSection/create"))
+        XCTAssertFalse(methods.contains("thread/section/move"))
+    }
+
+    func testNativeAuthorityKeepsExistingPinMutationContract() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "native-new"), CodexThread(id: "native-old")]
+        var serverPins = ["native-old"]
+        var moveParams: RPCObject?
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: serverPins)
+            case "thread/section/move":
+                moveParams = params?.objectValue
+                serverPins = ["native-new", "native-old"]
+                return self.emptyRPCResponse()
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.setThreadPinned("native-new", pinned: true)
+
+        XCTAssertEqual(moveParams?["threadId"], .string("native-new"))
+        XCTAssertEqual(moveParams?["sectionId"], .string("pinned-section"))
+        XCTAssertEqual(moveParams?["beforeThreadId"], .string("native-old"))
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.pinnedThreadIDs, ["native-new", "native-old"])
+    }
+
     func testPinMovesRootBeforeCurrentFirstPin() async throws {
         let service = makeService()
         service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]

@@ -94,7 +94,16 @@ extension CodexService {
 
     func refreshNativePinsForThreadHydration() async -> [CodexThread] {
         do {
-            try await synchronizeNativePins()
+            try await withSerializedNativePinOperation {
+                do {
+                    try await self.synchronizeNativePinsWithoutSerialization()
+                } catch {
+                    self.lastErrorMessage = self.nativePinBackgroundErrorMessage(for: error)
+                }
+                if self.pinnedStateAuthority == .hostCompatibility {
+                    await self.hydrateConfirmedHostPinnedThreads()
+                }
+            }
         } catch {
             lastErrorMessage = nativePinBackgroundErrorMessage(for: error)
         }
@@ -103,8 +112,116 @@ extension CodexService {
 
     func confirmedNativePinnedThreadsForHydration() -> [CodexThread] {
         var seen: Set<String> = []
-        return confirmedNativePinnedThreadIDs.flatMap { confirmedNativePinnedThreadSnapshotsByRootID[$0] ?? [] }
+        let snapshots: [String: [CodexThread]] = pinnedStateAuthority == .hostCompatibility
+            ? confirmedHostPinnedThreadSnapshotsByRootID
+            : confirmedNativePinnedThreadSnapshotsByRootID
+        let ids = pinnedStateAuthority == .hostCompatibility
+            ? confirmedHostPinnedThreadIDs
+            : confirmedNativePinnedThreadIDs
+        return ids.flatMap { snapshots[$0] ?? [] }
             .filter { seen.insert($0.id).inserted }
+    }
+
+    private func hydrateConfirmedHostPinnedThreads() async {
+        var didChangeSnapshots = false
+        for threadID in confirmedHostPinnedThreadIDs {
+            if let liveThread = thread(for: threadID) {
+                guard !liveThread.isSubagent else { continue }
+                if let snapshot = snapshotThreadsForPinnedRoot(threadID), !snapshot.isEmpty {
+                    if confirmedHostPinnedThreadSnapshotsByRootID[threadID] != snapshot {
+                        confirmedHostPinnedThreadSnapshotsByRootID[threadID] = snapshot
+                        didChangeSnapshots = true
+                    }
+                }
+                continue
+            }
+
+            if let cachedSnapshot = confirmedHostPinnedThreadSnapshotsByRootID[threadID],
+               !cachedSnapshot.isEmpty {
+                continue
+            }
+
+            do {
+                guard let hydratedThread = try await readHostPinnedThread(threadID: threadID),
+                      !hydratedThread.isSubagent else {
+                    continue
+                }
+                upsertThread(hydratedThread, treatAsServerState: true)
+                confirmedHostPinnedThreadSnapshotsByRootID[threadID] =
+                    snapshotThreadsForPinnedRoot(threadID) ?? [hydratedThread]
+                didChangeSnapshots = true
+            } catch {
+                // Keep the confirmed host ID and any prior snapshot. The next
+                // serialized refresh retries only the row that is still absent.
+                continue
+            }
+        }
+
+        if didChangeSnapshots {
+            persistConfirmedHostPinnedThreadState()
+            rebuildEffectivePinnedThreadState()
+        }
+    }
+
+    private func readHostPinnedThread(threadID: String) async throws -> CodexThread? {
+        let camelCaseParams: JSONValue = .object([
+            "threadId": .string(threadID),
+            "includeTurns": .bool(false),
+        ])
+
+        do {
+            let response = try await sendRequest(
+                method: "thread/read",
+                params: camelCaseParams,
+                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+                timeoutMessage: "thread/read timed out while hydrating a Codex host pin."
+            )
+            return try decodeHostPinnedThread(response, requestedThreadID: threadID)
+        } catch {
+            guard shouldRetryHostThreadReadWithSnakeCase(error) else {
+                throw error
+            }
+
+            let response = try await sendRequest(
+                method: "thread/read",
+                params: .object([
+                    "thread_id": .string(threadID),
+                    "includeTurns": .bool(false),
+                ]),
+                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+                timeoutMessage: "thread/read timed out while hydrating a Codex host pin."
+            )
+            return try decodeHostPinnedThread(response, requestedThreadID: threadID)
+        }
+    }
+
+    private func decodeHostPinnedThread(
+        _ response: RPCMessage,
+        requestedThreadID: String
+    ) throws -> CodexThread? {
+        if let error = response.error {
+            throw CodexServiceError.rpcError(error)
+        }
+        guard let threadValue = response.result?.objectValue?["thread"],
+              let decodedThread = decodeModel(CodexThread.self, from: threadValue) else {
+            throw CodexServiceError.invalidResponse("thread/read response missing thread")
+        }
+        guard decodedThread.id == requestedThreadID else {
+            throw CodexServiceError.invalidResponse("thread/read returned the wrong thread")
+        }
+        return decodedThread
+    }
+
+    private func shouldRetryHostThreadReadWithSnakeCase(_ error: Error) -> Bool {
+        guard let serviceError = error as? CodexServiceError,
+              case .rpcError(let rpcError) = serviceError,
+              rpcError.code == -32602 else {
+            return false
+        }
+        let message = rpcError.message.lowercased()
+        return message.contains("threadid")
+            || message.contains("thread_id")
+            || (message.contains("unknown") && message.contains("field"))
     }
 
     private func synchronizeNativePinsWithoutSerialization() async throws {
