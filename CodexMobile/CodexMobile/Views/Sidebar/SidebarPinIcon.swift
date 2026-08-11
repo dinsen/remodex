@@ -18,14 +18,18 @@ struct SidebarPinIcon: View {
 
     let style: Style
 
+    @ViewBuilder
     var body: some View {
-        // Both variants route through the same explicit-size path so they
-        // render at identical bounds; the font-driven path used to make the
-        // row badge anchor on an SF Symbol bounding box larger than the
-        // header glyph. Asset name doesn't matter: `pin` and `pin.fill` both
-        // map to `central-pin` in `RemodexIcon`.
-        RemodexIcon.image(systemName: "pin", size: 18, weight: .medium)
-            .foregroundStyle(style.foregroundStyle)
+        switch style {
+        case .header:
+            RemodexIcon.image(systemName: "pin", size: 18, weight: .medium)
+                .foregroundStyle(style.foregroundStyle)
+        case .rowBadge:
+            Image(systemName: "pin.fill")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(style.foregroundStyle)
+                .accessibilityHidden(true)
+        }
     }
 }
 

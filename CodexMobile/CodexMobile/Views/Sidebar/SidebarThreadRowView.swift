@@ -13,7 +13,6 @@ struct SidebarThreadRowView: View {
     let timingLabel: String?
     let showsTimestampRefreshIndicator: Bool
     let isPinned: Bool
-    let pinnedProjectLabel: String?
     let childSubagentCount: Int
     let isSubagentExpanded: Bool
     let onToggleSubagents: (() -> Void)?
@@ -81,13 +80,9 @@ struct SidebarThreadRowView: View {
                 // Keep trailing metadata inside the main stack so long titles truncate before it.
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
-                        // Pinned glyph hidden on the row itself: pinned threads already
-                        // live under the "Pinned" section header, so the per-row badge
-                        // was redundant. Kept the `isPinned` plumbing for the context
-                        // menu / accessibility / future use.
-                        // if isPinned && !thread.isSubagent {
-                        //     SidebarPinIcon(style: .rowBadge)
-                        // }
+                        if isPinned && !thread.isSubagent {
+                            SidebarPinIcon(style: .rowBadge)
+                        }
 
                         Text(thread.displayTitle)
                             .font(AppFont.body())
@@ -113,6 +108,7 @@ struct SidebarThreadRowView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityValue(isPinned ? "Pinned" : "")
         .padding(.horizontal, 12)
         .padding(.vertical, 12)
     }
@@ -136,14 +132,6 @@ struct SidebarThreadRowView: View {
 
             if thread.isUsingGoal {
                 SidebarThreadGoalBadgeView(pointSize: 12)
-            }
-
-            if let pinnedProjectLabel, !pinnedProjectLabel.isEmpty {
-                Text(pinnedProjectLabel)
-                    .font(AppFont.footnote())
-                    .foregroundStyle(SidebarForegroundStyle.meta)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
             }
 
             if let runBadgeState {

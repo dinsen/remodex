@@ -263,7 +263,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
             pinnedThreadIDs: ["archived-thread", "live-thread"]
         )
 
-        XCTAssertEqual(groups.map(\.id), ["pinned", "project:/Users/me/work/app"])
+        XCTAssertEqual(groups.map(\.id), ["pinned"])
         XCTAssertEqual(groups.first?.threads.map(\.id), ["live-thread"])
     }
 
@@ -290,6 +290,47 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(groups.map(\.id), ["pinned", "project:/Users/me/work/app"])
         XCTAssertEqual(groups.first?.threads.map(\.id), ["root-thread", "child-thread"])
         XCTAssertEqual(groups.last?.threads.map(\.id), ["sibling-thread"])
+    }
+
+    func testPinnedRootsAppearOnceInNativeOrderAndSubtreesLeaveProjects() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "root-a", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(
+                id: "child-a",
+                updatedAt: now.addingTimeInterval(300),
+                cwd: "/Users/me/work/app",
+                parentThreadId: "root-a"
+            ),
+            makeThread(id: "root-b", updatedAt: now.addingTimeInterval(600), cwd: "/Users/me/work/site"),
+            makeThread(id: "regular", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/app"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            pinnedThreadIDs: ["root-a", "root-b", "root-a"]
+        )
+
+        XCTAssertEqual(groups.first?.kind, .pinned)
+        XCTAssertEqual(groups.first?.threads.map(\.id), ["root-a", "child-a", "root-b"])
+        XCTAssertEqual(groups.flatMap(\.threads).filter { $0.id == "root-a" }.count, 1)
+        XCTAssertEqual(groups.flatMap(\.threads).filter { $0.id == "child-a" }.count, 1)
+        XCTAssertEqual(
+            groups.filter { $0.kind != .pinned }.flatMap(\.threads).map(\.id),
+            ["regular"]
+        )
+    }
+
+    func testEmptyPinnedOrderOmitsPinnedGroup() {
+        let thread = makeThread(
+            id: "regular",
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            cwd: "/Users/me/work/app"
+        )
+
+        let groups = SidebarThreadGrouping.makeGroups(from: [thread], pinnedThreadIDs: [])
+
+        XCTAssertFalse(groups.contains { $0.kind == .pinned })
     }
 
     // Without a resolved origin (older bridge, or a worktree gone from disk) the chat still needs a

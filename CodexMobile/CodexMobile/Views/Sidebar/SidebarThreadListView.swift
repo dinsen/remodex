@@ -325,13 +325,7 @@ struct SidebarThreadListView: View {
             runBadgeState: runBadgeStateByThreadID[thread.id],
             timingLabel: timingLabelProvider(thread),
             showsTimestampRefreshIndicator: showsTimestampRefreshIndicator(thread),
-            isPinned: codex.isThreadPinned(thread.id),
-            pinnedProjectLabel: isPinnedRow && !SidebarThreadGrouping.isRootlessChatThread(
-                thread,
-                projectlessRootPaths: projectlessRootPaths
-            )
-                ? thread.projectDisplayName
-                : nil,
+            isPinned: isPinnedRow,
             childSubagentCount: childSubagentCount,
             isSubagentExpanded: isSubagentExpanded,
             onToggleSubagents: onToggleSubagents,
