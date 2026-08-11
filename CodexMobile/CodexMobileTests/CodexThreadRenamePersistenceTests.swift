@@ -99,7 +99,8 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 title: "Mac Rename",
                 name: "Mac Rename",
                 cwd: "/tmp/remodex"
-            )
+            ),
+            treatAsServerState: true
         )
 
         XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Mac Rename")
@@ -110,7 +111,8 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 id: "thread-1",
                 title: "Conversation",
                 cwd: "/tmp/remodex"
-            )
+            ),
+            treatAsServerState: true
         )
 
         XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "New Thread")
@@ -141,7 +143,8 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 id: "thread-1",
                 title: "Mac Title Rename",
                 cwd: "/tmp/remodex"
-            )
+            ),
+            treatAsServerState: true
         )
 
         XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Mac Title Rename")
@@ -152,7 +155,8 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
                 id: "thread-1",
                 title: "Conversation",
                 cwd: "/tmp/remodex"
-            )
+            ),
+            treatAsServerState: true
         )
 
         XCTAssertEqual(secondReloadedService.thread(for: "thread-1")?.displayTitle, "New Thread")
