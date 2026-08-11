@@ -924,6 +924,7 @@ final class CodexServiceThreadListTests: XCTestCase {
             switch method {
             case "threadSection/list": return self.pinnedSectionListResponse()
             case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "bridge/hostPins/read": return self.hostPinsResponse(ids: [])
             case "thread/section/move":
                 let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
                 await recorder.record(threadID)
@@ -1510,6 +1511,8 @@ final class CodexServiceThreadListTests: XCTestCase {
                     result: .object(["data": .array([])]),
                     includeJSONRPC: false
                 )
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: [])
             case "runtime/defaults":
                 return RPCMessage(
                     id: .string(UUID().uuidString),
