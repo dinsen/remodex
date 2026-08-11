@@ -67,6 +67,11 @@ enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case archivedLocal
 }
 
+struct CodexThreadSection: Codable, Hashable, Sendable {
+    let id: String
+    let name: String
+}
+
 // Who created the session, when it was not the user. Scheduled runs are the common case
 // and carry no extra meaning worth a word in a sidebar row, so they render as the clock
 // glyph Synara already uses for automations; named kinds keep their short text.
@@ -98,6 +103,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var preview: String?
     var createdAt: Date?
     var updatedAt: Date?
+    var section: CodexThreadSection?
+    var sectionEnteredAt: Date?
     var cwd: String?
     // Checkout that owns `cwd` when the chat runs inside a Codex-managed worktree. The bridge
     // resolves it from the worktree's Git link so the sidebar can keep worktree chats inside the
@@ -132,6 +139,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         preview: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
+        section: CodexThreadSection? = nil,
+        sectionEnteredAt: Date? = nil,
         cwd: String? = nil,
         worktreeOriginPath: String? = nil,
         metadata: [String: JSONValue]? = nil,
@@ -157,6 +166,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.preview = preview
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.section = section
+        self.sectionEnteredAt = sectionEnteredAt
         self.cwd = Self.normalizeProjectPath(cwd)
         self.worktreeOriginPath = Self.normalizeProjectPath(worktreeOriginPath)
         self.metadata = metadata
@@ -188,6 +199,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case createdAtSnake = "created_at"
         case updatedAt
         case updatedAtSnake = "updated_at"
+        case section
+        case sectionEnteredAt
         case cwd
         case cwdSnake = "current_working_directory"
         case cwdWorkingDirectory = "working_directory"
@@ -239,6 +252,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         preview = try container.decodeIfPresent(String.self, forKey: .preview)
         createdAt = try Self.decodeDateIfPresent(from: container, keys: [.createdAt, .createdAtSnake])
         updatedAt = try Self.decodeDateIfPresent(from: container, keys: [.updatedAt, .updatedAtSnake])
+        section = try container.decodeIfPresent(CodexThreadSection.self, forKey: .section)
+        sectionEnteredAt = try Self.decodeDateIfPresent(from: container, keys: [.sectionEnteredAt])
         metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata)
         cwd = Self.decodeStringIfPresent(from: container, keys: [.cwd, .cwdSnake, .cwdWorkingDirectory])
             ?? Self.decodeProjectPath(from: metadata)
@@ -326,6 +341,8 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(preview, forKey: .preview)
         try container.encodeIfPresent(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try container.encodeIfPresent(section, forKey: .section)
+        try container.encodeIfPresent(sectionEnteredAt, forKey: .sectionEnteredAt)
         try container.encodeIfPresent(Self.normalizeProjectPath(cwd), forKey: .cwd)
         try container.encodeIfPresent(Self.normalizeProjectPath(worktreeOriginPath), forKey: .worktreeOriginPath)
         try container.encodeIfPresent(metadata, forKey: .metadata)

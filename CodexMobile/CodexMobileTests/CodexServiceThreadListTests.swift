@@ -11,6 +11,29 @@ import XCTest
 final class CodexServiceThreadListTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
+    func testDecodeThreadSectionMetadata() throws {
+        let data = Data(#"""
+        [
+          {
+            "id": "thread-pinned",
+            "section": { "id": "pinned-section", "name": "Pinned" },
+            "sectionEnteredAt": 1786383000
+          },
+          {
+            "id": "thread-unsectioned"
+          }
+        ]
+        """#.utf8)
+
+        let threads = try JSONDecoder().decode([CodexThread].self, from: data)
+
+        XCTAssertEqual(threads[0].section?.id, "pinned-section")
+        XCTAssertEqual(threads[0].section?.name, "Pinned")
+        XCTAssertEqual(threads[0].sectionEnteredAt, Date(timeIntervalSince1970: 1_786_383_000))
+        XCTAssertNil(threads[1].section)
+        XCTAssertNil(threads[1].sectionEnteredAt)
+    }
+
     func testListThreadsRequestsInitialAndCursorPagesAndAppServerSourceKinds() async throws {
         let service = makeService()
         service.isConnected = true
