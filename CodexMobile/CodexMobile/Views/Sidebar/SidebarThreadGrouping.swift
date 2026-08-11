@@ -730,7 +730,7 @@ enum SidebarThreadGrouping {
         var visitedThreadIDs: Set<String> = []
 
         for rootThreadID in pinnedRootThreadIDs {
-            guard let rootThread = threadsByID[rootThreadID] else {
+            guard let rootThread = threadsByID[rootThreadID], !rootThread.isSubagent else {
                 continue
             }
 

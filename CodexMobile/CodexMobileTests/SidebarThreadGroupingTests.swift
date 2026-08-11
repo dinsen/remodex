@@ -333,6 +333,25 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertFalse(groups.contains { $0.kind == .pinned })
     }
 
+    func testPinnedSubagentIsNotPromotedToPinnedSection() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let rootThread = makeThread(id: "root-thread", updatedAt: now, cwd: "/Users/me/work/app")
+        let subagentThread = makeThread(
+            id: "subagent-thread",
+            updatedAt: now.addingTimeInterval(-60),
+            cwd: "/Users/me/work/app",
+            parentThreadId: "root-thread"
+        )
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: [rootThread, subagentThread],
+            pinnedThreadIDs: ["subagent-thread"]
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/app"])
+        XCTAssertEqual(groups.first?.threads.map(\.id), ["root-thread", "subagent-thread"])
+    }
+
     // Without a resolved origin (older bridge, or a worktree gone from disk) the chat still needs a
     // home, so it keeps a standalone group that names the worktree instead of hiding under the repo.
     func testMakeGroupsMarksCodexManagedWorktreesInLabelAndIconWhenOriginIsUnknown() throws {
