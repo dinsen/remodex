@@ -354,7 +354,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
 
         XCTAssertEqual(mainGroup.label, "Remodex")
         XCTAssertEqual(mainGroup.iconSystemName, "folder")
-        XCTAssertEqual(worktreeGroup.label, "Remodex 15")
+        XCTAssertEqual(worktreeGroup.label, "Remodex [ce15]")
         XCTAssertEqual(worktreeGroup.iconSystemName, "remodex.worktree")
     }
 
@@ -457,7 +457,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
 
         XCTAssertEqual(labelsByPath["/Users/me/work/Remodex"]?.label, "Remodex")
         XCTAssertEqual(labelsByPath["/Users/me/work/Remodex"]?.iconSystemName, "folder")
-        XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.label, "Remodex 15")
+        XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.label, "Remodex [ce15]")
         XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.iconSystemName, "remodex.worktree")
     }
 

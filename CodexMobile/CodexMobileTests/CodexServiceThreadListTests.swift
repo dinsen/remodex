@@ -1103,6 +1103,12 @@ final class CodexServiceThreadListTests: XCTestCase {
                     result: .object(["data": .array([])]),
                     includeJSONRPC: false
                 )
+            case "runtime/defaults":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([:]),
+                    includeJSONRPC: false
+                )
             case "model/list":
                 modelListRequestCount += 1
                 didLoadModelsBeforeThreadListReturned = !didReturnThreadListResponse
@@ -1138,7 +1144,7 @@ final class CodexServiceThreadListTests: XCTestCase {
         let laterByUpdatedAt = CodexThread(
             id: "later-by-updated-at",
             createdAt: Date(timeIntervalSince1970: 10),
-            updatedAt: Date(timeIntervalSince1970: 50)
+            updatedAt: Date(timeIntervalSince1970: 150)
         )
         let laterByCreatedAt = CodexThread(
             id: "later-by-created-at",
@@ -1179,8 +1185,8 @@ final class CodexServiceThreadListTests: XCTestCase {
         service.reconcileLocalThreadsWithServer([
             CodexThread(
                 id: "pinned-thread",
-                title: "Original server title",
-                name: "Original server title",
+                title: "New Thread",
+                name: "New Thread",
                 createdAt: Date(timeIntervalSince1970: 10),
                 updatedAt: Date(timeIntervalSince1970: 30),
                 cwd: "/Users/dev/project"

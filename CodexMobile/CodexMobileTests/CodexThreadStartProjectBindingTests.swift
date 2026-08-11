@@ -216,7 +216,7 @@ final class CodexThreadStartProjectBindingTests: XCTestCase {
 
         let thread = try JSONDecoder().decode(CodexThread.self, from: payload)
 
-        XCTAssertEqual(thread.goalStatus, .completed)
+        XCTAssertEqual(thread.goalStatus, .complete)
         XCTAssertFalse(thread.isUsingGoal)
     }
 

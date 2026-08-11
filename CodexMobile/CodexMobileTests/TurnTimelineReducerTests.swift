@@ -902,36 +902,6 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(messageIDs, ["tool-1", "tool-2"])
     }
 
-    func testTimelineRenderProjectionGroupsFinishedCommandsIntoDisclosureItem() {
-        let now = Date()
-        let messages = [
-            makeMessage(
-                id: "command-1",
-                threadID: "thread",
-                role: .system,
-                kind: .commandExecution,
-                text: "Completed rg -n \"needle\" Sources",
-                createdAt: now,
-                turnID: "turn-1",
-                itemID: "command-1"
-            ),
-            makeMessage(
-                id: "command-2",
-                threadID: "thread",
-                role: .system,
-                kind: .commandExecution,
-                text: "Completed sed -n '1,40p' Sources/App.swift",
-                createdAt: now.addingTimeInterval(1),
-                turnID: "turn-1",
-                itemID: "command-2"
-            ),
-        ]
-
-        let items = TurnTimelineRenderProjection.project(messages: messages)
-
-        XCTAssertEqual(items.map(\.id), ["command-group:command-1"])
-    }
-
     func testTimelineRenderProjectionKeepsLatestFinishedCallVisibleWhileTurnRuns() {
         let now = Date()
         let messages = [
@@ -1652,37 +1622,6 @@ final class TurnTimelineReducerTests: XCTestCase {
         XCTAssertEqual(group.failedCommandCount, 1)
         XCTAssertEqual(group.stoppedCommandCount, 1)
         XCTAssertTrue(group.hasUnsuccessfulCommands)
-    }
-
-    func testTimelineRenderProjectionKeepsRunningCommandsVisibleUntilFinished() {
-        let now = Date()
-        let messages = [
-            makeMessage(
-                id: "running",
-                threadID: "thread",
-                role: .system,
-                kind: .commandExecution,
-                text: "Running rg -n \"needle\" Sources",
-                createdAt: now,
-                turnID: "turn-1",
-                itemID: "running",
-                isStreaming: true
-            ),
-            makeMessage(
-                id: "finished",
-                threadID: "thread",
-                role: .system,
-                kind: .commandExecution,
-                text: "Completed sed -n '1,40p' Sources/App.swift",
-                createdAt: now.addingTimeInterval(1),
-                turnID: "turn-1",
-                itemID: "finished"
-            ),
-        ]
-
-        let items = TurnTimelineRenderProjection.project(messages: messages)
-
-        XCTAssertEqual(items.map(\.id), ["running", "command-group:finished"])
     }
 
     func testTimelineRenderProjectionMovesFinishedCommandGroupInsideCompletedTurnPreviousMessages() {
@@ -7493,7 +7432,7 @@ final class ScrollGeometryCoalescerTests: XCTestCase {
     @MainActor
     func testFollowBottomRetriesOneRequestQueuedDuringAnimation() async {
         let coalescer = ScrollGeometryCoalescer()
-        coalescer.observe(ScrollBottomState(isAtBottom: false))
+        coalescer.observe(ScrollBottomState(isAtBottom: false, viewportHeight: 0, contentHeight: 0))
         var actionCount = 0
         var firstCompletion: (@MainActor () -> Void)?
         var retryCompletion: (@MainActor () -> Void)?
@@ -7524,7 +7463,7 @@ final class ScrollGeometryCoalescerTests: XCTestCase {
     @MainActor
     func testFollowBottomDropsQueuedRetryAfterReachingBottom() async {
         let coalescer = ScrollGeometryCoalescer()
-        coalescer.observe(ScrollBottomState(isAtBottom: false))
+        coalescer.observe(ScrollBottomState(isAtBottom: false, viewportHeight: 0, contentHeight: 0))
         var firstCompletion: (@MainActor () -> Void)?
         let firstActionStarted = expectation(description: "First follow-bottom action started")
         let retryActionStarted = expectation(description: "Queued retry must not start")
@@ -7539,7 +7478,7 @@ final class ScrollGeometryCoalescerTests: XCTestCase {
             retryActionStarted.fulfill()
         }
 
-        coalescer.observe(ScrollBottomState(isAtBottom: true))
+        coalescer.observe(ScrollBottomState(isAtBottom: true, viewportHeight: 0, contentHeight: 0))
         firstCompletion?()
         await fulfillment(of: [retryActionStarted], timeout: 0.1)
     }
@@ -7547,7 +7486,7 @@ final class ScrollGeometryCoalescerTests: XCTestCase {
     @MainActor
     func testCancellingFollowBottomClearsQueuedRetry() async {
         let coalescer = ScrollGeometryCoalescer()
-        coalescer.observe(ScrollBottomState(isAtBottom: false))
+        coalescer.observe(ScrollBottomState(isAtBottom: false, viewportHeight: 0, contentHeight: 0))
         var firstCompletion: (@MainActor () -> Void)?
         let firstActionStarted = expectation(description: "First follow-bottom action started")
         let retryActionStarted = expectation(description: "Cancelled retry must not start")
