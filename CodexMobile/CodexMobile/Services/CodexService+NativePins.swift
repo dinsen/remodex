@@ -425,6 +425,11 @@ extension CodexService {
             throw userFacingNativePinMutationError(error)
         }
 
+        guard pinnedStateAuthority == .native,
+              nativePinCapability == .available else {
+            throw CodexServiceError.invalidInput("Update Codex to synchronize pins.")
+        }
+
         let rootThreadID = pinnedRootThreadID(for: threadID) ?? threadID
         if pinned == confirmedNativePinnedThreadIDs.contains(rootThreadID) {
             return

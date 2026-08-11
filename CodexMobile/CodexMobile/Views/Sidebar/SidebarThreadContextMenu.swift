@@ -16,6 +16,7 @@ struct SidebarThreadContextMenu {
     let thread: CodexThread
     /// Drives the Pin / Unpin label. Ignored when `onPinToggle` is nil.
     var isPinned: Bool = false
+    var pinMutationDisabledReason: String? = nil
     var onCopySessionId: (() -> Void)? = nil
     var onRename: (() -> Void)? = nil
     var onArchiveToggle: (() -> Void)? = nil
@@ -51,11 +52,21 @@ struct SidebarThreadContextMenu {
         }
 
         if let onPinToggle, thread.syncState != .archivedLocal, !thread.isSubagent {
-            children.append(makeAction(
-                title: isPinned ? "Unpin" : "Pin",
-                systemImage: isPinned ? "pin.slash" : "pin",
-                handler: onPinToggle
-            ))
+            let pinTitle = isPinned ? "Unpin" : "Pin"
+            if let pinMutationDisabledReason {
+                children.append(makeAction(
+                    title: "\(pinTitle) — \(pinMutationDisabledReason)",
+                    systemImage: isPinned ? "pin.slash" : "pin",
+                    attributes: .disabled,
+                    handler: {}
+                ))
+            } else {
+                children.append(makeAction(
+                    title: pinTitle,
+                    systemImage: isPinned ? "pin.slash" : "pin",
+                    handler: onPinToggle
+                ))
+            }
         }
 
         if let onDelete {

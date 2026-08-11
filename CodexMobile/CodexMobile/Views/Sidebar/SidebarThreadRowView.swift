@@ -18,6 +18,7 @@ struct SidebarThreadRowView: View {
     let onToggleSubagents: (() -> Void)?
     let onTap: () -> Void
     var onRename: ((String) -> Void)? = nil
+    var pinMutationDisabledReason: String? = nil
     var onPinToggle: (() -> Void)? = nil
     var onArchiveToggle: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
@@ -59,6 +60,7 @@ struct SidebarThreadRowView: View {
             SidebarThreadContextMenu(
                 thread: thread,
                 isPinned: isPinned,
+                pinMutationDisabledReason: pinMutationDisabledReason,
                 onCopySessionId: { UIPasteboard.general.string = thread.sessionId },
                 onRename: onRename.map { _ in { renamePrompt.present(currentTitle: thread.displayTitle) } },
                 onArchiveToggle: onArchiveToggle,

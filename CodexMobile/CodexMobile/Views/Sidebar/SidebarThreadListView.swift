@@ -28,6 +28,7 @@ struct SidebarThreadListView: View {
     var onArchiveProjectGroup: ((SidebarThreadGroup) -> Void)? = nil
     var onDeleteProjectGroup: ((SidebarThreadGroup) -> Void)? = nil
     var onRenameThread: ((CodexThread, String) -> Void)? = nil
+    var pinMutationDisabledReason: String? = nil
     var onPinToggleThread: ((CodexThread) -> Void)? = nil
     var onArchiveToggleThread: ((CodexThread) -> Void)? = nil
     var onDeleteThread: ((CodexThread) -> Void)? = nil
@@ -337,6 +338,7 @@ struct SidebarThreadListView: View {
                 }
             },
             onRename: onRenameThread.map { handler in { newName in handler(thread, newName) } },
+            pinMutationDisabledReason: pinMutationDisabledReason,
             onPinToggle: onPinToggleThread.map { handler in { handler(thread) } },
             onArchiveToggle: onArchiveToggleThread.map { handler in { handler(thread) } },
             onDelete: onDeleteThread.map { handler in { handler(thread) } }

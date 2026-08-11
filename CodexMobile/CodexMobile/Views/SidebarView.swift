@@ -805,6 +805,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             onRenameThread: { thread, newName in
                 codex.renameThread(thread.id, name: newName)
             },
+            pinMutationDisabledReason: codex.pinMutationDisabledReason,
             onPinToggleThread: { thread in
                 let shouldPin = !codex.isThreadPinned(thread.id)
                 Task { @MainActor in
