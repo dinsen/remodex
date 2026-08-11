@@ -142,10 +142,10 @@ extension CodexService {
             return
         }
 
-        let pinnedThreads = await refreshNativePinsForThreadHydration()
         let fetchID = UUID()
         let task = Task { @MainActor in
-            try await self.fetchServerThreads(
+            let pinnedThreads = await self.refreshNativePinsForThreadHydration()
+            return try await self.fetchServerThreads(
                 limit: self.initialVisibleThreadListLimit,
                 paginateLimitedPages: true
             ) { _, accumulatedThreads in

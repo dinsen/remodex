@@ -1220,6 +1220,12 @@ final class CodexServiceThreadListTests: XCTestCase {
                     result: .object(["threads": .array([])]),
                     includeJSONRPC: false
                 )
+            case "threadSection/list":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["data": .array([])]),
+                    includeJSONRPC: false
+                )
             case "model/list":
                 modelListRequestCount += 1
                 didLoadModelsBeforeThreadListReturned = !didReturnThreadListResponse
