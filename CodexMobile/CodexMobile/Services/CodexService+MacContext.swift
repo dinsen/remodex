@@ -152,26 +152,12 @@ extension CodexService {
                 renamedThreadNameByThreadID = [:]
             }
 
-            if let savedPinnedThreadIDs = defaults.data(
+            defaults.removeObject(
                 forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
-            ),
-               let decodedPinnedThreadIDs = try? decoder.decode([String].self, from: savedPinnedThreadIDs) {
-                legacyPinnedThreadIDs = decodedPinnedThreadIDs
-            } else {
-                legacyPinnedThreadIDs = []
-            }
-
-            if let savedPinnedThreadSnapshots = defaults.data(
+            )
+            defaults.removeObject(
                 forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
-            ),
-               let decodedPinnedThreadSnapshots = try? decoder.decode(
-                   [String: [CodexThread]].self,
-                   from: savedPinnedThreadSnapshots
-               ) {
-                legacyPinnedThreadSnapshotsByRootID = decodedPinnedThreadSnapshots
-            } else {
-                legacyPinnedThreadSnapshotsByRootID = [:]
-            }
+            )
 
             if let savedNativePinnedThreadIDs = defaults.data(
                 forKey: macScopedDefaultsKey(Self.nativePinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
@@ -329,8 +315,6 @@ extension CodexService {
             pinnedThreadSnapshotsByRootID.removeAll()
             confirmedNativePinnedThreadIDs.removeAll()
             confirmedNativePinnedThreadSnapshotsByRootID.removeAll()
-            legacyPinnedThreadIDs.removeAll()
-            legacyPinnedThreadSnapshotsByRootID.removeAll()
             nativePinnedSectionID = nil
             nativePinCapability = .unknown
             snapshotOnlyPinnedThreadIDs.removeAll()

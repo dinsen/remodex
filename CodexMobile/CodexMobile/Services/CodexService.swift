@@ -820,8 +820,6 @@ final class CodexService {
     @ObservationIgnored var pinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
     @ObservationIgnored var confirmedNativePinnedThreadIDs: [String] = []
     @ObservationIgnored var confirmedNativePinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
-    @ObservationIgnored var legacyPinnedThreadIDs: [String] = []
-    @ObservationIgnored var legacyPinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
     @ObservationIgnored var nativePinnedSectionID: String?
     @ObservationIgnored var nativePinCapability: NativePinCapability = .unknown
     @ObservationIgnored let nativePinOperationGate = NativePinOperationGate()

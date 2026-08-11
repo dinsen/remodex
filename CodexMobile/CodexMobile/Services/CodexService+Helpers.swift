@@ -290,18 +290,6 @@ extension CodexService {
             persistConfirmedNativePinnedThreadState()
         }
 
-        var nextLegacySnapshots = legacyPinnedThreadSnapshotsByRootID
-        for rootThreadID in legacyPinnedThreadIDs {
-            if let snapshotThreads = snapshotThreadsForPinnedRoot(rootThreadID),
-               !snapshotThreads.isEmpty {
-                nextLegacySnapshots[rootThreadID] = snapshotThreads
-            }
-        }
-        nextLegacySnapshots = nextLegacySnapshots.filter { legacyPinnedThreadIDs.contains($0.key) }
-        if nextLegacySnapshots != legacyPinnedThreadSnapshotsByRootID {
-            legacyPinnedThreadSnapshotsByRootID = nextLegacySnapshots
-            persistLegacyPinnedThreadSnapshots()
-        }
         rebuildEffectivePinnedThreadState()
     }
 
@@ -310,12 +298,7 @@ extension CodexService {
             let remaining = $0.filter { $0.id != threadID }
             return remaining.isEmpty ? nil : remaining
         }
-        legacyPinnedThreadSnapshotsByRootID = legacyPinnedThreadSnapshotsByRootID.compactMapValues {
-            let remaining = $0.filter { $0.id != threadID }
-            return remaining.isEmpty ? nil : remaining
-        }
         persistConfirmedNativePinnedThreadState()
-        persistLegacyPinnedThreadSnapshots()
         rebuildEffectivePinnedThreadState()
     }
 
@@ -375,16 +358,6 @@ extension CodexService {
         }
 
         return injectedThreadIDs
-    }
-
-    private func persistLegacyPinnedThreadSnapshots() {
-        let key = macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey)
-        guard !legacyPinnedThreadSnapshotsByRootID.isEmpty,
-              let encodedSnapshots = try? encoder.encode(legacyPinnedThreadSnapshotsByRootID) else {
-            defaults.removeObject(forKey: key)
-            return
-        }
-        defaults.set(encodedSnapshots, forKey: key)
     }
 
     func pinnedRootThreadID(for threadId: String?) -> String? {

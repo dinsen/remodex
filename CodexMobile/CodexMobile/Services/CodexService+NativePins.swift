@@ -72,23 +72,13 @@ extension CodexService {
             guard let section else {
                 nativePinnedSectionID = nil
                 nativePinCapability = .available
-
-                guard !legacyPinnedThreadIDs.isEmpty else {
-                    replaceConfirmedNativePins(with: [])
-                    return
-                }
-
-                let createdSection = try await createNativePinnedSection()
-                try await migrateLegacyPins(into: createdSection)
+                replaceConfirmedNativePins(with: [])
                 return
             }
 
             nativePinnedSectionID = section.id
             nativePinCapability = .available
             try await refreshConfirmedNativePins(sectionID: section.id)
-            if !legacyPinnedThreadIDs.isEmpty {
-                try await migrateLegacyPins(into: section)
-            }
         } catch {
             if isUnsupportedNativePinError(error) {
                 nativePinCapability = .unsupported
@@ -207,28 +197,10 @@ extension CodexService {
     }
 
     func rebuildEffectivePinnedThreadState() {
-        var seen: Set<String> = []
-        pinnedThreadIDs = (legacyPinnedThreadIDs + confirmedNativePinnedThreadIDs).filter {
-            seen.insert($0).inserted
+        pinnedThreadIDs = orderedUniqueThreadIDs(confirmedNativePinnedThreadIDs)
+        pinnedThreadSnapshotsByRootID = confirmedNativePinnedThreadSnapshotsByRootID.filter {
+            pinnedThreadIDs.contains($0.key)
         }
-
-        var effectiveSnapshots: [String: [CodexThread]] = [:]
-        for threadID in pinnedThreadIDs {
-            if let legacySnapshot = legacyPinnedThreadSnapshotsByRootID[threadID] {
-                effectiveSnapshots[threadID] = legacySnapshot
-            } else if let nativeSnapshot = confirmedNativePinnedThreadSnapshotsByRootID[threadID] {
-                effectiveSnapshots[threadID] = nativeSnapshot
-            }
-        }
-        pinnedThreadSnapshotsByRootID = effectiveSnapshots
-    }
-
-    func clearCompletedLegacyPinMigration() {
-        legacyPinnedThreadIDs.removeAll()
-        legacyPinnedThreadSnapshotsByRootID.removeAll()
-        defaults.removeObject(forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey))
-        defaults.removeObject(forKey: macScopedDefaultsKey(Self.pinnedThreadSnapshotsDefaultsKey))
-        rebuildEffectivePinnedThreadState()
     }
 
     func persistConfirmedNativePinnedThreadState() {
@@ -314,40 +286,6 @@ extension CodexService {
         return section
     }
 
-    private func migrateLegacyPins(into section: NativeThreadSection) async throws {
-        try await refreshConfirmedNativePins(sectionID: section.id)
-
-        let confirmedIDs = Set(confirmedNativePinnedThreadIDs)
-        let missingLegacyIDs = orderedUniqueThreadIDs(legacyPinnedThreadIDs).filter {
-            !confirmedIDs.contains($0)
-        }
-        var firstPinnedThreadID = confirmedNativePinnedThreadIDs.first
-
-        for threadID in missingLegacyIDs.reversed() {
-            var params: RPCObject = [
-                "threadId": .string(threadID),
-                "sectionId": .string(section.id),
-            ]
-            if let firstPinnedThreadID {
-                params["beforeThreadId"] = .string(firstPinnedThreadID)
-            }
-            _ = try await sendRequest(
-                method: "thread/section/move",
-                params: .object(params),
-                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
-                timeoutMessage: "thread/section/move timed out while migrating pins."
-            )
-            firstPinnedThreadID = threadID
-        }
-
-        try await refreshConfirmedNativePins(sectionID: section.id)
-        let refreshedIDs = Set(confirmedNativePinnedThreadIDs)
-        guard legacyPinnedThreadIDs.allSatisfy(refreshedIDs.contains) else {
-            throw CodexServiceError.invalidResponse("Codex did not confirm every migrated pin")
-        }
-        clearCompletedLegacyPinMigration()
-    }
-
     private func refreshConfirmedNativePins(sectionID: String) async throws {
         let threads = try await fetchNativePinnedThreads(sectionID: sectionID)
         replaceConfirmedNativePins(with: threads)
@@ -424,7 +362,6 @@ extension CodexService {
         var returnedThreadsByID: [String: [CodexThread]] = [:]
         for thread in threads where returnedThreadsByID[thread.id] == nil {
             let cachedSnapshot = confirmedNativePinnedThreadSnapshotsByRootID[thread.id]
-                ?? legacyPinnedThreadSnapshotsByRootID[thread.id]
                 ?? []
             returnedThreadsByID[thread.id] = [thread] + cachedSnapshot.filter { $0.id != thread.id }
         }

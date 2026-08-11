@@ -317,132 +317,32 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.pinnedThreadIDs, [])
     }
 
-    func testLegacyPinMigrationIsOrderedAndIdempotent() async throws {
+    func testLegacyStorageNeverCreatesOrMovesNativePins() async throws {
         let service = makeService()
-        service.legacyPinnedThreadIDs = ["legacy-one", "legacy-two"]
-        service.rebuildEffectivePinnedThreadState()
-        var sectionExists = false
-        var serverPins = ["native-one"]
-        var successfulMoves: [(threadID: String, beforeThreadID: String?)] = []
-
-        service.requestTransportOverride = { method, params in
-            switch method {
-            case "threadSection/list":
-                let sections: [JSONValue] = sectionExists
-                    ? [.object(["id": .string("pinned-section"), "name": .string("Pinned")])]
-                    : []
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object(["data": .array(sections), "nextCursor": .null]),
-                    includeJSONRPC: false
-                )
-            case "threadSection/create":
-                sectionExists = true
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object(["section": .object(["id": .string("pinned-section"), "name": .string("Pinned")])]),
-                    includeJSONRPC: false
-                )
-            case "thread/list":
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object([
-                        "threads": .array(serverPins.map { .object(["id": .string($0)]) }),
-                        "nextCursor": .null,
-                    ]),
-                    includeJSONRPC: false
-                )
-            case "thread/section/move":
-                let request = params?.objectValue ?? [:]
-                let threadID = request["threadId"]?.stringValue ?? ""
-                let beforeThreadID = request["beforeThreadId"]?.stringValue
-                successfulMoves.append((threadID, beforeThreadID))
-                serverPins.removeAll { $0 == threadID }
-                if let beforeThreadID, let insertionIndex = serverPins.firstIndex(of: beforeThreadID) {
-                    serverPins.insert(threadID, at: insertionIndex)
-                } else {
-                    serverPins.append(threadID)
-                }
-                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
-            default:
-                XCTFail("Unexpected method \(method)")
-                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        let macDeviceID = "discarded-legacy-pin-mac"
+        service.defaults.set(
+            try JSONEncoder().encode(["legacy-one", "legacy-two"]),
+            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        )
+        service.clearInMemoryMacScopedState()
+        service.loadMacScopedDefaultsState(for: macDeviceID)
+        var methods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            methods.append(method)
+            if method != "threadSection/list" {
+                XCTFail("Legacy storage must not trigger \(method)")
             }
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["data": .array([]), "nextCursor": .null]),
+                includeJSONRPC: false
+            )
         }
 
         try await service.synchronizeNativePins()
-        try await service.synchronizeNativePins()
 
-        XCTAssertEqual(successfulMoves.map(\.threadID), ["legacy-two", "legacy-one"])
-        XCTAssertEqual(successfulMoves.map(\.beforeThreadID), ["native-one", "legacy-two"])
-        XCTAssertEqual(service.legacyPinnedThreadIDs, [])
-        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["legacy-one", "legacy-two", "native-one"])
-    }
-
-    func testPartialLegacyPinMigrationRetainsUnion() async throws {
-        let service = makeService()
-        service.legacyPinnedThreadIDs = ["legacy-one", "legacy-two"]
-        service.confirmedNativePinnedThreadIDs = ["native-one"]
-        service.rebuildEffectivePinnedThreadState()
-        var serverPins = ["native-one"]
-        var moveAttempts: [String] = []
-        var shouldFailLegacyOne = true
-
-        service.requestTransportOverride = { method, params in
-            switch method {
-            case "threadSection/list":
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object([
-                        "data": .array([.object(["id": .string("pinned-section"), "name": .string("Pinned")])]),
-                        "nextCursor": .null,
-                    ]),
-                    includeJSONRPC: false
-                )
-            case "thread/list":
-                return RPCMessage(
-                    id: .string(UUID().uuidString),
-                    result: .object([
-                        "threads": .array(serverPins.map { .object(["id": .string($0)]) }),
-                        "nextCursor": .null,
-                    ]),
-                    includeJSONRPC: false
-                )
-            case "thread/section/move":
-                let request = params?.objectValue ?? [:]
-                let threadID = request["threadId"]?.stringValue ?? ""
-                moveAttempts.append(threadID)
-                if threadID == "legacy-one", shouldFailLegacyOne {
-                    shouldFailLegacyOne = false
-                    throw CodexServiceError.rpcError(RPCError(code: -32000, message: "temporary failure"))
-                }
-                serverPins.removeAll { $0 == threadID }
-                if let beforeThreadID = request["beforeThreadId"]?.stringValue,
-                   let insertionIndex = serverPins.firstIndex(of: beforeThreadID) {
-                    serverPins.insert(threadID, at: insertionIndex)
-                } else {
-                    serverPins.append(threadID)
-                }
-                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
-            default:
-                XCTFail("Unexpected method \(method)")
-                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
-            }
-        }
-
-        do {
-            try await service.synchronizeNativePins()
-            XCTFail("Expected partial migration to fail")
-        } catch {}
-
-        XCTAssertEqual(service.legacyPinnedThreadIDs, ["legacy-one", "legacy-two"])
-        XCTAssertEqual(service.pinnedThreadIDs, ["legacy-one", "legacy-two", "native-one"])
-
-        try await service.synchronizeNativePins()
-
-        XCTAssertEqual(moveAttempts, ["legacy-two", "legacy-one", "legacy-one"])
-        XCTAssertEqual(service.legacyPinnedThreadIDs, [])
-        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["legacy-one", "legacy-two", "native-one"])
+        XCTAssertEqual(methods, ["threadSection/list"])
+        XCTAssertEqual(service.pinnedThreadIDs, [])
     }
 
     func testUnsupportedNativePinsRetainConfirmedCache() async {
@@ -510,33 +410,6 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(moveParams?["sectionId"], .null)
         XCTAssertNil(moveParams?["beforeThreadId"])
         XCTAssertEqual(service.pinnedThreadIDs, [])
-    }
-
-    func testPinWaitsForLegacyMigration() async {
-        let service = makeService()
-        service.threads = [CodexThread(id: "new-pin")]
-        service.legacyPinnedThreadIDs = ["legacy-pin"]
-        service.rebuildEffectivePinnedThreadState()
-        var moveThreadIDs: [String] = []
-        service.requestTransportOverride = { method, params in
-            switch method {
-            case "threadSection/list": return self.pinnedSectionListResponse()
-            case "thread/list": return self.threadListResponse(ids: [])
-            case "thread/section/move":
-                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
-                moveThreadIDs.append(threadID)
-                throw CodexServiceError.rpcError(RPCError(code: -32000, message: "migration failed"))
-            default: return self.emptyRPCResponse()
-            }
-        }
-
-        do {
-            try await service.setThreadPinned("new-pin", pinned: true)
-            XCTFail("Expected migration failure")
-        } catch {}
-
-        XCTAssertEqual(moveThreadIDs, ["legacy-pin"])
-        XCTAssertFalse(service.pinnedThreadIDs.contains("new-pin"))
     }
 
     func testPinsDoNotChangeBeforeMoveConfirmation() async throws {
