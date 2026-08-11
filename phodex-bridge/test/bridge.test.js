@@ -10,6 +10,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { invalidateRolloutLookupCache } = require("../src/rollout-watch");
+const { handleHostPinsRequest } = require("../src/host-pins-handler");
 const {
   annotateTurnStateProbeWithMirrorActiveTurn,
   buildThreadTurnsListRelaySanitizeContext,
@@ -31,6 +32,176 @@ const {
   sanitizeThreadHistoryImagesForRelay,
   shouldSuppressRolloutMirrorForThread,
 } = require("../src/bridge");
+
+test("handleHostPinsRequest returns only ordered pinned IDs and never writes", async (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-host-pins-"));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+
+  const statePath = path.join(codexHome, ".codex-global-state.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    "pinned-thread-ids": ["thread-a", "thread-b"],
+    unrelated: { secret: "must-not-cross-the-rpc-boundary" },
+  }), "utf8");
+
+  const writes = [];
+  const readPaths = [];
+  const response = await invokeHostPinsRequest(
+    JSON.stringify({ id: "host-read-1", method: "bridge/hostPins/read", params: {} }),
+    {
+      codexHome,
+      fsModule: trackedHostPinsFs({ writes, readPaths }),
+    }
+  );
+
+  assert.deepEqual(response, {
+    id: "host-read-1",
+    result: {
+      schemaVersion: 1,
+      source: "codex-host",
+      pinnedThreadIds: ["thread-a", "thread-b"],
+    },
+  });
+  assert.deepEqual(writes, []);
+  assert.ok(readPaths.length > 0);
+  assert.ok(readPaths.every((readPath) => readPath === statePath));
+});
+
+test("handleHostPinsRequest rejects arbitrary path input", async () => {
+  const reads = [];
+  const response = await invokeHostPinsRequest(
+    JSON.stringify({
+      id: "host-read-path-injection",
+      method: "bridge/hostPins/read",
+      params: { path: "/tmp/should-never-be-read" },
+    }),
+    {
+      codexHome: "/tmp/unused-host-home",
+      fsModule: trackedHostPinsFs({ readPaths: reads }),
+    }
+  );
+
+  assert.equal(response.error?.data?.errorCode, "host_pins_malformed");
+  assert.equal(response.result, undefined);
+  assert.deepEqual(reads, []);
+});
+
+test("handleHostPinsRequest rejects malformed or racing global state without partial IDs", async (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-host-pins-invalid-"));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  const statePath = path.join(codexHome, ".codex-global-state.json");
+
+  const malformedCases = [
+    { name: "missing key", contents: JSON.stringify({ other: true }) },
+    { name: "invalid ID", contents: JSON.stringify({ "pinned-thread-ids": ["thread-a", "../escape"] }) },
+    { name: "oversized payload", contents: "{" + "x".repeat(1_048_576) },
+  ];
+
+  for (const malformedCase of malformedCases) {
+    fs.writeFileSync(statePath, malformedCase.contents, "utf8");
+    const response = await invokeHostPinsRequest(
+      JSON.stringify({ id: `host-read-${malformedCase.name}`, method: "bridge/hostPins/read", params: null }),
+      { codexHome }
+    );
+
+    assert.equal(response.error?.data?.errorCode, "host_pins_malformed", malformedCase.name);
+    assert.equal(response.result, undefined, malformedCase.name);
+  }
+
+  fs.writeFileSync(statePath, JSON.stringify({ "pinned-thread-ids": ["thread-a", "thread-b"] }), "utf8");
+  const racingResponse = await invokeHostPinsRequest(
+    JSON.stringify({ id: "host-read-racing", method: "bridge/hostPins/read" }),
+    {
+      codexHome,
+      fsModule: racingHostPinsFs(),
+    }
+  );
+
+  assert.equal(racingResponse.error?.data?.errorCode, "host_pins_racing");
+  assert.equal(racingResponse.result, undefined);
+});
+
+test("sanitizeThreadHistoryImagesForRelay keeps authoritative thread/read metadata", (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-authoritative-thread-read-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  t.after(() => {
+    if (previousCodexHome == null) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  const threadId = "thread-authoritative-read";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "08", "11");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionsDir, `rollout-2026-08-11T19-45-00-${threadId}.jsonl`),
+    JSON.stringify({
+      type: "session_meta",
+      payload: { id: threadId, cwd: "/tmp/jsonl-must-not-win" },
+    }),
+    "utf8"
+  );
+  invalidateRolloutLookupCache({ root: path.join(codexHome, "sessions"), threadId });
+
+  const sanitized = JSON.parse(sanitizeThreadHistoryImagesForRelay(JSON.stringify({
+    id: "authoritative-thread-read",
+    result: {
+      thread: {
+        id: threadId,
+        cwd: "/tmp/app-server-authoritative",
+        turns: [],
+      },
+    },
+  }), "thread/read", { threadId, includeTurns: false }));
+
+  assert.equal(sanitized.result.thread.cwd, "/tmp/app-server-authoritative");
+  assert.equal(Object.hasOwn(sanitized.result.thread, "current_working_directory"), false);
+});
+
+function invokeHostPinsRequest(rawMessage, options = {}) {
+  return new Promise((resolve) => {
+    const handled = handleHostPinsRequest(rawMessage, (response) => resolve(JSON.parse(response)), options);
+    assert.equal(handled, true);
+  });
+}
+
+function trackedHostPinsFs({ writes = [], readPaths = [] } = {}) {
+  return {
+    openSync(filePath, ...args) {
+      readPaths.push(filePath);
+      return fs.openSync(filePath, ...args);
+    },
+    statSync(filePath, ...args) {
+      readPaths.push(filePath);
+      return fs.statSync(filePath, ...args);
+    },
+    fstatSync: (...args) => fs.fstatSync(...args),
+    readSync: (...args) => fs.readSync(...args),
+    closeSync: (...args) => fs.closeSync(...args),
+    writeFileSync(...args) {
+      writes.push(args[0]);
+      return fs.writeFileSync(...args);
+    },
+  };
+}
+
+function racingHostPinsFs() {
+  let fstatCount = 0;
+  return {
+    openSync: (...args) => fs.openSync(...args),
+    statSync: (...args) => fs.statSync(...args),
+    fstatSync(...args) {
+      const stat = fs.fstatSync(...args);
+      fstatCount += 1;
+      return fstatCount % 2 === 0 ? { ...stat, mtimeMs: stat.mtimeMs + fstatCount } : stat;
+    },
+    readSync: (...args) => fs.readSync(...args),
+    closeSync: (...args) => fs.closeSync(...args),
+  };
+}
 
 function expectedGeneratedImagePath(threadId, fileName) {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");

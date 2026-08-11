@@ -39,6 +39,7 @@ const { handleProjectRequest } = require("./project-handler");
 const { handlePetRequest } = require("./pet-handler");
 const { handleAutomationRequest } = require("./automation-handler");
 const { handleRuntimeDefaultsRequest } = require("./runtime-defaults-handler");
+const { handleHostPinsRequest } = require("./host-pins-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
 const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
 const {
@@ -1247,6 +1248,9 @@ function startBridge({
     if (notificationsHandler.handleNotificationsRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
+    if (handleHostPinsRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (handleDesktopRequest(rawMessage, sendApplicationResponse, {
       bundleId: config.codexBundleId,
       appPath: config.codexAppPath,
@@ -1753,6 +1757,7 @@ function startBridge({
         limit: method === "thread/list" ? threadListLimitFromParams(parsed.params) : undefined,
         sectionId: method === "thread/list" ? normalizeNonEmptyString(parsed.params?.sectionId) : "",
         sortKey: method === "thread/list" ? normalizeNonEmptyString(parsed.params?.sortKey) : "",
+        includeTurns: method === "thread/read" ? parsed.params?.includeTurns : undefined,
         createdAt: Date.now(),
       };
       if (method === "thread/turns/list") {
@@ -3445,7 +3450,11 @@ function sanitizeThreadHistoryImagesForRelay(rawMessage, requestMethod, requestC
     : {};
 
   const { turns: sanitizedTurns, didSanitize } = sanitizeRelayHistoryTurns(workingTurns, threadId);
-  const { thread: threadWithJsonlMetadata, didAugment: didAugmentThreadMetadata } = augmentRelayThreadWithJsonlMetadata(workingThread, threadId);
+  const shouldAugmentJsonlMetadata = requestContext?.skipJsonlMetadataAugmentation !== true
+    && requestContext?.includeTurns !== false;
+  const { thread: threadWithJsonlMetadata, didAugment: didAugmentThreadMetadata } = shouldAugmentJsonlMetadata
+    ? augmentRelayThreadWithJsonlMetadata(workingThread, threadId)
+    : { thread: workingThread, didAugment: false };
   const { turns: augmentedTurns, didAugment } = augmentRelayHistoryTurnsWithJsonlArtifacts(
     sanitizedTurns,
     threadId,
