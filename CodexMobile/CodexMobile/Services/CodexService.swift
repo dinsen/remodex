@@ -818,6 +818,12 @@ final class CodexService {
     @ObservationIgnored var authoritativeProjectPathByThreadID: [String: String] = [:]
     var pinnedThreadIDs: [String] = []
     @ObservationIgnored var pinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
+    @ObservationIgnored var confirmedNativePinnedThreadIDs: [String] = []
+    @ObservationIgnored var confirmedNativePinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
+    @ObservationIgnored var legacyPinnedThreadIDs: [String] = []
+    @ObservationIgnored var legacyPinnedThreadSnapshotsByRootID: [String: [CodexThread]] = [:]
+    @ObservationIgnored var nativePinnedSectionID: String?
+    @ObservationIgnored var nativePinCapability: NativePinCapability = .unknown
     // Sidebar rows read this directly, so keep it observable even when thread metadata is unchanged.
     var snapshotOnlyPinnedThreadIDs: Set<String> = []
     @ObservationIgnored var stoppedTurnIDsByThread: [String: Set<String>] = [:]
@@ -856,6 +862,8 @@ final class CodexService {
     static let renamedThreadNamesDefaultsKey = "codex.renamedThreadNames"
     static let pinnedThreadIDsDefaultsKey = "codex.pinnedThreadIDs"
     static let pinnedThreadSnapshotsDefaultsKey = "codex.pinnedThreadSnapshots"
+    static let nativePinnedThreadIDsDefaultsKey = "codex.nativePinnedThreadIDs"
+    static let nativePinnedThreadSnapshotsDefaultsKey = "codex.nativePinnedThreadSnapshots"
     static let associatedManagedWorktreePathsDefaultsKey = "codex.associatedManagedWorktreePaths"
     static let turnTerminalStatesDefaultsKey = "codex.turnTerminalStates"
     static let threadHistoryPaginationStateDefaultsKey = "codex.threadHistoryPaginationState"

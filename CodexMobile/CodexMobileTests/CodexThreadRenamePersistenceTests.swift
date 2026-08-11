@@ -189,7 +189,7 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         XCTAssertEqual(reloadedService.thread(for: "thread-1")?.displayTitle, "Phone Rename")
     }
 
-    func testPinPersistsAcrossServiceReload() {
+    func testLegacyPinsLoadAsMigrationUnion() throws {
         let suiteName = "CodexThreadRenamePersistenceTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Expected isolated UserDefaults suite")
@@ -198,19 +198,57 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         defaults.removePersistentDomain(forName: suiteName)
 
         let service = CodexService(defaults: defaults)
-        service.threads = [
-            CodexThread(
-                id: "thread-1",
-                title: "Pinned Thread",
-                cwd: "/tmp/remodex"
-            ),
-        ]
-        service.pinThread("thread-1")
+        let macDeviceID = "legacy-pin-mac"
+        defaults.set(
+            try JSONEncoder().encode(["legacy-one", "shared"]),
+            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        )
+        defaults.set(
+            try JSONEncoder().encode(["shared", "native-one"]),
+            forKey: service.macScopedDefaultsKey(CodexService.nativePinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        )
+
+        service.clearInMemoryMacScopedState()
+        service.loadMacScopedDefaultsState(for: macDeviceID)
+
+        XCTAssertEqual(service.legacyPinnedThreadIDs, ["legacy-one", "shared"])
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["shared", "native-one"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["legacy-one", "shared", "native-one"])
+    }
+
+    func testCompletedMigrationClearsLegacyStorage() throws {
+        let suiteName = "CodexThreadRenamePersistenceTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Expected isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let service = CodexService(defaults: defaults)
+        let macDeviceID = "completed-pin-migration-mac"
+        service.macScopedContextOverrideDeviceId = macDeviceID
+        defaults.set(
+            try JSONEncoder().encode(["legacy-one"]),
+            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        )
+        defaults.set(
+            try JSONEncoder().encode(["legacy-one", "native-one"]),
+            forKey: service.macScopedDefaultsKey(CodexService.nativePinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        )
+
+        service.clearInMemoryMacScopedState()
+        service.loadMacScopedDefaultsState(for: macDeviceID)
+        service.clearCompletedLegacyPinMigration()
 
         let reloadedService = CodexService(defaults: defaults)
+        reloadedService.clearInMemoryMacScopedState()
+        reloadedService.loadMacScopedDefaultsState(for: macDeviceID)
 
-        XCTAssertEqual(reloadedService.pinnedThreadIDs, ["thread-1"])
-        XCTAssertTrue(reloadedService.isThreadPinned("thread-1"))
+        XCTAssertEqual(reloadedService.legacyPinnedThreadIDs, [])
+        XCTAssertEqual(reloadedService.pinnedThreadIDs, ["legacy-one", "native-one"])
+        XCTAssertNil(defaults.data(
+            forKey: service.macScopedDefaultsKey(CodexService.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceID)
+        ))
     }
 
     func testDeletingThreadClearsPersistedPin() {

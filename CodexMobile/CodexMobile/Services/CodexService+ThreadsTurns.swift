@@ -11,12 +11,12 @@ enum ThreadTurnStateSnapshotPolicy {
     static let requestTimeoutNanoseconds: UInt64 = 30_000_000_000
 }
 
-private enum ThreadListHydrationPolicy {
+enum ThreadListHydrationPolicy {
     static let initialVisibleThreadLimit = 10
     static let requestTimeoutNanoseconds: UInt64 = 12_000_000_000
 }
 
-private nonisolated enum CodexThreadPageDecoder {
+nonisolated enum CodexThreadPageDecoder {
     static func decode(_ page: [JSONValue]) async -> [CodexThread] {
         await Task.detached(priority: .userInitiated) {
             let encoder = JSONEncoder()
@@ -1334,7 +1334,7 @@ extension CodexService {
     }
 
     // Requests all user-facing thread sources instead of relying on the server default.
-    private var threadListSourceKinds: [String] {
+    var threadListSourceKinds: [String] {
         [
             "cli",
             "vscode",
@@ -1349,7 +1349,7 @@ extension CodexService {
         ]
     }
 
-    private var legacyThreadListSourceKinds: [String] {
+    var legacyThreadListSourceKinds: [String] {
         [
             "cli",
             "vscode",
@@ -1359,7 +1359,7 @@ extension CodexService {
         ]
     }
 
-    private func shouldRetryThreadListWithLegacySourceKinds(_ error: Error) -> Bool {
+    func shouldRetryThreadListWithLegacySourceKinds(_ error: Error) -> Bool {
         guard let serviceError = error as? CodexServiceError,
               case .rpcError(let rpcError) = serviceError else {
             return false

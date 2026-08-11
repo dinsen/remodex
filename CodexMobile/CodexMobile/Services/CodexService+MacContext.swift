@@ -156,9 +156,9 @@ extension CodexService {
                 forKey: macScopedDefaultsKey(Self.pinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
             ),
                let decodedPinnedThreadIDs = try? decoder.decode([String].self, from: savedPinnedThreadIDs) {
-                pinnedThreadIDs = decodedPinnedThreadIDs
+                legacyPinnedThreadIDs = decodedPinnedThreadIDs
             } else {
-                pinnedThreadIDs = []
+                legacyPinnedThreadIDs = []
             }
 
             if let savedPinnedThreadSnapshots = defaults.data(
@@ -168,10 +168,35 @@ extension CodexService {
                    [String: [CodexThread]].self,
                    from: savedPinnedThreadSnapshots
                ) {
-                pinnedThreadSnapshotsByRootID = decodedPinnedThreadSnapshots
+                legacyPinnedThreadSnapshotsByRootID = decodedPinnedThreadSnapshots
             } else {
-                pinnedThreadSnapshotsByRootID = [:]
+                legacyPinnedThreadSnapshotsByRootID = [:]
             }
+
+            if let savedNativePinnedThreadIDs = defaults.data(
+                forKey: macScopedDefaultsKey(Self.nativePinnedThreadIDsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedNativePinnedThreadIDs = try? decoder.decode([String].self, from: savedNativePinnedThreadIDs) {
+                confirmedNativePinnedThreadIDs = decodedNativePinnedThreadIDs
+            } else {
+                confirmedNativePinnedThreadIDs = []
+            }
+
+            if let savedNativePinnedThreadSnapshots = defaults.data(
+                forKey: macScopedDefaultsKey(Self.nativePinnedThreadSnapshotsDefaultsKey, macDeviceId: macDeviceId)
+            ),
+               let decodedNativePinnedThreadSnapshots = try? decoder.decode(
+                   [String: [CodexThread]].self,
+                   from: savedNativePinnedThreadSnapshots
+               ) {
+                confirmedNativePinnedThreadSnapshotsByRootID = decodedNativePinnedThreadSnapshots
+            } else {
+                confirmedNativePinnedThreadSnapshotsByRootID = [:]
+            }
+
+            nativePinnedSectionID = nil
+            nativePinCapability = .unknown
+            rebuildEffectivePinnedThreadState()
 
             if let savedAssociatedManagedWorktreePaths = defaults.data(
                 forKey: macScopedDefaultsKey(Self.associatedManagedWorktreePathsDefaultsKey, macDeviceId: macDeviceId)
@@ -302,6 +327,12 @@ extension CodexService {
             renamedThreadNameByThreadID.removeAll()
             pinnedThreadIDs.removeAll()
             pinnedThreadSnapshotsByRootID.removeAll()
+            confirmedNativePinnedThreadIDs.removeAll()
+            confirmedNativePinnedThreadSnapshotsByRootID.removeAll()
+            legacyPinnedThreadIDs.removeAll()
+            legacyPinnedThreadSnapshotsByRootID.removeAll()
+            nativePinnedSectionID = nil
+            nativePinCapability = .unknown
             snapshotOnlyPinnedThreadIDs.removeAll()
             associatedManagedWorktreePathByThreadID.removeAll()
             authoritativeProjectPathByThreadID.removeAll()
@@ -319,6 +350,8 @@ extension CodexService {
         migrateLegacyMacScopedDefaultsValue(for: Self.renamedThreadNamesDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadIDsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.pinnedThreadSnapshotsDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.nativePinnedThreadIDsDefaultsKey)
+        migrateLegacyMacScopedDefaultsValue(for: Self.nativePinnedThreadSnapshotsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.associatedManagedWorktreePathsDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.turnTerminalStatesDefaultsKey)
         migrateLegacyMacScopedDefaultsValue(for: Self.threadHistoryPaginationStateDefaultsKey)
@@ -376,6 +409,12 @@ extension CodexService {
             as: [String: [CodexThread]].self
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
+            Self.nativePinnedThreadSnapshotsDefaultsKey,
+            from: sourceDeviceIds,
+            to: targetDeviceId,
+            as: [String: [CodexThread]].self
+        ) || migratedDefaults
+        migratedDefaults = mergeMacScopedDefaultsDataDictionary(
             Self.associatedManagedWorktreePathsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
@@ -406,6 +445,11 @@ extension CodexService {
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataList(
             Self.pinnedThreadIDsDefaultsKey,
+            from: sourceDeviceIds,
+            to: targetDeviceId
+        ) || migratedDefaults
+        migratedDefaults = mergeMacScopedDefaultsDataList(
+            Self.nativePinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId
         ) || migratedDefaults
