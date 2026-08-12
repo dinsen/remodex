@@ -579,6 +579,33 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertNil(service.thread(for: "host-a")?.metadata)
     }
 
+    func testHostHydrationSkipsThreadReadForCurrentLiveRows() async throws {
+        let service = makeService()
+        service.threads = [CodexThread(id: "host-live", title: "Current title")]
+        service.confirmedHostPinnedThreadIDs = ["host-live"]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var threadReadCount = 0
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-live"])
+            case "thread/read":
+                threadReadCount += 1
+                return self.threadReadResponse(id: "host-live", title: "Unexpected refresh")
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(threadReadCount, 0)
+        XCTAssertEqual(service.thread(for: "host-live")?.title, "Current title")
+    }
+
     func testHostHydrationPreservesOrderWhenThreadReadsCompleteOutOfOrder() async throws {
         let service = makeService()
         service.threads = []

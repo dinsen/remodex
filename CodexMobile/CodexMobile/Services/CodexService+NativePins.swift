@@ -133,9 +133,10 @@ extension CodexService {
                         didChangeSnapshots = true
                     }
                 }
+                continue
             }
 
-            // Refresh authoritative metadata on every sync; the live row or cached snapshot remains the fallback on failure.
+            // Snapshot-only rows retry authoritative metadata; the cached snapshot remains the fallback on failure.
             do {
                 guard let hydratedThread = try await readHostPinnedThread(threadID: threadID),
                       !hydratedThread.isSubagent else {
