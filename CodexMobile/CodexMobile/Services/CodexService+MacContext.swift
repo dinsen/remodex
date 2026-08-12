@@ -403,6 +403,7 @@ extension CodexService {
             discardLegacyPinnedDefaults(for: sourceDeviceId)
         }
 
+        let targetPinnedStateAuthority = decodedMacScopedPinnedStateAuthority(macDeviceId: targetDeviceId) ?? .undecided
         var migratedDefaults = false
         migratedDefaults = migrateMacScopedLocalCaches(
             from: sourceDeviceIds,
@@ -436,13 +437,15 @@ extension CodexService {
             Self.hostPinnedThreadSnapshotsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
-            as: [String: [CodexThread]].self
+            as: [String: [CodexThread]].self,
+            preservingTarget: targetPinnedStateAuthority == .hostCompatibility
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
             Self.nativePinnedThreadSnapshotsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
-            as: [String: [CodexThread]].self
+            as: [String: [CodexThread]].self,
+            preservingTarget: targetPinnedStateAuthority == .native
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
             Self.associatedManagedWorktreePathsDefaultsKey,
@@ -476,12 +479,14 @@ extension CodexService {
         migratedDefaults = mergeMacScopedDefaultsDataList(
             Self.hostPinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
-            to: targetDeviceId
+            to: targetDeviceId,
+            preservingTarget: targetPinnedStateAuthority == .hostCompatibility
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataList(
             Self.nativePinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
-            to: targetDeviceId
+            to: targetDeviceId,
+            preservingTarget: targetPinnedStateAuthority == .native
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedPinnedStateAuthority(
             from: sourceDeviceIds,
@@ -850,7 +855,8 @@ private extension CodexService {
         _ baseKey: String,
         from sourceDeviceIds: [String],
         to targetDeviceId: String,
-        as _: [String: Value].Type
+        as _: [String: Value].Type,
+        preservingTarget: Bool = false
     ) -> Bool {
         let targetKey = macScopedDefaultsKey(baseKey, macDeviceId: targetDeviceId)
         var targetValue = decodedMacScopedDefaultsDataDictionary(baseKey, macDeviceId: targetDeviceId, as: [String: Value].self)
@@ -859,6 +865,11 @@ private extension CodexService {
         for sourceDeviceId in sourceDeviceIds {
             let sourceKey = macScopedDefaultsKey(baseKey, macDeviceId: sourceDeviceId)
             defer { defaults.removeObject(forKey: sourceKey) }
+
+            if preservingTarget {
+                changed = defaults.object(forKey: sourceKey) != nil || changed
+                continue
+            }
 
             guard let sourceValue = decodedMacScopedDefaultsDataDictionary(
                 baseKey,
@@ -928,7 +939,12 @@ private extension CodexService {
         return true
     }
 
-    func mergeMacScopedDefaultsDataList(_ baseKey: String, from sourceDeviceIds: [String], to targetDeviceId: String) -> Bool {
+    func mergeMacScopedDefaultsDataList(
+        _ baseKey: String,
+        from sourceDeviceIds: [String],
+        to targetDeviceId: String,
+        preservingTarget: Bool = false
+    ) -> Bool {
         let targetKey = macScopedDefaultsKey(baseKey, macDeviceId: targetDeviceId)
         var mergedValues = decodedMacScopedDefaultsDataList(baseKey, macDeviceId: targetDeviceId) ?? []
         var seenValues = Set(mergedValues)
@@ -937,6 +953,11 @@ private extension CodexService {
         for sourceDeviceId in sourceDeviceIds {
             let sourceKey = macScopedDefaultsKey(baseKey, macDeviceId: sourceDeviceId)
             defer { defaults.removeObject(forKey: sourceKey) }
+
+            if preservingTarget {
+                changed = defaults.object(forKey: sourceKey) != nil || changed
+                continue
+            }
 
             guard let sourceValues = decodedMacScopedDefaultsDataList(baseKey, macDeviceId: sourceDeviceId) else {
                 changed = migrateMacScopedOpaqueDefaultIfEmpty(fromKey: sourceKey, toKey: targetKey) || changed
