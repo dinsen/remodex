@@ -606,6 +606,42 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(service.thread(for: "host-live")?.title, "Current title")
     }
 
+    func testHostHydrationReadsRestoredAndSnapshotOnlyRowsThroughThreadRead() async throws {
+        let service = makeService()
+        service.threads = [
+            CodexThread(id: "host-restored", title: "Stale restored"),
+            CodexThread(id: "host-snapshot-only", title: "Stale snapshot"),
+            CodexThread(id: "host-live", title: "Current live"),
+        ]
+        service.restoredThreadSnapshotIDs = ["host-restored"]
+        service.snapshotOnlyPinnedThreadIDs = ["host-snapshot-only"]
+        service.confirmedHostPinnedThreadIDs = ["host-restored", "host-snapshot-only", "host-live"]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var threadReadIDs: [String] = []
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-restored", "host-snapshot-only", "host-live"])
+            case "thread/read":
+                let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
+                threadReadIDs.append(threadID)
+                return self.threadReadResponse(id: threadID, title: "Fresh " + threadID)
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(threadReadIDs, ["host-restored", "host-snapshot-only"])
+        XCTAssertEqual(service.thread(for: "host-restored")?.title, "Fresh host-restored")
+        XCTAssertEqual(service.thread(for: "host-snapshot-only")?.title, "Fresh host-snapshot-only")
+        XCTAssertEqual(service.thread(for: "host-live")?.title, "Current live")
+    }
+
     func testHostHydrationPreservesOrderWhenThreadReadsCompleteOutOfOrder() async throws {
         let service = makeService()
         service.threads = []

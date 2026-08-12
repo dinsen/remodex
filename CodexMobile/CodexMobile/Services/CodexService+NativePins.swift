@@ -125,7 +125,9 @@ extension CodexService {
     private func hydrateConfirmedHostPinnedThreads() async {
         var didChangeSnapshots = false
         for threadID in confirmedHostPinnedThreadIDs {
-            if let liveThread = thread(for: threadID) {
+            if let liveThread = thread(for: threadID),
+               !restoredThreadSnapshotIDs.contains(threadID),
+               !snapshotOnlyPinnedThreadIDs.contains(threadID) {
                 guard !liveThread.isSubagent else { continue }
                 if let snapshot = snapshotThreadsForPinnedRoot(threadID), !snapshot.isEmpty {
                     if confirmedHostPinnedThreadSnapshotsByRootID[threadID] != snapshot {
