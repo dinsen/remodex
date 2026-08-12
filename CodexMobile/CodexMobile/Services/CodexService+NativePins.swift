@@ -133,14 +133,9 @@ extension CodexService {
                         didChangeSnapshots = true
                     }
                 }
-                continue
             }
 
-            if let cachedSnapshot = confirmedHostPinnedThreadSnapshotsByRootID[threadID],
-               !cachedSnapshot.isEmpty {
-                continue
-            }
-
+            // Refresh authoritative metadata on every sync; the live row or cached snapshot remains the fallback on failure.
             do {
                 guard let hydratedThread = try await readHostPinnedThread(threadID: threadID),
                       !hydratedThread.isSubagent else {

@@ -614,7 +614,7 @@ final class CodexServiceThreadListTests: XCTestCase {
         ]
         service.pinnedStateAuthority = .hostCompatibility
         service.rebuildEffectivePinnedThreadState()
-        var shouldFailRetryRead = true
+        var threadIDsWithInitialReadFailure: Set<String> = ["host-stable", "host-retry"]
         service.requestTransportOverride = { method, params in
             switch method {
             case "threadSection/list":
@@ -623,8 +623,7 @@ final class CodexServiceThreadListTests: XCTestCase {
                 return self.hostPinsResponse(ids: ["host-stable", "host-retry"])
             case "thread/read":
                 let threadID = params?.objectValue?["threadId"]?.stringValue ?? ""
-                if shouldFailRetryRead {
-                    shouldFailRetryRead = false
+                if threadIDsWithInitialReadFailure.remove(threadID) != nil {
                     throw CodexServiceError.rpcError(RPCError(code: -32000, message: "temporary read failure"))
                 }
                 return self.threadReadResponse(id: threadID, title: "Authoritative retry")
@@ -645,6 +644,59 @@ final class CodexServiceThreadListTests: XCTestCase {
             service.confirmedHostPinnedThreadSnapshotsByRootID["host-retry"]?.first?.title,
             "Authoritative retry"
         )
+    }
+
+    func testHostHydrationRefreshesCachedSnapshotThroughThreadRead() async throws {
+        let service = makeService()
+        service.threads = []
+        service.confirmedHostPinnedThreadIDs = ["host-cached"]
+        service.confirmedHostPinnedThreadSnapshotsByRootID = [
+            "host-cached": [
+                CodexThread(
+                    id: "host-cached",
+                    title: "Cached title",
+                    cwd: "/cached"
+                ),
+            ],
+        ]
+        service.pinnedStateAuthority = .hostCompatibility
+        service.rebuildEffectivePinnedThreadState()
+        var threadReadCount = 0
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return self.emptyPinnedSectionListResponse()
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(ids: ["host-cached"])
+            case "thread/read":
+                threadReadCount += 1
+                XCTAssertEqual(params?.objectValue, [
+                    "threadId": .string("host-cached"),
+                    "includeTurns": .bool(false),
+                ])
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "thread": .object([
+                            "id": .string("host-cached"),
+                            "title": .string("Authoritative title"),
+                            "cwd": .string("/authoritative"),
+                        ]),
+                    ]),
+                    includeJSONRPC: false
+                )
+            default:
+                return self.emptyRPCResponse()
+            }
+        }
+
+        _ = await service.refreshNativePinsForThreadHydration()
+
+        XCTAssertEqual(threadReadCount, 1)
+        let refreshedSnapshot = service.confirmedHostPinnedThreadSnapshotsByRootID["host-cached"]?.first
+        XCTAssertEqual(refreshedSnapshot?.title, "Authoritative title")
+        XCTAssertEqual(refreshedSnapshot?.cwd, "/authoritative")
+        XCTAssertNil(refreshedSnapshot?.parentThreadId)
     }
 
     func testHostHydrationUsesThreadReadWithoutJSONLFallback() async throws {
