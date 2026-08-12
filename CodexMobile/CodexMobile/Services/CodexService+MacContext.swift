@@ -683,19 +683,10 @@ private extension CodexService {
         let idsBaseKey = authority == .native
             ? Self.nativePinnedThreadIDsDefaultsKey
             : Self.hostPinnedThreadIDsDefaultsKey
-        let snapshotsBaseKey = authority == .native
-            ? Self.nativePinnedThreadSnapshotsDefaultsKey
-            : Self.hostPinnedThreadSnapshotsDefaultsKey
-        guard let ids = decodedMacScopedDefaultsDataList(idsBaseKey, macDeviceId: macDeviceId),
-              !ids.isEmpty,
-              let snapshots = decodedMacScopedDefaultsDataDictionary(
-                  snapshotsBaseKey,
-                  macDeviceId: macDeviceId,
-                  as: [String: [CodexThread]].self
-              ) else {
+        guard decodedMacScopedDefaultsDataList(idsBaseKey, macDeviceId: macDeviceId) != nil else {
             return false
         }
-        return Set(ids) == Set(snapshots.keys)
+        return true
     }
 
     func selectMacScopedPinnedState(
