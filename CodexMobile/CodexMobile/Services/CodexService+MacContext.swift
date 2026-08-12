@@ -408,12 +408,25 @@ extension CodexService {
             targetDeviceId: targetDeviceId,
             sourceDeviceIds: sourceDeviceIds
         )
+        let provisionalPinnedStateAuthority = pinnedStateWinner.authority == .undecided
+            ? macScopedPinnedStateCacheAuthority(
+                macDeviceId: pinnedStateWinner.sourceDeviceId ?? targetDeviceId
+            )
+            : nil
+        let preservePinnedTarget = pinnedStateWinner.sourceDeviceId != nil
+            || provisionalPinnedStateAuthority != nil
         var migratedDefaults = false
         if let sourceDeviceId = pinnedStateWinner.sourceDeviceId {
             migratedDefaults = selectMacScopedPinnedState(
-                authority: pinnedStateWinner.authority,
+                authority: provisionalPinnedStateAuthority ?? pinnedStateWinner.authority,
                 from: sourceDeviceId,
                 to: targetDeviceId
+            ) || migratedDefaults
+        }
+        if let provisionalPinnedStateAuthority {
+            migratedDefaults = removeOpposingMacScopedPinnedCache(
+                authority: provisionalPinnedStateAuthority,
+                from: targetDeviceId
             ) || migratedDefaults
         }
         migratedDefaults = migrateMacScopedLocalCaches(
@@ -449,7 +462,7 @@ extension CodexService {
             from: sourceDeviceIds,
             to: targetDeviceId,
             as: [String: [CodexThread]].self,
-            preservingTarget: pinnedStateWinner.sourceDeviceId != nil
+            preservingTarget: preservePinnedTarget
                 || targetPinnedStateAuthority == .hostCompatibility
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
@@ -457,7 +470,7 @@ extension CodexService {
             from: sourceDeviceIds,
             to: targetDeviceId,
             as: [String: [CodexThread]].self,
-            preservingTarget: pinnedStateWinner.sourceDeviceId != nil
+            preservingTarget: preservePinnedTarget
                 || targetPinnedStateAuthority == .native
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataDictionary(
@@ -493,14 +506,14 @@ extension CodexService {
             Self.hostPinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
-            preservingTarget: pinnedStateWinner.sourceDeviceId != nil
+            preservingTarget: preservePinnedTarget
                 || targetPinnedStateAuthority == .hostCompatibility
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedDefaultsDataList(
             Self.nativePinnedThreadIDsDefaultsKey,
             from: sourceDeviceIds,
             to: targetDeviceId,
-            preservingTarget: pinnedStateWinner.sourceDeviceId != nil
+            preservingTarget: preservePinnedTarget
                 || targetPinnedStateAuthority == .native
         ) || migratedDefaults
         migratedDefaults = mergeMacScopedPinnedStateAuthority(
@@ -636,7 +649,53 @@ private extension CodexService {
             winningSourceDeviceId = sourceDeviceId
         }
 
+        if winningAuthority == .undecided,
+           winningSourceDeviceId == nil,
+           macScopedPinnedStateCacheAuthority(macDeviceId: targetDeviceId) == nil {
+            winningSourceDeviceId = sourceDeviceIds.first { sourceDeviceId in
+                let sourceAuthority = decodedMacScopedPinnedStateAuthority(macDeviceId: sourceDeviceId)
+                    ?? .undecided
+                return sourceAuthority == .undecided
+                    && macScopedPinnedStateCacheAuthority(macDeviceId: sourceDeviceId) != nil
+            }
+        }
+
         return (winningAuthority, winningSourceDeviceId)
+    }
+
+    func macScopedPinnedStateCacheAuthority(macDeviceId: String) -> CodexPinnedStateAuthority? {
+        if hasPairedMacScopedPinnedCache(authority: .native, macDeviceId: macDeviceId) {
+            return .native
+        }
+        if hasPairedMacScopedPinnedCache(authority: .hostCompatibility, macDeviceId: macDeviceId) {
+            return .hostCompatibility
+        }
+        return nil
+    }
+
+    func hasPairedMacScopedPinnedCache(
+        authority: CodexPinnedStateAuthority,
+        macDeviceId: String
+    ) -> Bool {
+        guard authority != .undecided else {
+            return false
+        }
+        let idsBaseKey = authority == .native
+            ? Self.nativePinnedThreadIDsDefaultsKey
+            : Self.hostPinnedThreadIDsDefaultsKey
+        let snapshotsBaseKey = authority == .native
+            ? Self.nativePinnedThreadSnapshotsDefaultsKey
+            : Self.hostPinnedThreadSnapshotsDefaultsKey
+        guard let ids = decodedMacScopedDefaultsDataList(idsBaseKey, macDeviceId: macDeviceId),
+              !ids.isEmpty,
+              let snapshots = decodedMacScopedDefaultsDataDictionary(
+                  snapshotsBaseKey,
+                  macDeviceId: macDeviceId,
+                  as: [String: [CodexThread]].self
+              ) else {
+            return false
+        }
+        return Set(ids) == Set(snapshots.keys)
     }
 
     func selectMacScopedPinnedState(
@@ -661,17 +720,36 @@ private extension CodexService {
             to: targetDeviceId
         ) || changed
 
-        if authority == .native {
-            changed = removeMacScopedPinnedValue(
-                Self.hostPinnedThreadIDsDefaultsKey,
-                from: targetDeviceId
-            ) || changed
-            changed = removeMacScopedPinnedValue(
-                Self.hostPinnedThreadSnapshotsDefaultsKey,
-                from: targetDeviceId
-            ) || changed
+        changed = removeOpposingMacScopedPinnedCache(
+            authority: authority,
+            from: targetDeviceId
+        ) || changed
+
+        return changed
+    }
+
+    func removeOpposingMacScopedPinnedCache(
+        authority: CodexPinnedStateAuthority,
+        from macDeviceId: String
+    ) -> Bool {
+        let opposingAuthority: CodexPinnedStateAuthority
+        switch authority {
+        case .native:
+            opposingAuthority = .hostCompatibility
+        case .hostCompatibility:
+            opposingAuthority = .native
+        case .undecided:
+            return false
         }
 
+        let idsBaseKey = opposingAuthority == .native
+            ? Self.nativePinnedThreadIDsDefaultsKey
+            : Self.hostPinnedThreadIDsDefaultsKey
+        let snapshotsBaseKey = opposingAuthority == .native
+            ? Self.nativePinnedThreadSnapshotsDefaultsKey
+            : Self.hostPinnedThreadSnapshotsDefaultsKey
+        var changed = removeMacScopedPinnedValue(idsBaseKey, from: macDeviceId)
+        changed = removeMacScopedPinnedValue(snapshotsBaseKey, from: macDeviceId) || changed
         return changed
     }
 
