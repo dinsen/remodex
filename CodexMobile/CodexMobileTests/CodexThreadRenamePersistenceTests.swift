@@ -382,6 +382,112 @@ final class CodexThreadRenamePersistenceTests: XCTestCase {
         XCTAssertEqual(service.pinnedStateAuthority, .native)
     }
 
+    func testNativeSourceAuthorityReplacesProvisionalTargetPinCachesDuringMigration() throws {
+        let suiteName = "CodexThreadRenamePersistenceTests.native-source-transition.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Expected isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let service = CodexService(defaults: defaults)
+        let sourceMacID = "native-source-mac"
+
+        for (index, targetAuthority) in [CodexPinnedStateAuthority.undecided, .hostCompatibility].enumerated() {
+            let targetMacID = "provisional-target-mac-\(index)"
+            let provisionalThread = CodexThread(id: "provisional-\(index)")
+            let nativeThread = CodexThread(id: "native-\(index)")
+
+            try defaults.set(
+                service.encoder.encode([provisionalThread.id]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.hostPinnedThreadIDsDefaultsKey,
+                    macDeviceId: targetMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode([provisionalThread.id: [provisionalThread]]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.hostPinnedThreadSnapshotsDefaultsKey,
+                    macDeviceId: targetMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode(targetAuthority),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.pinnedStateAuthorityDefaultsKey,
+                    macDeviceId: targetMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode([provisionalThread.id]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadIDsDefaultsKey,
+                    macDeviceId: targetMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode([provisionalThread.id: [provisionalThread]]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadSnapshotsDefaultsKey,
+                    macDeviceId: targetMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode([nativeThread.id]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadIDsDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode([nativeThread.id: [nativeThread]]),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadSnapshotsDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            )
+            try defaults.set(
+                service.encoder.encode(CodexPinnedStateAuthority.native),
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.pinnedStateAuthorityDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            )
+
+            _ = service.migrateMacScopedState(from: [sourceMacID], to: targetMacID)
+            service.loadMacScopedDefaultsState(for: targetMacID)
+
+            XCTAssertEqual(service.pinnedStateAuthority, .native)
+            XCTAssertEqual(service.confirmedNativePinnedThreadIDs, [nativeThread.id])
+            XCTAssertEqual(
+                service.confirmedNativePinnedThreadSnapshotsByRootID,
+                [nativeThread.id: [nativeThread]]
+            )
+            XCTAssertEqual(service.pinnedThreadIDs, [nativeThread.id])
+            XCTAssertEqual(service.confirmedHostPinnedThreadIDs, [])
+            XCTAssertNil(defaults.data(
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadIDsDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            ))
+            XCTAssertNil(defaults.data(
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.nativePinnedThreadSnapshotsDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            ))
+            XCTAssertNil(defaults.data(
+                forKey: service.macScopedDefaultsKey(
+                    CodexService.pinnedStateAuthorityDefaultsKey,
+                    macDeviceId: sourceMacID
+                )
+            ))
+            XCTAssertFalse(service.migrateMacScopedState(from: [sourceMacID], to: targetMacID))
+        }
+    }
+
     func testUndecidedStateUsesLastConfirmedNativeCacheUntilProbe() throws {
         let suiteName = "CodexThreadRenamePersistenceTests.undecided.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
