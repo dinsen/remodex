@@ -403,6 +403,7 @@ function parseSessionJsonlThreadSummary(content, {
 } = {}) {
   let threadId = "";
   let cwd = "";
+  let originator = "";
   let source = "";
   let threadSource = "";
   let modelProvider = "";
@@ -447,6 +448,7 @@ function parseSessionJsonlThreadSummary(content, {
       cwd ||= normalizeString(payload?.cwd)
         || normalizeString(payload?.current_working_directory)
         || normalizeString(payload?.working_directory);
+      originator ||= normalizeString(payload?.originator);
       source ||= normalizeString(payload?.source);
       threadSource ||= normalizeString(payload?.thread_source)
         || normalizeString(payload?.threadSource);
@@ -486,6 +488,10 @@ function parseSessionJsonlThreadSummary(content, {
     createdAt: createdAt || updatedAt,
     updatedAt: updatedAt || createdAt,
   };
+
+  if (originator) {
+    summary.originator = originator;
+  }
 
   if (title) {
     summary.title = title;

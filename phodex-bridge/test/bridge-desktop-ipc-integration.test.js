@@ -686,6 +686,9 @@ test("bridge observes held desktop IPC turns only after local fallback", async (
       return fakeCodex;
     },
     desktopIpcActionFollowerModule: {
+      isDeliveryFailureError(error) {
+        return error?.remodexDeliveryFailed === true;
+      },
       createDesktopIpcActionFollower(options) {
         followerOptions = options;
         return {
@@ -779,6 +782,7 @@ test("bridge routes desktop-owned JSONL thread turn starts to Codex Desktop IPC"
   const codexHome = path.join(tempDir, "codex-home");
   writeSessionJsonl(codexHome, "thread-desktop-turn", {
     cwd: "/tmp/remodex-desktop-thread",
+    originator: "Codex Desktop",
     source: "vscode",
   });
 
@@ -897,6 +901,222 @@ test("bridge routes desktop-owned JSONL thread turn starts to Codex Desktop IPC"
   );
   assert.deepEqual(response.result, { turnId: "turn-from-desktop" });
 });
+
+test("bridge routes a vscode-sourced mobile rollout to local Codex", async (t) => {
+  const harness = await createTurnStartHarness({
+    threadId: "thread-mobile-turn",
+    originator: "codexmobile_ios",
+  });
+  t.after(harness.cleanup);
+
+  harness.relaySocket.send(JSON.stringify({
+    id: "turn-start-mobile",
+    method: "turn/start",
+    params: {
+      threadId: "thread-mobile-turn",
+      input: "Continue locally",
+    },
+  }));
+
+  await waitFor(() => harness.fakeCodex.sent.some((message) => message.id === "turn-start-mobile"));
+  assert.equal(harness.followerStarts.length, 0);
+  assert.equal(
+    harness.fakeCodex.sent.filter((message) => message.id === "turn-start-mobile").length,
+    1
+  );
+  assert.equal(
+    harness.fakeCodex.sent.find((message) => message.id === "turn-start-mobile").method,
+    "turn/start"
+  );
+});
+
+test("bridge falls back once when Desktop IPC confirms turn delivery did not happen", async (t) => {
+  const deliveryFailure = Object.assign(
+    new Error("No Codex IPC client can handle thread-follower-start-turn."),
+    { remodexDeliveryFailed: true }
+  );
+  const harness = await createTurnStartHarness({
+    threadId: "thread-delivery-failure",
+    originator: "Codex Desktop",
+    startTurn: async () => {
+      throw deliveryFailure;
+    },
+  });
+  t.after(harness.cleanup);
+
+  harness.relaySocket.send(JSON.stringify({
+    id: "turn-start-delivery-failure",
+    method: "turn/start",
+    params: {
+      threadId: "thread-delivery-failure",
+      input: "Retry locally once",
+    },
+  }));
+
+  await waitFor(() => harness.fakeCodex.sent.some((message) => message.id === "turn-start-delivery-failure"));
+  await wait(40);
+  assert.equal(harness.followerStarts.length, 1);
+  assert.equal(
+    harness.fakeCodex.sent.filter((message) => message.id === "turn-start-delivery-failure").length,
+    1
+  );
+  assert.equal(
+    harness.fakeCodex.sent.find((message) => message.id === "turn-start-delivery-failure").method,
+    "turn/start"
+  );
+  assert.equal(
+    harness.relayMessages.some((message) => message.id === "turn-start-delivery-failure" && message.error),
+    false
+  );
+});
+
+test("bridge does not fall back on an ambiguous Desktop IPC timeout", async (t) => {
+  const harness = await createTurnStartHarness({
+    threadId: "thread-ambiguous-timeout",
+    originator: "Codex Desktop",
+    startTurn: async () => {
+      throw new Error("Desktop IPC request timed out: thread-follower-start-turn");
+    },
+  });
+  t.after(harness.cleanup);
+
+  harness.relaySocket.send(JSON.stringify({
+    id: "turn-start-ambiguous-timeout",
+    method: "turn/start",
+    params: {
+      threadId: "thread-ambiguous-timeout",
+      input: "Do not duplicate this turn",
+    },
+  }));
+
+  const response = await waitForMessage(
+    harness.relayMessages,
+    (message) => message.id === "turn-start-ambiguous-timeout"
+  );
+  await wait(40);
+  assert.equal(harness.followerStarts.length, 1);
+  assert.equal(
+    harness.fakeCodex.sent.some((message) => message.id === "turn-start-ambiguous-timeout"),
+    false
+  );
+  assert.equal(response.error?.data?.errorCode, "desktop_turn_start_failed");
+});
+
+async function createTurnStartHarness({
+  threadId,
+  originator,
+  source = "vscode",
+  startTurn = async () => ({ turnId: "desktop-turn" }),
+}) {
+  const { tempDir, socketPath: ipcSocketPath } = createIpcTestSocket("remodex-bridge-ipc-turn-route-");
+  const codexHome = path.join(tempDir, "codex-home");
+  writeSessionJsonl(codexHome, threadId, {
+    cwd: "/tmp/remodex-turn-route",
+    originator,
+    source,
+  });
+
+  const originalCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  const relayServer = new WebSocket.Server({ port: 0 });
+  const relayMessages = [];
+  let relaySocket = null;
+  let bridge = null;
+  let fakeCodex = null;
+  const followerStarts = [];
+
+  await new Promise((resolve) => relayServer.once("listening", resolve));
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (data) => {
+      const parsed = safeParseJSON(data.toString("utf8"));
+      if (parsed) {
+        relayMessages.push(parsed);
+      }
+    });
+  });
+
+  const { startBridge } = loadBridgeWithTestDoubles({
+    createCodexTransportImpl() {
+      fakeCodex = createFakeCodexTransport();
+      return fakeCodex;
+    },
+    desktopIpcActionFollowerModule: {
+      isDeliveryFailureError(error) {
+        return error?.remodexDeliveryFailed === true;
+      },
+      createDesktopIpcActionFollower() {
+        return {
+          observeInbound() {
+            return false;
+          },
+          startTurn(request) {
+            followerStarts.push(request);
+            return startTurn(request);
+          },
+          stopAll() {},
+        };
+      },
+      seedConversationStateFromThreadRead() {
+        return null;
+      },
+    },
+    desktopIpcLiveOwnerModule: {
+      createDesktopIpcLiveOwner() {
+        return {
+          observeInbound() {},
+          observeOutbound() {},
+          stopAll() {},
+          isThreadOwned() {
+            return false;
+          },
+          isFreshThreadOwned() {
+            return false;
+          },
+        };
+      },
+    },
+  });
+
+  bridge = startBridge({
+    printPairingQr: false,
+    config: {
+      relayUrl: `ws://127.0.0.1:${relayServer.address().port}`,
+      pushServiceUrl: "",
+      pushPreviewMaxChars: 160,
+      refreshEnabled: false,
+      refreshDebounceMs: 1,
+      keepMacAwakeEnabled: false,
+      codexEndpoint: "",
+      refreshCommand: "",
+      codexBundleId: "",
+      codexAppPath: "",
+      desktopIpcSocketPath: ipcSocketPath,
+      desktopIpcLiveSyncEnabled: false,
+    },
+  });
+
+  await waitFor(() => relaySocket && relaySocket.readyState === WebSocket.OPEN);
+
+  return {
+    fakeCodex,
+    followerStarts,
+    relayMessages,
+    relaySocket,
+    cleanup() {
+      bridge?.stop();
+      relaySocket?.close();
+      relayServer.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      if (originalCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = originalCodexHome;
+      }
+    },
+  };
+}
 
 // Loads bridge.js with plaintext test transports while leaving the production module untouched.
 function loadBridgeWithTestDoubles({
@@ -1087,6 +1307,7 @@ function createIpcTestSocket(prefix) {
 
 function writeSessionJsonl(codexHome, threadId, {
   cwd,
+  originator,
   source,
 } = {}) {
   const sessionDir = path.join(codexHome, "sessions", "2026", "07", "05");
@@ -1099,6 +1320,7 @@ function writeSessionJsonl(codexHome, threadId, {
       payload: {
         id: threadId,
         cwd,
+        originator,
         source,
       },
     }),

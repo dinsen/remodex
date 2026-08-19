@@ -3562,6 +3562,7 @@ module.exports = {
   buildDesktopTurnsListResult,
   createDesktopIpcActionFollower,
   desktopFollowerPayloadForResponse,
+  isDeliveryFailureError,
   projectDesktopAssistantDeltaNotifications,
   projectPendingDesktopActions,
   resolveDefaultIpcSocketPath,

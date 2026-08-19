@@ -56,7 +56,10 @@ const {
   resolveBridgeRelaySession,
 } = require("./secure-device-state");
 const { createBridgeSecureTransport } = require("./secure-transport");
-const { createRolloutLiveMirrorController } = require("./rollout-live-mirror");
+const {
+  createRolloutLiveMirrorController,
+  isDesktopRolloutOrigin,
+} = require("./rollout-live-mirror");
 const {
   buildCompleteThreadReadParams,
   isContextualUserText,
@@ -68,6 +71,7 @@ const {
 } = require("./desktop-ipc-shared");
 const {
   createDesktopIpcActionFollower,
+  isDeliveryFailureError,
   seedConversationStateFromThreadRead,
 } = require("./desktop-ipc-action-follower");
 const { createDesktopIpcLiveOwner } = require("./desktop-ipc-live-owner");
@@ -1423,6 +1427,11 @@ function startBridge({
           result: result || {},
         }));
       } catch (error) {
+        if (isDeliveryFailureError(error)) {
+          observeDesktopIpcLiveOwnerInbound(rawMessage, request);
+          forwardInboundRequestToCodex(rawMessage);
+          return;
+        }
         sendResponse(createJsonRpcErrorResponse(
           request.id,
           error,
@@ -1467,8 +1476,7 @@ function startBridge({
         rolloutPath,
         RELAY_THREAD_LIST_JSONL_SUMMARY_READ_BYTES
       ));
-      const source = normalizeNonEmptyString(summary?.source).toLowerCase();
-      return source === "vscode" || source === "codex_desktop" || source === "codex-desktop";
+      return isDesktopRolloutOrigin(summary);
     } catch {
       return false;
     }

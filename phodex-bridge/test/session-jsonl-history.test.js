@@ -44,6 +44,24 @@ test("parseSessionJsonlMetadata reads desktop thread cwd", () => {
   });
 });
 
+test("parseSessionJsonlThreadSummary retains mobile originator beside vscode source", () => {
+  const content = JSON.stringify({
+    timestamp: "2026-08-19T17:33:29.520Z",
+    type: "session_meta",
+    payload: {
+      id: "thread-mobile-origin",
+      cwd: "/repo",
+      originator: "codexmobile_ios",
+      source: "vscode",
+    },
+  });
+
+  assert.equal(
+    parseSessionJsonlThreadSummary(content).originator,
+    "codexmobile_ios"
+  );
+});
+
 test("parseSessionJsonlThreadSummary reads delegated worktree thread metadata", () => {
   const content = [
     JSON.stringify({
