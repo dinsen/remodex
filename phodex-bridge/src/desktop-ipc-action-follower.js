@@ -1886,7 +1886,9 @@ function createDesktopIpcActionFollower({
       return {
         threadId,
         method: "thread-follower-start-turn",
-        params: buildThreadFollowerStartTurnParams(threadId, requestId, params),
+        params: { conversationId: threadId },
+        senderRequestId: requestId,
+        turnStartParams: params,
       };
     }
     if (method === "turn/steer") {
@@ -1906,7 +1908,8 @@ function createDesktopIpcActionFollower({
         method: "thread-follower-interrupt-turn",
         params: {
           conversationId: threadId,
-          turnId: readString(params.turnId) || readString(params.turn_id),
+          mode: "user-stop",
+          expectedTurnId: readString(params.turnId) || readString(params.turn_id),
         },
       };
     }
@@ -1925,11 +1928,11 @@ function createDesktopIpcActionFollower({
 
   function submitDesktopFollowerRequest(route, originalMessage) {
     Promise.resolve()
-      .then(() => resolveFollowerRequestParams(route))
-      .then(async (resolvedParams) => {
+      .then(() => resolveFollowerRequest(route))
+      .then(async (resolvedRequest) => {
         if (route.method === "thread-follower-start-turn") {
           try {
-            await syncDesktopOwnerRuntimeSettings(route.threadId, resolvedParams.turnStartParams);
+            await syncDesktopOwnerRuntimeSettings(route.threadId, resolvedRequest.turnStartParams);
           } catch (error) {
             // The actual turn has not reached Desktop yet. Even if the settings
             // request timed out after being applied, continuing through the local
@@ -1938,16 +1941,16 @@ function createDesktopIpcActionFollower({
           }
         }
         return {
-          resolvedParams,
-          result: await ipc.sendRequest(route.method, resolvedParams),
+          resolvedRequest,
+          result: await ipc.sendRequest(route.method, resolvedRequest.params),
         };
       })
-      .then(({ resolvedParams, result }) => {
+      .then(({ resolvedRequest, result }) => {
         const appServerResult = appServerResultForFollowerRequest(route.method, result);
         if (route.method === "thread-follower-start-turn") {
           commitPhoneRuntimeSettings(
             route.threadId,
-            resolvedParams.turnStartParams,
+            resolvedRequest.turnStartParams,
             readTurnIdFromAppServerResult(appServerResult)
           );
         }
@@ -2043,41 +2046,35 @@ function createDesktopIpcActionFollower({
 
   // Desktop-followed turn starts must apply the same param normalization as
   // requests forwarded straight to the local app-server.
-  async function resolveFollowerRequestParams(route) {
+  async function resolveFollowerRequest(route) {
     if (route.method !== "thread-follower-start-turn") {
-      return route.params;
+      return {
+        params: route.params,
+        turnStartParams: null,
+      };
     }
 
     const normalized = await Promise.resolve(
-      normalizeTurnStartParams(cloneJSON(route.params.turnStartParams))
+      normalizeTurnStartParams(cloneJSON(route.turnStartParams))
     );
     const turnStartParams = normalized && typeof normalized === "object" && !Array.isArray(normalized)
       ? normalized
-      : route.params.turnStartParams;
-    return buildThreadFollowerStartTurnParams(
-      route.threadId,
-      route.params.senderRequestId,
-      turnStartParams
-    );
-  }
-
-  function buildThreadFollowerStartTurnParams(threadId, senderRequestId, turnStartParams) {
-    const normalizedThreadId = readString(threadId);
-    const params = turnStartParams && typeof turnStartParams === "object" && !Array.isArray(turnStartParams)
-      ? turnStartParams
-      : {};
-    const followerParams = { ...params };
-    delete followerParams.effort;
-    delete followerParams.reasoningEffort;
-    delete followerParams.reasoning_effort;
-    delete followerParams.serviceTier;
-    delete followerParams.service_tier;
+      : route.turnStartParams;
+    const request = cloneJSON(turnStartParams);
+    if (!readString(request.clientUserMessageId)) {
+      request.clientUserMessageId = route.senderRequestId;
+    }
     return {
-      ...followerParams,
-      conversationId: normalizedThreadId,
-      threadId: normalizedThreadId,
-      senderRequestId,
-      turnStartParams: params,
+      params: {
+        ...route.params,
+        turnStart: {
+          request,
+          context: {
+            inheritThreadSettings: true,
+          },
+        },
+      },
+      turnStartParams,
     };
   }
 

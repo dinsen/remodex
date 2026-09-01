@@ -1427,7 +1427,7 @@ extension CodexService {
         preferredProjectPath: String? = nil
     ) async throws -> CodexThread {
         let continuationRuntimeOverride = threadRuntimeOverride(for: archivedThreadId)
-        let continuationProjectPath = preferredProjectPath ?? thread(for: archivedThreadId)?.gitWorkingDirectory
+        let continuationProjectPath = preferredProjectPath ?? (try await requiredContinuationProjectPath(from: archivedThreadId))
         let continuationThread = try await startThreadIfReady(
             preferredProjectPath: continuationProjectPath,
             rootlessChatPromptHint: "continued from \(archivedThreadId)",
@@ -1438,6 +1438,15 @@ extension CodexService {
             text: "Continued from unavailable thread `\(archivedThreadId)`"
         )
         return continuationThread
+    }
+
+    private func requiredContinuationProjectPath(from archivedThreadId: String) async throws -> String {
+        if let sourceProjectPath = thread(for: archivedThreadId)?.normalizedProjectPath {
+            return sourceProjectPath
+        }
+
+        try await awaitRuntimeInitializedIfNeeded()
+        return try await createRootlessChatRoot(promptHint: nil)
     }
 
     @discardableResult
