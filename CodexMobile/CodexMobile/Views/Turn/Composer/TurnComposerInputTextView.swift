@@ -234,8 +234,15 @@ struct TurnComposerInputTextView: UIViewRepresentable {
             // Let heavier streaming rows back off briefly so keystrokes stay responsive
             // while a run is repainting tool/status activity.
             StreamingUIInteractionMonitor.noteComposerKeystroke()
-            TurnComposerInlineSkillToken.normalizeTokenAttributes(in: textView.textStorage)
-            let newText = TurnComposerInlineSkillToken.canonicalText(from: textView.attributedText)
+            let newText: String
+            if mentionedSkillNames.isEmpty {
+                // Most drafts are plain text. Avoid scanning and rebuilding the
+                // complete attributed string when there are no inline skill chips.
+                newText = textView.text
+            } else {
+                TurnComposerInlineSkillToken.normalizeTokenAttributes(in: textView.textStorage)
+                newText = TurnComposerInlineSkillToken.canonicalText(from: textView.attributedText)
+            }
             if text.wrappedValue != newText {
                 pendingUIKitText = newText
                 staleBindingTextDuringPendingEdit = text.wrappedValue

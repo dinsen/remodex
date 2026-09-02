@@ -1427,7 +1427,12 @@ extension CodexService {
         preferredProjectPath: String? = nil
     ) async throws -> CodexThread {
         let continuationRuntimeOverride = threadRuntimeOverride(for: archivedThreadId)
-        let continuationProjectPath = preferredProjectPath ?? (try await requiredContinuationProjectPath(from: archivedThreadId))
+        let continuationProjectPath: String
+        if let preferredProjectPath {
+            continuationProjectPath = preferredProjectPath
+        } else {
+            continuationProjectPath = try await requiredContinuationProjectPath(from: archivedThreadId)
+        }
         let continuationThread = try await startThreadIfReady(
             preferredProjectPath: continuationProjectPath,
             rootlessChatPromptHint: "continued from \(archivedThreadId)",
