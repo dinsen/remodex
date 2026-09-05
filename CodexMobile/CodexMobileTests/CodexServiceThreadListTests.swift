@@ -11,6 +11,86 @@ import XCTest
 final class CodexServiceThreadListTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
+    func testApplyingSectionSnapshotClearsPriorMemberOmittedByRefresh() {
+        let service = makeService()
+        let planning = CodexThreadSection(id: "planning", name: "Planning")
+        let other = CodexThreadSection(id: "other", name: "Other")
+        service.threads = [
+            CodexThread(id: "moved-out", title: "Moved out", section: planning, cwd: "/Users/me/work/app"),
+            CodexThread(id: "unrelated", title: "Unrelated", section: other, cwd: "/Users/me/work/site"),
+        ]
+
+        service.applyThreadSectionSnapshot(
+            CodexThreadSectionsSnapshot(
+                sections: [planning],
+                threads: [CodexThread(id: "current-member", title: "Current", section: planning, cwd: "/Users/me/work/app")],
+                threadIDsBySection: ["planning": ["current-member"]]
+            ),
+            clearingMembershipIn: ["planning"]
+        )
+
+        XCTAssertNil(service.thread(for: "moved-out")?.section)
+        XCTAssertEqual(service.thread(for: "current-member")?.section, planning)
+        XCTAssertEqual(service.thread(for: "unrelated")?.section, other)
+    }
+
+    func testSectionHydrationShowsSectionOnlyThreadsInNativeOrderWithoutHidingProjects() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "data": .array([
+                            .object(["id": .string("planning"), "name": .string("Planning")]),
+                        ]),
+                        "nextCursor": .null,
+                    ]),
+                    includeJSONRPC: false
+                )
+            case "thread/list":
+                XCTAssertEqual(params?.objectValue?["sectionId"], .string("planning"))
+                XCTAssertEqual(params?.objectValue?["sortKey"], .string("section_position"))
+                XCTAssertEqual(params?.objectValue?["sortDirection"], .string("asc"))
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "threads": .array([
+                            .object(["id": .string("section-second"), "cwd": .string("/Users/me/work/app")]),
+                            .object(["id": .string("section-first"), "cwd": .string("/Users/me/work/app")]),
+                        ]),
+                        "nextCursor": .null,
+                    ]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        let snapshot = try await service.fetchThreadSections()
+        snapshot.threads.forEach { service.upsertThread($0, treatAsServerState: true) }
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: service.threads,
+            sections: snapshot.sections,
+            sectionThreadIDsBySection: snapshot.threadIDsBySection
+        )
+
+        XCTAssertEqual(groups.first(where: { $0.id == "section:planning" })?.threads.map(\.id), [
+            "section-second",
+            "section-first",
+        ])
+        XCTAssertEqual(
+            Set(groups.first(where: { $0.id == "project:/Users/me/work/app" })?.threads.map(\.id) ?? []),
+            Set(["section-second", "section-first"])
+        )
+    }
+
     func testDecodeThreadSectionMetadata() throws {
         let data = Data(#"""
         [

@@ -38,6 +38,7 @@ struct SidebarThreadListView: View {
     @State private var knownProjectGroupIDs: Set<String> = []
     @State private var hasInitializedProjectGroupExpansion = false
     @State private var isPinnedExpanded = true
+    @State private var expandedSectionGroupIDs: Set<String> = []
     @State private var isChatGroupExpanded = true
     @State private var expandedSubagentParentIDs: Set<String> = []
     // Tracks project sections whose preview cap was manually lifted with Show more.
@@ -70,12 +71,14 @@ struct SidebarThreadListView: View {
             await codex.loadSubagentThreadMetadataIfNeeded(threadIds: visibleSubagentThreadIDs)
         }
         .onAppear {
+            expandedSectionGroupIDs = Set(groups.filter { $0.kind == .section }.map(\.id))
             syncExpandedProjectGroupState()
             syncRevealedProjectGroupState()
             revealSelectedThreadProjectGroup()
             revealSelectedSubagentAncestors()
         }
         .onChange(of: groups.map(\.id)) { _, _ in
+            expandedSectionGroupIDs.formUnion(groups.filter { $0.kind == .section }.map(\.id))
             syncExpandedProjectGroupState()
             syncRevealedProjectGroupState()
             revealSelectedThreadProjectGroup()
@@ -101,11 +104,57 @@ struct SidebarThreadListView: View {
         switch group.kind {
         case .pinned:
             pinnedGroupSection(group)
+        case .section:
+            sectionGroupSection(group)
         case .project:
             projectGroupSection(group)
         case .chat:
             chatGroupSection(group)
         }
+    }
+
+    private func sectionGroupSection(_ group: SidebarThreadGroup) -> some View {
+        let isExpanded = expandedSectionGroupIDs.contains(group.id)
+        let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            SidebarSectionHeader(
+                label: group.label,
+                onToggle: {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        if isExpanded {
+                            expandedSectionGroupIDs.remove(group.id)
+                        } else {
+                            expandedSectionGroupIDs.insert(group.id)
+                        }
+                    }
+                },
+                leadingIcon: {
+                    RemodexIcon.image(systemName: group.iconSystemName)
+                        .font(AppFont.body(weight: .medium))
+                        .foregroundStyle(.primary)
+                },
+                trailing: {
+                    SidebarSectionExpansionChevron(isExpanded: isExpanded)
+                }
+            )
+            .padding(.horizontal)
+
+            if isExpanded {
+                SidebarThreadGroupBlock(bottomPadding: 0) {
+                    VStack(spacing: 2) {
+                        ForEach(hierarchy.rootThreads) { thread in
+                            threadRowTree(
+                                thread,
+                                childrenByParentID: hierarchy.childrenByParentID,
+                                leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        .clipped()
     }
 
     private func pinnedGroupSection(_ group: SidebarThreadGroup) -> some View {
@@ -353,6 +402,17 @@ struct SidebarThreadListView: View {
             switch group.kind {
             case .pinned:
                 guard isPinnedExpanded else { continue }
+                let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+                for rootThread in hierarchy.rootThreads {
+                    collectVisibleSubagentThreadIDs(
+                        from: rootThread,
+                        childrenByParentID: hierarchy.childrenByParentID,
+                        ancestorThreadIDs: [],
+                        into: &visibleThreadIDs
+                    )
+                }
+            case .section:
+                guard expandedSectionGroupIDs.contains(group.id) else { continue }
                 let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
                 for rootThread in hierarchy.rootThreads {
                     collectVisibleSubagentThreadIDs(

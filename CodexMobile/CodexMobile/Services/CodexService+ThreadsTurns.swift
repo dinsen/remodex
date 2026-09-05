@@ -54,7 +54,143 @@ struct CodexPreAppendedTurnMessage: Sendable {
     let automaticTitleSeed: String?
 }
 
+struct CodexThreadSectionsSnapshot: Sendable {
+    let sections: [CodexThreadSection]
+    let threads: [CodexThread]
+    let threadIDsBySection: [String: [String]]
+}
+
 extension CodexService {
+    // Sections are independently persisted by Codex, so fetch them separately from
+    // thread/list to keep empty sections visible in the sidebar.
+    func fetchThreadSections() async throws -> CodexThreadSectionsSnapshot {
+        var sections: [CodexThreadSection] = []
+        var cursor: JSONValue = .null
+        var seenCursors: Set<String> = []
+
+        repeat {
+            if let cursorValue = cursor.stringValue,
+               !seenCursors.insert(cursorValue).inserted {
+                throw CodexServiceError.invalidResponse("threadSection/list pagination did not complete")
+            }
+
+            let response = try await sendRequest(
+                method: "threadSection/list",
+                params: .object(["cursor": cursor, "limit": .integer(100)]),
+                timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+                timeoutMessage: "threadSection/list timed out while loading Codex sections."
+            )
+            guard let result = response.result?.objectValue,
+                  let rawSections = result["data"]?.arrayValue
+                    ?? result["items"]?.arrayValue
+                    ?? result["sections"]?.arrayValue else {
+                throw CodexServiceError.invalidResponse("threadSection/list response missing sections")
+            }
+
+            for rawSection in rawSections {
+                guard let section = decodeModel(CodexThreadSection.self, from: rawSection) else {
+                    throw CodexServiceError.invalidResponse("threadSection/list response contained malformed section")
+                }
+                if !sections.contains(where: { $0.id == section.id }) {
+                    sections.append(section)
+                }
+            }
+            cursor = result["nextCursor"] ?? result["next_cursor"] ?? .null
+        } while cursor.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+
+        var sectionThreads: [CodexThread] = []
+        var threadIDsBySection: [String: [String]] = [:]
+        for section in sections {
+            let threads = try await fetchThreads(in: section)
+            sectionThreads.append(contentsOf: threads)
+            threadIDsBySection[section.id] = threads.map(\.id)
+        }
+
+        return CodexThreadSectionsSnapshot(
+            sections: sections,
+            threads: sectionThreads,
+            threadIDsBySection: threadIDsBySection
+        )
+    }
+
+    private func fetchThreads(in section: CodexThreadSection) async throws -> [CodexThread] {
+        var threads: [CodexThread] = []
+        var cursor: JSONValue = .null
+        var sourceKinds = threadListSourceKinds
+        var seenCursors: Set<String> = []
+
+        repeat {
+            if let cursorValue = cursor.stringValue,
+               !seenCursors.insert(cursorValue).inserted {
+                throw CodexServiceError.invalidResponse("Section thread/list pagination did not complete")
+            }
+
+            let page: (threads: [CodexThread], nextCursor: JSONValue)
+            do {
+                page = try await fetchThreadsPage(
+                    in: section,
+                    cursor: cursor,
+                    sourceKinds: sourceKinds
+                )
+            } catch {
+                guard sourceKinds == threadListSourceKinds,
+                      shouldRetryThreadListWithLegacySourceKinds(error) else {
+                    throw error
+                }
+                sourceKinds = legacyThreadListSourceKinds
+                page = try await fetchThreadsPage(
+                    in: section,
+                    cursor: cursor,
+                    sourceKinds: sourceKinds
+                )
+            }
+
+            threads.append(contentsOf: page.threads)
+            cursor = page.nextCursor
+        } while cursor.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+
+        return threads
+    }
+
+    private func fetchThreadsPage(
+        in section: CodexThreadSection,
+        cursor: JSONValue,
+        sourceKinds: [String]
+    ) async throws -> (threads: [CodexThread], nextCursor: JSONValue) {
+        let response = try await sendRequest(
+            method: "thread/list",
+            params: .object([
+                "sectionId": .string(section.id),
+                "sortKey": .string("section_position"),
+                "sortDirection": .string("asc"),
+                "sourceKinds": .array(sourceKinds.map(JSONValue.string)),
+                "cursor": cursor,
+                "limit": .integer(100),
+            ]),
+            timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
+            timeoutMessage: "thread/list timed out while loading Codex section threads."
+        )
+        guard let result = response.result?.objectValue,
+              let rawThreads = result["data"]?.arrayValue
+                ?? result["items"]?.arrayValue
+                ?? result["threads"]?.arrayValue else {
+            throw CodexServiceError.invalidResponse("Section thread/list response missing data array")
+        }
+
+        let decodedThreads = await CodexThreadPageDecoder.decode(rawThreads)
+        guard decodedThreads.count == rawThreads.count else {
+            throw CodexServiceError.invalidResponse("Section thread/list response contained malformed data")
+        }
+        return (
+            decodedThreads.map { thread in
+                var sectionThread = thread
+                sectionThread.section = section
+                return sectionThread
+            },
+            result["nextCursor"] ?? result["next_cursor"] ?? .null
+        )
+    }
+
     // Sidebar loads stay capped so reconnect/bootstrap cannot pull an entire local history at once.
     var recentActiveThreadListLimit: Int { ThreadListHydrationPolicy.initialVisibleThreadLimit }
     var initialVisibleThreadListLimit: Int { ThreadListHydrationPolicy.initialVisibleThreadLimit }

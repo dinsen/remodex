@@ -67,7 +67,7 @@ enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case archivedLocal
 }
 
-struct CodexThreadSection: Codable, Hashable, Sendable {
+struct CodexThreadSection: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let name: String
 }

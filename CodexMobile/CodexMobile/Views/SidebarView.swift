@@ -68,6 +68,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var sidebarDataRebuildCoalescer = SidebarDataRebuildCoalescer()
     @State private var projectlessChatRootPaths: [String] = []
     @State private var configuredProjectChoices: [SidebarProjectChoice] = []
+    @State private var codexThreadSections: [CodexThreadSection] = []
+    @State private var sectionThreadIDsBySection: [String: [String]] = [:]
     @AppStorage(SidebarProjectSource.storageKey)
     private var projectSourceRawValue = SidebarProjectSource.defaultSource.rawValue
     @AppStorage(SidebarProjectExpansionState.collapsedProjectGroupIDsStorageKey)
@@ -100,6 +102,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 rebuildCachedSidebarState()
                 await refreshProjectlessChatRoots()
                 await refreshConfiguredProjects()
+                await refreshCodexThreadSections()
                 if codex.isConnected, codex.threads.isEmpty {
                     await refreshThreads()
                 }
@@ -134,6 +137,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 Task { @MainActor in
                     await refreshProjectlessChatRoots()
                     await refreshConfiguredProjects()
+                    await refreshCodexThreadSections()
                 }
             }
             // Deferred through the same sidebar coalescer as thread/group changes
@@ -270,6 +274,25 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         } catch {
             // Older bridges can lack this RPC; recent-thread grouping still renders.
             debugSidebarLog("configured projects unavailable error=\(error.localizedDescription)")
+        }
+    }
+
+    private func refreshCodexThreadSections() async {
+        guard codex.isConnected else { return }
+
+        do {
+            let snapshot = try await codex.fetchThreadSections()
+            let sectionIDsToClear = Set(codexThreadSections.map(\.id)).union(snapshot.sections.map(\.id))
+            codex.applyThreadSectionSnapshot(snapshot, clearingMembershipIn: sectionIDsToClear)
+            guard snapshot.sections != codexThreadSections
+                || snapshot.threadIDsBySection != sectionThreadIDsBySection else { return }
+            codexThreadSections = snapshot.sections
+            sectionThreadIDsBySection = snapshot.threadIDsBySection
+            scheduleSidebarDataRebuild(needsGroups: true)
+        } catch {
+            // Older app servers can lack sections; thread metadata still preserves
+            // any section represented in the regular thread list.
+            debugSidebarLog("Codex sections unavailable error=\(error.localizedDescription)")
         }
     }
 
@@ -496,6 +519,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         groupedThreads = SidebarThreadGrouping.makeGroups(
             from: source,
             pinnedThreadIDs: codex.pinnedThreadIDs,
+            sections: codexThreadSections,
+            sectionThreadIDsBySection: sectionThreadIDsBySection,
             scope: sidebarGroupingScope,
             projectlessRootPaths: projectlessChatRootPaths,
             projectSource: selectedProjectSource,
@@ -541,6 +566,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         hasher.combine(selectedContentScope)
         hasher.combine(projectSourceRawValue)
         hasher.combine(projectlessChatRootPaths)
+        hasher.combine(codexThreadSections)
+        hasher.combine(sectionThreadIDsBySection)
         for choice in configuredProjectChoices {
             hasher.combine(choice.id)
             hasher.combine(choice.label)

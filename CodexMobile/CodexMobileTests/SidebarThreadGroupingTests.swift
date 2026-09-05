@@ -8,6 +8,34 @@ import XCTest
 @testable import CodexMobile
 
 final class SidebarThreadGroupingTests: XCTestCase {
+    func testMakeGroupsShowsEveryCodexSectionWithoutHidingProjects() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "sectioned", updatedAt: now, cwd: "/Users/me/work/app", section: .init(id: "planning", name: "Planning")),
+            makeThread(id: "unsectioned", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/site"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [
+                .init(id: "planning", name: "Planning"),
+                .init(id: "later", name: "Later"),
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "section:planning",
+            "section:later",
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/site",
+        ])
+        XCTAssertEqual(groups[0].kind, .section)
+        XCTAssertEqual(groups[0].threads.map(\.id), ["sectioned"])
+        XCTAssertTrue(groups[1].threads.isEmpty)
+        XCTAssertEqual(groups[2].threads.map(\.id), ["sectioned"])
+    }
+
     func testMakeGroupsPartitionsLiveThreadsByProjectPath() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let threads = [
@@ -1028,6 +1056,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
         id: String,
         updatedAt: Date,
         cwd: String?,
+        section: CodexThreadSection? = nil,
         worktreeOriginPath: String? = nil,
         syncState: CodexThreadSyncState = .live,
         parentThreadId: String? = nil,
@@ -1037,6 +1066,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
             id: id,
             title: id,
             updatedAt: updatedAt,
+            section: section,
             cwd: cwd,
             worktreeOriginPath: worktreeOriginPath,
             forkedFromThreadId: forkedFromThreadId,

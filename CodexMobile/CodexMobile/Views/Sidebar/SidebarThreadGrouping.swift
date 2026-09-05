@@ -9,6 +9,7 @@ import Foundation
 
 enum SidebarThreadGroupKind: Equatable {
     case pinned
+    case section
     case project
     case chat
 }
@@ -78,6 +79,8 @@ struct SidebarThreadGroup: Identifiable {
         switch kind {
         case .pinned:
             return "pin"
+        case .section:
+            return "rectangle.3.group"
         case .project:
             return CodexThread.projectIconSystemName(for: projectPath)
         case .chat:
@@ -94,6 +97,8 @@ enum SidebarThreadGrouping {
     static func makeGroups(
         from threads: [CodexThread],
         pinnedThreadIDs: [String] = [],
+        sections: [CodexThreadSection] = [],
+        sectionThreadIDsBySection: [String: [String]] = [:],
         scope: SidebarThreadGroupingScope = .all,
         projectlessRootPaths: [String] = [],
         projectSource: SidebarProjectSource = .recentThreadProjects,
@@ -118,6 +123,16 @@ enum SidebarThreadGrouping {
                     threads: pinnedThreads
                 )
             )
+        }
+
+        if scope != .chats {
+            groups.append(contentsOf: makeSectionGroups(
+                from: scopedThreads,
+                sections: sections,
+                threadIDsBySection: sectionThreadIDsBySection,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ))
         }
 
         switch scope {
@@ -157,6 +172,47 @@ enum SidebarThreadGrouping {
         }
 
         return groups
+    }
+
+    private static func makeSectionGroups(
+        from threads: [CodexThread],
+        sections: [CodexThreadSection],
+        threadIDsBySection: [String: [String]],
+        excludingPinnedThreadIDs pinnedThreadIDs: Set<String>,
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+    ) -> [SidebarThreadGroup] {
+        var knownSectionsByID: [String: CodexThreadSection] = [:]
+        for section in sections where section.name.localizedCaseInsensitiveCompare("Pinned") != .orderedSame {
+            knownSectionsByID[section.id] = section
+        }
+        for section in threads.compactMap(\.section)
+        where section.name.localizedCaseInsensitiveCompare("Pinned") != .orderedSame {
+            knownSectionsByID[section.id] = section
+        }
+
+        return knownSectionsByID.values.map { section in
+            let matchingThreads = threads.filter { $0.section?.id == section.id && !pinnedThreadIDs.contains($0.id) }
+            let threadsByID = Dictionary(uniqueKeysWithValues: matchingThreads.map { ($0.id, $0) })
+            let nativeOrderedThreads = (threadIDsBySection[section.id] ?? []).compactMap { threadsByID[$0] }
+            let nativeOrderedThreadIDs = Set(nativeOrderedThreads.map(\.id))
+            let remainingThreads = sortThreadsByRecentActivity(
+                matchingThreads.filter { !nativeOrderedThreadIDs.contains($0.id) },
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            )
+            let sectionThreads = nativeOrderedThreads + remainingThreads
+            return SidebarThreadGroup(
+                id: "section:\(section.id)",
+                label: section.name,
+                kind: .section,
+                sortDate: sectionThreads.first?.updatedAt ?? sectionThreads.first?.createdAt ?? .distantPast,
+                projectPath: nil,
+                threads: sectionThreads
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.sortDate != rhs.sortDate { return lhs.sortDate > rhs.sortDate }
+            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        }
     }
 
     // Keeps the UI picker from leaking project chats into rootless Chats and vice versa.

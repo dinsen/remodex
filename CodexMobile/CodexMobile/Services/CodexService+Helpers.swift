@@ -94,6 +94,41 @@ extension CodexService {
         }
     }
 
+    // A section refresh is authoritative for the sections it listed: members
+    // omitted from a refreshed section must no longer retain stale membership.
+    func applyThreadSectionSnapshot(
+        _ snapshot: CodexThreadSectionsSnapshot,
+        clearingMembershipIn sectionIDs: Set<String>
+    ) {
+        var resolvedThreads = threads.map { thread in
+            guard let sectionID = thread.section?.id, sectionIDs.contains(sectionID) else {
+                return thread
+            }
+            var clearedThread = thread
+            clearedThread.section = nil
+            clearedThread.sectionEnteredAt = nil
+            return clearedThread
+        }
+        var indexByThreadID = Dictionary(uniqueKeysWithValues: resolvedThreads.enumerated().map { ($0.element.id, $0.offset) })
+
+        for incomingThread in snapshot.threads {
+            applyRemoteRuntimeSettings(from: incomingThread)
+            restoredThreadSnapshotIDs.remove(incomingThread.id)
+            if let index = indexByThreadID[incomingThread.id] {
+                resolvedThreads[index] = mergedThread(
+                    incomingThread,
+                    with: resolvedThreads[index],
+                    treatAsServerState: true
+                )
+            } else {
+                indexByThreadID[incomingThread.id] = resolvedThreads.count
+                resolvedThreads.append(incomingThread)
+            }
+        }
+
+        threads = sortThreads(resolvedThreads)
+    }
+
     // Preserves locally discovered child-thread identity while newer server payloads trickle in.
     func mergedThread(
         _ incoming: CodexThread,
