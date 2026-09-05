@@ -26,6 +26,7 @@ struct ComposerBottomBar: View {
     let activeTurnID: String?
     let isThreadRunning: Bool
     let showsSendButton: Bool
+    let voicePhaseOneControl: VoiceComposerPhaseOne.TrailingControl
     let voiceButtonPresentation: TurnComposerVoiceButtonPresentation
     let selectedAccessMode: CodexAccessMode
     let contextWindowUsage: ContextWindowUsage?
@@ -124,10 +125,12 @@ struct ComposerBottomBar: View {
                 .accessibilityLabel("Resume queued messages")
             }
 
-            ComposerVoiceButton(
-                presentation: voiceButtonPresentation,
-                onTap: onTapVoice
-            )
+            if voicePhaseOneControl == .normal {
+                ComposerVoiceButton(
+                    presentation: voiceButtonPresentation,
+                    onTap: onTapVoice
+                )
+            }
 
             if showsStopButton {
                 ComposerStopControl(
@@ -142,7 +145,10 @@ struct ComposerBottomBar: View {
                 .padding(.leading, 4)
             }
 
-            if showsSendButton {
+            if voicePhaseOneControl == .voiceWave {
+                ComposerVoiceWaveButton()
+                    .padding(.leading, 4)
+            } else if showsSendButton {
                 Button {
                     HapticFeedback.shared.triggerImpactFeedback()
                     onSend()

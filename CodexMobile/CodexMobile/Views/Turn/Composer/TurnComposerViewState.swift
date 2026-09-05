@@ -6,6 +6,31 @@
 
 import SwiftUI
 
+enum VoicePreference {
+    static let storageKey = "codex.voice.enabled"
+
+    static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: storageKey)
+    }
+
+    static func setEnabled(_ isEnabled: Bool, in defaults: UserDefaults = .standard) {
+        defaults.set(isEnabled, forKey: storageKey)
+    }
+}
+
+enum VoiceComposerPhaseOne {
+    enum TrailingControl: Equatable {
+        case normal
+        case send
+        case voiceWave
+    }
+
+    static func trailingControl(isVoiceEnabled: Bool, input: String) -> TrailingControl {
+        guard isVoiceEnabled else { return .normal }
+        return input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .voiceWave : .send
+    }
+}
+
 struct TurnComposerAutocompleteState: Equatable {
     let availableSlashCommands: [TurnComposerSlashCommand]
     let fileAutocompleteItems: [CodexFuzzyFileMatch]

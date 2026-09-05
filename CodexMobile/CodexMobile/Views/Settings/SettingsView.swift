@@ -455,10 +455,13 @@ private struct SettingsNotificationsCard: View {
 }
 
 private struct SettingsGPTAccountCard: View {
+    @AppStorage(VoicePreference.storageKey) private var isVoiceEnabled = false
     let onShowInfo: () -> Void
 
     var body: some View {
         SettingsCard(title: "Voice") {
+            Toggle("Enable Voice", isOn: $isVoiceEnabled)
+
             Button {
                 HapticFeedback.shared.triggerImpactFeedback(style: .light)
                 onShowInfo()

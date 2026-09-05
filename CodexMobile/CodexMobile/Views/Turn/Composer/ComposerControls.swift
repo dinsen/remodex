@@ -171,6 +171,28 @@ struct ComposerVoiceButton: View {
     }
 }
 
+// First-phase Voice affordance only. Its action is deliberately empty: it
+// must not request microphone permission or begin an audio session.
+struct ComposerVoiceWaveButton: View {
+    var circleDiameter: CGFloat = 32
+    var tapTargetSide: CGFloat? = nil
+
+    var body: some View {
+        Button(action: {}) {
+            RemodexCircleBadge(
+                systemName: "waveform",
+                foreground: .primary,
+                background: Color(.systemGray5),
+                diameter: circleDiameter
+            )
+            .frame(width: tapTargetSide, height: tapTargetSide)
+            .contentShape(Circle())
+        }
+        .accessibilityLabel("Voice")
+        .accessibilityHint("Voice input is coming soon")
+    }
+}
+
 // MARK: - Stop control
 
 // Stop affordance for a running turn: a short spinner while the run is still

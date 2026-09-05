@@ -126,6 +126,7 @@ struct TurnComposerView: View, Equatable {
     // The runtime picker is presented from the always-mounted composer root (not
     // from the bottom bar) so it survives the composer collapsing mid-flow.
     @State private var showsRuntimeOverlay = false
+    @AppStorage(VoicePreference.storageKey) private var isVoiceEnabled = false
 
     @Environment(\.pinnedPlanAccessory) private var pinnedPlanAccessory
 
@@ -141,6 +142,10 @@ struct TurnComposerView: View, Equatable {
 
     private var showsSendButton: Bool {
         !isThreadRunning || accessoryState.hasSendableContent(input: input)
+    }
+
+    private var voicePhaseOneControl: VoiceComposerPhaseOne.TrailingControl {
+        VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: isVoiceEnabled, input: input)
     }
 
     // Collapse to a single glass capsule whenever the keyboard is closed. Only
@@ -331,13 +336,19 @@ struct TurnComposerView: View, Equatable {
                     }
 
                     if showsCollapsedComposer {
-                        ComposerVoiceButton(
-                            presentation: voiceButtonPresentation,
-                            onTap: onTapVoice,
-                            tapTargetSide: collapsedControlTapTarget
-                        )
-                        .frame(width: collapsedControlTapTarget, height: collapsedControlTapTarget)
-                        .transition(.opacity)
+                        if voicePhaseOneControl == .normal {
+                            ComposerVoiceButton(
+                                presentation: voiceButtonPresentation,
+                                onTap: onTapVoice,
+                                tapTargetSide: collapsedControlTapTarget
+                            )
+                            .frame(width: collapsedControlTapTarget, height: collapsedControlTapTarget)
+                            .transition(.opacity)
+                        } else if voicePhaseOneControl == .voiceWave {
+                            ComposerVoiceWaveButton(tapTargetSide: collapsedControlTapTarget)
+                                .frame(width: collapsedControlTapTarget, height: collapsedControlTapTarget)
+                                .transition(.opacity)
+                        }
 
                         // Keep Stop reachable while a turn runs even in the resting capsule.
                         if isThreadRunning {
@@ -420,6 +431,7 @@ struct TurnComposerView: View, Equatable {
             activeTurnID: activeTurnID,
             isThreadRunning: isThreadRunning,
             showsSendButton: showsSendButton,
+            voicePhaseOneControl: voicePhaseOneControl,
             voiceButtonPresentation: voiceButtonPresentation,
             selectedAccessMode: selectedAccessMode,
             contextWindowUsage: contextWindowUsage,

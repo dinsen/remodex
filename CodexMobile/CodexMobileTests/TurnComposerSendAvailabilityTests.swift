@@ -11,6 +11,36 @@ import XCTest
 final class TurnComposerSendAvailabilityTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
+    func testVoicePreferenceDefaultsOffAndPersists() {
+        let suiteName = "TurnComposerSendAvailabilityTests.voice.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Expected isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(VoicePreference.isEnabled(in: defaults))
+
+        VoicePreference.setEnabled(true, in: defaults)
+
+        XCTAssertTrue(VoicePreference.isEnabled(in: defaults))
+    }
+
+    func testVoicePhaseOneUsesWaveOnlyForEnabledEmptyText() {
+        XCTAssertEqual(
+            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: false, input: ""),
+            .normal
+        )
+        XCTAssertEqual(
+            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: true, input: "Ship it"),
+            .send
+        )
+        XCTAssertEqual(
+            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: true, input: "   \n"),
+            .voiceWave
+        )
+    }
+
     func testSendDisabledWhenDisconnected() {
         let state = makeState(isConnected: false)
         XCTAssertTrue(state.isSendDisabled)
