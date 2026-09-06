@@ -26,19 +26,132 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertTrue(VoicePreference.isEnabled(in: defaults))
     }
 
-    func testVoicePhaseOneUsesWaveOnlyForEnabledEmptyText() {
+    func testVoicePhaseOneUsesWaveOnlyWhenVoiceIsEnabledAndNothingIsSendable() {
         XCTAssertEqual(
-            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: false, input: ""),
+            VoiceComposerPhaseOne.trailingControl(
+                isVoiceEnabled: false,
+                hasSendableContent: false,
+                isVoiceSessionActive: false
+            ),
             .normal
         )
         XCTAssertEqual(
-            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: true, input: "Ship it"),
+            VoiceComposerPhaseOne.trailingControl(
+                isVoiceEnabled: true,
+                hasSendableContent: true,
+                isVoiceSessionActive: false
+            ),
             .send
         )
         XCTAssertEqual(
-            VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: true, input: "   \n"),
+            VoiceComposerPhaseOne.trailingControl(
+                isVoiceEnabled: true,
+                hasSendableContent: false,
+                isVoiceSessionActive: false
+            ),
             .voiceWave
         )
+    }
+
+    func testVoiceSessionStopTakesPrecedenceOverSendableContent() {
+        XCTAssertEqual(
+            VoiceComposerPhaseOne.trailingControl(
+                isVoiceEnabled: true,
+                hasSendableContent: true,
+                isVoiceSessionActive: true
+            ),
+            .voiceWave
+        )
+    }
+
+    func testVoicePhaseOnePreservesSendForAllStructuredSendableContent() {
+        let accessoryStates = [
+            makeAccessoryState(hasAttachment: true),
+            makeAccessoryState(hasMentionedFile: true),
+            makeAccessoryState(hasSkillSelection: true),
+            makeAccessoryState(hasPluginSelection: true),
+            makeAccessoryState(hasReviewSelection: true),
+            makeAccessoryState(hasSubagentsSelection: true),
+            makeAccessoryState(hasPlanSelection: true),
+        ]
+
+        for accessoryState in accessoryStates {
+            XCTAssertEqual(
+                VoiceComposerPhaseOne.trailingControl(
+                    isVoiceEnabled: true,
+                    hasSendableContent: accessoryState.hasSendableContent(input: ""),
+                    isVoiceSessionActive: false
+                ),
+                .send
+            )
+        }
+    }
+
+    func testVoicePhaseTwoStartsLocalSessionWhenMicrophonePermissionIsGranted() async {
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
+
+        await controller.handleWaveTap()
+
+        XCTAssertTrue(controller.isVoiceSessionActive)
+        XCTAssertNil(controller.permissionExplanation)
+    }
+
+    func testVoicePhaseTwoKeepsSessionInactiveWhenMicrophonePermissionIsDenied() async {
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .denied })
+
+        await controller.handleWaveTap()
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(
+            controller.permissionExplanation,
+            "Allow Microphone access for Remodex in Settings to use Voice."
+        )
+    }
+
+    func testVoicePhaseTwoKeepsSessionInactiveWhenMicrophonePermissionIsRestricted() async {
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .restricted })
+
+        await controller.handleWaveTap()
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(
+            controller.permissionExplanation,
+            "Allow Microphone access for Remodex in Settings to use Voice."
+        )
+    }
+
+    func testVoicePhaseTwoStopsLocalSessionWithoutRequestingPermissionAgain() async {
+        var permissionRequestCount = 0
+        let controller = VoiceComposerPhaseTwoController(requestPermission: {
+            permissionRequestCount += 1
+            return .granted
+        })
+
+        await controller.handleWaveTap()
+        await controller.handleWaveTap()
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(permissionRequestCount, 1)
+    }
+
+    func testVoicePhaseTwoDoesNotStartAfterVoiceIsDisabledWhilePermissionIsPending() async {
+        let permissionRequested = expectation(description: "Microphone permission requested")
+        var continuation: CheckedContinuation<VoiceMicrophonePermission, Never>?
+        let controller = VoiceComposerPhaseTwoController(requestPermission: {
+            permissionRequested.fulfill()
+            return await withCheckedContinuation { continuation = $0 }
+        })
+
+        let requestTask = Task { @MainActor in
+            await controller.handleWaveTap()
+        }
+        await fulfillment(of: [permissionRequested], timeout: 1)
+
+        controller.disableVoice()
+        continuation?.resume(returning: .granted)
+        await requestTask.value
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
     }
 
     func testSendDisabledWhenDisconnected() {
@@ -237,6 +350,17 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
                 throw CodexServiceError.rpcError(
                     RPCError(code: -32000, message: "thread not found")
                 )
+            case "workspace/checkpointCapture":
+                return self.workspaceCheckpointResponse(
+                    threadID: "thread-selected",
+                    kind: "messageStart"
+                )
+            case "workspace/checkpointCopy":
+                return self.workspaceCheckpointResponse(
+                    threadID: "thread-selected",
+                    kind: "turnStart",
+                    copied: true
+                )
             case "turn/start":
                 turnStartThreadID = params?.objectValue?["threadId"]?.stringValue
                 return RPCMessage(
@@ -284,6 +408,12 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             case "thread/resume":
                 throw CodexServiceError.rpcError(
                     RPCError(code: -32000, message: "thread not found")
+                )
+            case "project/createRootlessChatRoot":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["path": .string("/tmp/remodex-local")]),
+                    includeJSONRPC: false
                 )
             case "thread/start":
                 return RPCMessage(
@@ -441,7 +571,6 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         let service = makeService()
         service.isConnected = true
         service.requestTransportOverride = { method, _ in
-            XCTAssertEqual(method, "turn/start")
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-sent")]),
@@ -479,6 +608,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-live",
             viewModel: viewModel,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             codex: service,
             threadID: "thread-live-attachment"
         )
@@ -505,6 +635,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-preserve",
             viewModel: nil,
             expectedDraftMergeRevision: preservingRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             codex: service,
             threadID: "thread-preserve-attachment"
         )
@@ -526,6 +657,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-stale",
             viewModel: nil,
             expectedDraftMergeRevision: staleRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             codex: service,
             threadID: "thread-stale-attachment"
         )
@@ -592,6 +724,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-navigation",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             codex: service,
             threadID: "thread-navigation-attachment"
         )
@@ -623,6 +756,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-detached",
             viewModel: viewModel,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             codex: service,
             threadID: "thread-detached-attachment"
         )
@@ -667,6 +801,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-reappeared",
             viewModel: viewModel,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: ["attachment-reappeared"],
             codex: service,
             threadID: "thread-reappeared-attachment"
@@ -699,6 +834,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-failed",
             viewModel: viewModel,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: ["attachment-failed"],
             codex: service,
             threadID: "thread-failed-attachment"
@@ -736,6 +872,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-second",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-ordered-attachments"
@@ -745,6 +882,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-first",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-ordered-attachments"
@@ -784,6 +922,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-first",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-partial-restore"
@@ -801,6 +940,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-second",
             viewModel: viewModel,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-partial-restore"
@@ -835,6 +975,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-edited",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: ["attachment-edited"],
             codex: service,
             threadID: "thread-edited-attachment"
@@ -868,6 +1009,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-removed",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: ["attachment-removed"],
             codex: service,
             threadID: "thread-removed-attachment"
@@ -904,6 +1046,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-removed",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-remove-one-attachment"
@@ -913,6 +1056,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             id: "attachment-kept",
             viewModel: nil,
             expectedDraftMergeRevision: expectedRevision,
+            expectedDraftMergeEpoch: service.composerDraftMergeEpoch,
             attachmentOrder: attachmentOrder,
             codex: service,
             threadID: "thread-remove-one-attachment"
@@ -972,8 +1116,9 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         var capturedParams: JSONValue?
         service.requestTransportOverride = { method, params in
-            XCTAssertEqual(method, "turn/start")
-            capturedParams = params
+            if method == "turn/start" {
+                capturedParams = params
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-subagents")]),
@@ -1001,8 +1146,9 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         var capturedParams: JSONValue?
         service.requestTransportOverride = { method, params in
-            XCTAssertEqual(method, "turn/start")
-            capturedParams = params
+            if method == "turn/start" {
+                capturedParams = params
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-literal-subagents")]),
@@ -1032,8 +1178,9 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         var capturedParams: JSONValue?
         service.requestTransportOverride = { method, params in
-            XCTAssertEqual(method, "turn/start")
-            capturedParams = params
+            if method == "turn/start" {
+                capturedParams = params
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-shifted-subagents")]),
@@ -1060,8 +1207,9 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         var capturedParams: JSONValue?
         service.requestTransportOverride = { method, params in
-            XCTAssertEqual(method, "turn/start")
-            capturedParams = params
+            if method == "turn/start" {
+                capturedParams = params
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-trimmed-subagents")]),
@@ -1088,8 +1236,9 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         var capturedParams: JSONValue?
         service.requestTransportOverride = { method, params in
-            XCTAssertEqual(method, "turn/start")
-            capturedParams = params
+            if method == "turn/start" {
+                capturedParams = params
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object(["turnId": .string("turn-file-mention-subagents")]),
@@ -1145,7 +1294,12 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
     private func makeAccessoryState(
         hasAttachment: Bool = false,
-        hasSkillSelection: Bool = false
+        hasMentionedFile: Bool = false,
+        hasSkillSelection: Bool = false,
+        hasPluginSelection: Bool = false,
+        hasReviewSelection: Bool = false,
+        hasSubagentsSelection: Bool = false,
+        hasPlanSelection: Bool = false
     ) -> TurnComposerAccessoryState {
         let attachment = CodexImageAttachment(
             thumbnailBase64JPEG: "thumb",
@@ -1160,14 +1314,21 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             composerAttachments: hasAttachment ? [
                 TurnComposerImageAttachment(id: "attachment-1", state: .ready(attachment))
             ] : [],
-            composerMentionedFiles: [],
+            composerMentionedFiles: hasMentionedFile ? [
+                TurnComposerMentionedFile(fileName: "TurnView.swift", path: "Views/Turn/TurnView.swift")
+            ] : [],
             composerMentionedSkills: hasSkillSelection ? [
                 TurnComposerMentionedSkill(name: "check-code", path: "/skills/check-code/SKILL.md", description: "Review")
             ] : [],
-            composerMentionedPlugins: [],
-            composerReviewSelection: nil,
-            isSubagentsSelectionArmed: false,
-            isPlanModeArmed: false,
+            composerMentionedPlugins: hasPluginSelection ? [
+                TurnComposerMentionedPlugin(name: "plugin", path: "/plugins/plugin", displayName: "Plugin")
+            ] : [],
+            composerReviewSelection: hasReviewSelection ? TurnComposerReviewSelection(
+                command: .codeReview,
+                target: .uncommittedChanges
+            ) : nil,
+            isSubagentsSelectionArmed: hasSubagentsSelection,
+            isPlanModeArmed: hasPlanSelection,
             isVoiceRecording: false,
             voiceAudioLevels: [],
             voiceRecordingDuration: 0

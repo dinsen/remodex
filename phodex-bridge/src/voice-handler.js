@@ -13,6 +13,8 @@ const {
 } = require("./voice-audio");
 
 const CHATGPT_TRANSCRIPTIONS_URL = "https://chatgpt.com/backend-api/transcribe";
+const OPENAI_REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets";
+const DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1";
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 const MAX_DURATION_SECONDS = 150;
 const MAX_DURATION_MS = MAX_DURATION_SECONDS * 1_000;
@@ -166,6 +168,168 @@ function createVoiceHandler({
   return {
     handleVoiceRequest,
   };
+}
+
+// Creates short-lived Realtime credentials only after the phone has reached the
+// bridge through its existing paired, encrypted application channel. The bridge
+// never persists, logs, or forwards the long-lived OpenAI API key.
+function createRealtimeSessionHandler({
+  apiKey = process.env.REMODEX_OPENAI_REALTIME_API_KEY,
+  createClientSecret = null,
+  fetchImpl = globalThis.fetch,
+  sendCodexRequest = null,
+  logger = console,
+  logPrefix = "[remodex]",
+  now = Date.now,
+} = {}) {
+  const mintClientSecret = typeof createClientSecret === "function"
+    ? createClientSecret
+    : createConfiguredRealtimeClientSecret({ apiKey, fetchImpl });
+
+  function handleRealtimeSessionRequest(rawMessage, sendResponse, parsedMessage = null) {
+    const parsed = parsedMessage || parseJsonMessage(rawMessage);
+    if (!parsed || parsed.method !== "voice/realtime/session") {
+      return false;
+    }
+
+    const threadId = readString(parsed.params?.threadId);
+    const id = parsed.id;
+    Promise.resolve()
+      .then(async () => {
+        if (!threadId) {
+          throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can start.");
+        }
+        if (typeof mintClientSecret !== "function") {
+          throw voiceError(
+            "realtime_not_configured",
+            "Live Voice is not configured on this Mac bridge."
+          );
+        }
+
+        await verifyRealtimeThread(sendCodexRequest, threadId);
+
+        const result = await mintClientSecret({
+          model: DEFAULT_REALTIME_MODEL,
+          safetyIdentifier: createRealtimeSafetyIdentifier(threadId),
+        });
+        const clientSecret = readString(result?.value || result?.clientSecret);
+        const expiresAt = Number(result?.expires_at ?? result?.expiresAt);
+        if (!clientSecret || !isPlausibleFutureRealtimeExpiry(expiresAt, now)) {
+          throw voiceError("realtime_invalid_response", "The Live Voice session could not be started.");
+        }
+
+        logRealtimeEvent(logger, "log", logPrefix, "session issued", {
+          hasExpiry: true,
+        });
+        return { clientSecret, expiresAt };
+      })
+      .then((result) => {
+        if (id != null) {
+          sendResponse(JSON.stringify({ id, result }));
+        }
+      })
+      .catch((error) => {
+        logRealtimeEvent(logger, "error", logPrefix, "session failed", {
+          errorCode: error.errorCode || "realtime_session_failed",
+        });
+        if (id != null) {
+          sendResponse(JSON.stringify({
+            id,
+            error: {
+              code: -32000,
+              message: error.userMessage || "Live Voice could not be started.",
+              data: voiceErrorData(error),
+            },
+          }));
+        }
+      });
+    return true;
+  }
+
+  return { handleRealtimeSessionRequest };
+}
+
+async function verifyRealtimeThread(sendCodexRequest, threadId) {
+  if (typeof sendCodexRequest !== "function") {
+    throw voiceError("realtime_thread_validation_unavailable", "Live Voice could not verify this conversation.");
+  }
+
+  let response;
+  try {
+    response = await sendCodexRequest("thread/read", {
+      threadId,
+      includeTurns: false,
+    });
+  } catch {
+    throw voiceError("realtime_thread_validation_unavailable", "Live Voice could not verify this conversation.");
+  }
+
+  const thread = response?.thread;
+  const returnedThreadId = readString(thread?.id || thread?.threadId || thread?.thread_id);
+  if (!thread || returnedThreadId !== threadId || isInactiveRealtimeThread(thread)) {
+    throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can start.");
+  }
+}
+
+function isInactiveRealtimeThread(thread) {
+  if (thread.archived === true) {
+    return true;
+  }
+
+  const status = readString(thread?.status?.type || thread?.status);
+  return ["archived", "inactive", "deleted"].includes(status?.toLowerCase());
+}
+
+function isPlausibleFutureRealtimeExpiry(expiresAt, now) {
+  if (!Number.isFinite(expiresAt)) {
+    return false;
+  }
+
+  const nowSeconds = Number(now()) / 1_000;
+  return Number.isFinite(nowSeconds) && expiresAt > nowSeconds;
+}
+
+function createConfiguredRealtimeClientSecret({ apiKey, fetchImpl }) {
+  const normalizedApiKey = readString(apiKey);
+  if (!normalizedApiKey || typeof fetchImpl !== "function") {
+    return null;
+  }
+
+  return async ({ model, safetyIdentifier }) => {
+    let response;
+    try {
+      response = await fetchImpl(OPENAI_REALTIME_CLIENT_SECRETS_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${normalizedApiKey}`,
+          "Content-Type": "application/json",
+          "OpenAI-Safety-Identifier": safetyIdentifier,
+        },
+        body: JSON.stringify({
+          session: {
+            type: "realtime",
+            model,
+          },
+        }),
+      });
+    } catch {
+      throw voiceError("realtime_unavailable", "Live Voice is unavailable right now.");
+    }
+
+    if (!response?.ok) {
+      throw voiceError("realtime_provider_rejected", "Live Voice could not be started.");
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw voiceError("realtime_invalid_response", "The Live Voice session could not be started.");
+    }
+  };
+}
+
+function createRealtimeSafetyIdentifier(threadId) {
+  const { createHash } = require("crypto");
+  return `remodex-${createHash("sha256").update(threadId).digest("hex")}`;
 }
 
 function parseJsonMessage(rawMessage) {
@@ -502,11 +666,19 @@ function isChatGPTAuthMethod(value) {
 
 // Formats fixed safe fields only; callers must pass classifications, counts, and statuses.
 function logVoiceEvent(logger, level, logPrefix, event, fields = {}) {
+  logSafeVoiceEvent(logger, level, logPrefix, "transcribe", event, fields);
+}
+
+function logRealtimeEvent(logger, level, logPrefix, event, fields = {}) {
+  logSafeVoiceEvent(logger, level, logPrefix, "realtime", event, fields);
+}
+
+function logSafeVoiceEvent(logger, level, logPrefix, category, event, fields = {}) {
   const writer = resolveLogWriter(logger, level);
   const details = Object.entries(fields)
     .map(([key, value]) => `${key}=${formatLogValue(value)}`)
     .join(" ");
-  writer(`${logPrefix} voice transcribe ${event}${details ? ` ${details}` : ""}`);
+  writer(`${logPrefix} voice ${category} ${event}${details ? ` ${details}` : ""}`);
 }
 
 function resolveLogWriter(logger, level) {
@@ -603,6 +775,7 @@ async function resolveVoiceAuth(sendCodexRequest) {
 }
 
 module.exports = {
+  createRealtimeSessionHandler,
   createVoiceHandler,
   resolveVoiceAuth,
 };

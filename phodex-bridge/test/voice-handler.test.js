@@ -7,7 +7,195 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createVoiceHandler, resolveVoiceAuth } = require("../src/voice-handler");
+const {
+  createRealtimeSessionHandler,
+  createVoiceHandler,
+  resolveVoiceAuth,
+} = require("../src/voice-handler");
+
+test("voice/realtime/session returns only a short-lived client secret through the paired bridge", async () => {
+  const responses = [];
+  const loggerCapture = makeLogger();
+  const createClientSecretCalls = [];
+  const handler = createRealtimeSessionHandler({
+    logger: loggerCapture.logger,
+    sendCodexRequest: activeThreadRequest(),
+    createClientSecret: async (request) => {
+      createClientSecretCalls.push(request);
+      return {
+        value: "ephemeral-client-secret",
+        expires_at: 1_800_000_000,
+      };
+    },
+  });
+
+  const handled = handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "realtime-1",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => {
+    responses.push(JSON.parse(response));
+  });
+
+  assert.equal(handled, true);
+  await tick();
+
+  assert.equal(createClientSecretCalls.length, 1);
+  assert.equal(createClientSecretCalls[0].model, "gpt-realtime-2.1");
+  assert.match(createClientSecretCalls[0].safetyIdentifier, /^remodex-[a-f0-9]{64}$/);
+  assert.equal(createClientSecretCalls[0].safetyIdentifier.includes("thread-123"), false);
+  assert.deepEqual(responses, [{
+    id: "realtime-1",
+    result: {
+      clientSecret: "ephemeral-client-secret",
+      expiresAt: 1_800_000_000,
+    },
+  }]);
+  assert.equal(loggerCapture.messages.join("\n").includes("ephemeral-client-secret"), false);
+});
+
+test("voice/realtime/session is unavailable until a local bridge credential provider is configured", async () => {
+  const responses = [];
+  const handler = createRealtimeSessionHandler({ apiKey: "" });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "realtime-unconfigured",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => {
+    responses.push(JSON.parse(response));
+  });
+
+  await tick();
+
+  assert.equal(responses[0].error?.data?.errorCode, "realtime_not_configured");
+  assert.match(responses[0].error?.message || "", /not configured/i);
+});
+
+test("voice/realtime/session mints the client secret with the Mac-only credential", async () => {
+  const responses = [];
+  const calls = [];
+  const loggerCapture = makeLogger();
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    logger: loggerCapture.logger,
+    sendCodexRequest: activeThreadRequest(),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return {
+        ok: true,
+        async json() {
+          return { value: "client-secret", expires_at: 1_800_000_000 };
+        },
+      };
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "realtime-configured",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => {
+    responses.push(JSON.parse(response));
+  });
+
+  await tick();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.openai.com/v1/realtime/client_secrets");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer local-only-api-key");
+  assert.equal(calls[0].options.headers["OpenAI-Safety-Identifier"].includes("thread-123"), false);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    session: { type: "realtime", model: "gpt-realtime-2.1" },
+  });
+  assert.equal(responses[0].result?.clientSecret, "client-secret");
+  assert.equal(loggerCapture.messages.join("\n").includes("local-only-api-key"), false);
+  assert.equal(loggerCapture.messages.join("\n").includes("client-secret"), false);
+});
+
+test("voice/realtime/session rejects unscoped requests before creating a client secret", async () => {
+  const responses = [];
+  let createClientSecretCalls = 0;
+  const handler = createRealtimeSessionHandler({
+    sendCodexRequest: activeThreadRequest(),
+    createClientSecret: async () => {
+      createClientSecretCalls += 1;
+      return { value: "should-not-be-created", expires_at: 1_800_000_000 };
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "realtime-missing-thread",
+    method: "voice/realtime/session",
+    params: {},
+  }), (response) => {
+    responses.push(JSON.parse(response));
+  });
+
+  await tick();
+
+  assert.equal(createClientSecretCalls, 0);
+  assert.equal(responses[0].error?.data?.errorCode, "invalid_realtime_scope");
+});
+
+test("voice/realtime/session rejects an unknown or inactive Codex thread before creating a client secret", async () => {
+  for (const [name, response] of [
+    ["unknown", { thread: null }],
+    ["inactive", { thread: { id: "thread-123", archived: true } }],
+  ]) {
+    const responses = [];
+    let createClientSecretCalls = 0;
+    const codexCalls = [];
+    const handler = createRealtimeSessionHandler({
+      sendCodexRequest: async (method, params) => {
+        codexCalls.push({ method, params });
+        return response;
+      },
+      createClientSecret: async () => {
+        createClientSecretCalls += 1;
+        return { value: "should-not-be-created", expires_at: 1_800_000_000 };
+      },
+    });
+
+    handler.handleRealtimeSessionRequest(JSON.stringify({
+      id: `realtime-${name}-thread`,
+      method: "voice/realtime/session",
+      params: { threadId: "thread-123" },
+    }), (rawResponse) => responses.push(JSON.parse(rawResponse)));
+
+    await tick();
+
+    assert.deepEqual(codexCalls, [{
+      method: "thread/read",
+      params: { threadId: "thread-123", includeTurns: false },
+    }]);
+    assert.equal(createClientSecretCalls, 0);
+    assert.equal(responses[0].error?.data?.errorCode, "invalid_realtime_scope");
+  }
+});
+
+test("voice/realtime/session rejects an already expired client secret", async () => {
+  const responses = [];
+  const handler = createRealtimeSessionHandler({
+    sendCodexRequest: activeThreadRequest(),
+    now: () => 1_700_000_000_000,
+    createClientSecret: async () => ({
+      value: "expired-client-secret",
+      expires_at: 1_699_999_999,
+    }),
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "realtime-expired-secret",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (rawResponse) => responses.push(JSON.parse(rawResponse)));
+
+  await tick();
+
+  assert.equal(responses[0].error?.data?.errorCode, "realtime_invalid_response");
+  assert.equal(responses[0].result, undefined);
+});
 
 test("voice/transcribe returns transcribed text without exposing auth tokens", async () => {
   const responses = [];
@@ -1337,6 +1525,14 @@ function makeLogger() {
 
 function tick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function activeThreadRequest() {
+  return async (method, params) => {
+    assert.equal(method, "thread/read");
+    assert.deepEqual(params, { threadId: "thread-123", includeTurns: false });
+    return { thread: { id: "thread-123" } };
+  };
 }
 
 function delay(ms) {

@@ -891,8 +891,11 @@ test("bridge routes desktop-owned JSONL thread turn starts to Codex Desktop IPC"
     (frame) => frame.method === "thread-follower-start-turn"
   );
   assert.equal(startTurnFrame.params.conversationId, "thread-desktop-turn");
-  assert.equal(startTurnFrame.params.threadId, "thread-desktop-turn");
-  assert.equal(startTurnFrame.params.input, "Continue this desktop thread");
+  assert.equal(startTurnFrame.params.turnStart.request.threadId, "thread-desktop-turn");
+  assert.equal(startTurnFrame.params.turnStart.request.input, "Continue this desktop thread");
+  assert.deepEqual(startTurnFrame.params.turnStart.context, {
+    inheritThreadSettings: true,
+  });
   assert.equal(fakeCodex.sent.some((message) => message.method === "turn/start"), false);
 
   const response = await waitForMessage(

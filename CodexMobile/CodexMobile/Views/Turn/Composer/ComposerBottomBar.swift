@@ -27,6 +27,7 @@ struct ComposerBottomBar: View {
     let isThreadRunning: Bool
     let showsSendButton: Bool
     let voicePhaseOneControl: VoiceComposerPhaseOne.TrailingControl
+    let isVoiceSessionActive: Bool
     let voiceButtonPresentation: TurnComposerVoiceButtonPresentation
     let selectedAccessMode: CodexAccessMode
     let contextWindowUsage: ContextWindowUsage?
@@ -39,6 +40,7 @@ struct ComposerBottomBar: View {
     let onTapAddImage: () -> Void
     let onTapTakePhoto: () -> Void
     let onTapVoice: () -> Void
+    let onTapVoiceWave: () -> Void
     let onSetPlanModeArmed: (Bool) -> Void
     let onResumeQueue: () -> Void
     let onStopTurn: (String?) -> Void
@@ -146,7 +148,10 @@ struct ComposerBottomBar: View {
             }
 
             if voicePhaseOneControl == .voiceWave {
-                ComposerVoiceWaveButton()
+                ComposerVoiceWaveButton(
+                    isVoiceSessionActive: isVoiceSessionActive,
+                    onTap: onTapVoiceWave
+                )
                     .padding(.leading, 4)
             } else if showsSendButton {
                 Button {

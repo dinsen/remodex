@@ -127,6 +127,7 @@ struct TurnComposerView: View, Equatable {
     // from the bottom bar) so it survives the composer collapsing mid-flow.
     @State private var showsRuntimeOverlay = false
     @AppStorage(VoicePreference.storageKey) private var isVoiceEnabled = false
+    @State private var voicePhaseTwoController = VoiceComposerPhaseTwoController()
 
     @Environment(\.pinnedPlanAccessory) private var pinnedPlanAccessory
 
@@ -145,7 +146,11 @@ struct TurnComposerView: View, Equatable {
     }
 
     private var voicePhaseOneControl: VoiceComposerPhaseOne.TrailingControl {
-        VoiceComposerPhaseOne.trailingControl(isVoiceEnabled: isVoiceEnabled, input: input)
+        VoiceComposerPhaseOne.trailingControl(
+            isVoiceEnabled: isVoiceEnabled,
+            hasSendableContent: accessoryState.hasSendableContent(input: input),
+            isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive
+        )
     }
 
     // Collapse to a single glass capsule whenever the keyboard is closed. Only
@@ -345,7 +350,11 @@ struct TurnComposerView: View, Equatable {
                             .frame(width: collapsedControlTapTarget, height: collapsedControlTapTarget)
                             .transition(.opacity)
                         } else if voicePhaseOneControl == .voiceWave {
-                            ComposerVoiceWaveButton(tapTargetSide: collapsedControlTapTarget)
+                            ComposerVoiceWaveButton(
+                                isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive,
+                                onTap: handleVoiceWaveTap,
+                                tapTargetSide: collapsedControlTapTarget
+                            )
                                 .frame(width: collapsedControlTapTarget, height: collapsedControlTapTarget)
                                 .transition(.opacity)
                         }
@@ -414,6 +423,22 @@ struct TurnComposerView: View, Equatable {
             }
             .zIndex(2)
         }
+        .alert("Microphone access needed", isPresented: permissionExplanationIsPresented) {
+            Button("Open Settings") {
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            }
+            Button("OK", role: .cancel) {
+                voicePhaseTwoController.permissionExplanation = nil
+            }
+        } message: {
+            Text(voicePhaseTwoController.permissionExplanation ?? "")
+        }
+        .onChange(of: isVoiceEnabled) { _, isEnabled in
+            if !isEnabled {
+                voicePhaseTwoController.disableVoice()
+            }
+        }
     }
 
     private var expandedBottomBar: some View {
@@ -432,6 +457,7 @@ struct TurnComposerView: View, Equatable {
             isThreadRunning: isThreadRunning,
             showsSendButton: showsSendButton,
             voicePhaseOneControl: voicePhaseOneControl,
+            isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive,
             voiceButtonPresentation: voiceButtonPresentation,
             selectedAccessMode: selectedAccessMode,
             contextWindowUsage: contextWindowUsage,
@@ -444,6 +470,7 @@ struct TurnComposerView: View, Equatable {
             onTapAddImage: onTapAddImage,
             onTapTakePhoto: onTapTakePhoto,
             onTapVoice: onTapVoice,
+            onTapVoiceWave: handleVoiceWaveTap,
             onSetPlanModeArmed: onSetPlanModeArmed,
             onResumeQueue: onResumeQueue,
             onStopTurn: onStopTurn,
@@ -455,6 +482,23 @@ struct TurnComposerView: View, Equatable {
             },
             onSend: onSend
         )
+    }
+
+    private var permissionExplanationIsPresented: Binding<Bool> {
+        Binding(
+            get: { voicePhaseTwoController.permissionExplanation != nil },
+            set: { isPresented in
+                if !isPresented {
+                    voicePhaseTwoController.permissionExplanation = nil
+                }
+            }
+        )
+    }
+
+    private func handleVoiceWaveTap() {
+        Task { @MainActor in
+            await voicePhaseTwoController.handleWaveTap()
+        }
     }
 
     // MARK: - Runtime picker hosting

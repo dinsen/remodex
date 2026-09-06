@@ -2060,21 +2060,33 @@ function createDesktopIpcActionFollower({
     const turnStartParams = normalized && typeof normalized === "object" && !Array.isArray(normalized)
       ? normalized
       : route.turnStartParams;
-    const request = cloneJSON(turnStartParams);
+    return {
+      params: buildThreadFollowerStartTurnParams(
+        route.threadId,
+        route.senderRequestId,
+        turnStartParams
+      ),
+      turnStartParams,
+    };
+  }
+
+  function buildThreadFollowerStartTurnParams(threadId, senderRequestId, turnStartParams) {
+    const request = cloneJSON(
+      turnStartParams && typeof turnStartParams === "object" && !Array.isArray(turnStartParams)
+        ? turnStartParams
+        : {}
+    );
     if (!readString(request.clientUserMessageId)) {
-      request.clientUserMessageId = route.senderRequestId;
+      request.clientUserMessageId = senderRequestId;
     }
     return {
-      params: {
-        ...route.params,
-        turnStart: {
-          request,
-          context: {
-            inheritThreadSettings: true,
-          },
+      conversationId: readString(threadId),
+      turnStart: {
+        request,
+        context: {
+          inheritThreadSettings: true,
         },
       },
-      turnStartParams,
     };
   }
 

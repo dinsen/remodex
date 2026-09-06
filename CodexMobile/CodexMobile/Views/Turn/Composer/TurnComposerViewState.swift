@@ -4,6 +4,7 @@
 // Exports: TurnComposerAutocompleteState, TurnComposerAccessoryState
 // Depends on: SwiftUI, TurnComposer command/attachment/message models
 
+import AVFAudio
 import SwiftUI
 
 enum VoicePreference {
@@ -25,9 +26,85 @@ enum VoiceComposerPhaseOne {
         case voiceWave
     }
 
-    static func trailingControl(isVoiceEnabled: Bool, input: String) -> TrailingControl {
+    static func trailingControl(
+        isVoiceEnabled: Bool,
+        hasSendableContent: Bool,
+        isVoiceSessionActive: Bool
+    ) -> TrailingControl {
         guard isVoiceEnabled else { return .normal }
-        return input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .voiceWave : .send
+        if isVoiceSessionActive { return .voiceWave }
+        return hasSendableContent ? .send : .voiceWave
+    }
+}
+
+enum VoiceMicrophonePermission {
+    case granted
+    case denied
+    case restricted
+}
+
+enum VoiceMicrophonePermissionRequest {
+    static func request() async -> VoiceMicrophonePermission {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:
+            return .granted
+        case .denied:
+            return .denied
+        case .undetermined:
+            return await withCheckedContinuation { continuation in
+                AVAudioApplication.requestRecordPermission { isGranted in
+                    continuation.resume(returning: isGranted ? .granted : .denied)
+                }
+            }
+        @unknown default:
+            return .restricted
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class VoiceComposerPhaseTwoController {
+    typealias PermissionRequester = () async -> VoiceMicrophonePermission
+
+    private let requestPermission: PermissionRequester
+    private var activePermissionRequestID: UUID?
+    private(set) var isVoiceSessionActive = false
+    var permissionExplanation: String?
+
+    init(requestPermission: @escaping PermissionRequester = VoiceMicrophonePermissionRequest.request) {
+        self.requestPermission = requestPermission
+    }
+
+    func handleWaveTap() async {
+        if isVoiceSessionActive {
+            endVoiceSession()
+            return
+        }
+
+        permissionExplanation = nil
+        let requestID = UUID()
+        activePermissionRequestID = requestID
+        switch await requestPermission() {
+        case .granted:
+            guard activePermissionRequestID == requestID else { return }
+            isVoiceSessionActive = true
+            activePermissionRequestID = nil
+        case .denied, .restricted:
+            guard activePermissionRequestID == requestID else { return }
+            isVoiceSessionActive = false
+            permissionExplanation = "Allow Microphone access for Remodex in Settings to use Voice."
+            activePermissionRequestID = nil
+        }
+    }
+
+    func endVoiceSession() {
+        isVoiceSessionActive = false
+        activePermissionRequestID = nil
+    }
+
+    func disableVoice() {
+        endVoiceSession()
     }
 }
 

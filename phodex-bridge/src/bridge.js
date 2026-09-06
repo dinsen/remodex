@@ -41,7 +41,11 @@ const { handleAutomationRequest } = require("./automation-handler");
 const { handleRuntimeDefaultsRequest } = require("./runtime-defaults-handler");
 const { handleHostPinsRequest } = require("./host-pins-handler");
 const { createNotificationsHandler } = require("./notifications-handler");
-const { createVoiceHandler, resolveVoiceAuth } = require("./voice-handler");
+const {
+  createRealtimeSessionHandler,
+  createVoiceHandler,
+  resolveVoiceAuth,
+} = require("./voice-handler");
 const {
   composeSanitizedAuthStatusFromSettledResults,
 } = require("./account-status");
@@ -909,6 +913,10 @@ function startBridge({
     sendCodexRequest,
     logPrefix: "[remodex]",
   });
+  const realtimeSessionHandler = createRealtimeSessionHandler({
+    sendCodexRequest,
+    logPrefix: "[remodex]",
+  });
   const bridgeStatusPublisher = createBridgeStatusPublisher({
     onBridgeStatus,
     getCodexLaunchState: () => codexLaunchState,
@@ -1229,6 +1237,9 @@ function startBridge({
       return;
     }
     if (voiceHandler.handleVoiceRequest(rawMessage, sendApplicationResponse, parsedMessage)) {
+      return;
+    }
+    if (realtimeSessionHandler.handleRealtimeSessionRequest(rawMessage, sendApplicationResponse, parsedMessage)) {
       return;
     }
     if (handleThreadContextRequest(rawMessage, sendApplicationResponse, parsedMessage)) {

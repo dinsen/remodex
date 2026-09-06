@@ -171,25 +171,25 @@ struct ComposerVoiceButton: View {
     }
 }
 
-// First-phase Voice affordance only. Its action is deliberately empty: it
-// must not request microphone permission or begin an audio session.
 struct ComposerVoiceWaveButton: View {
+    let isVoiceSessionActive: Bool
+    let onTap: () -> Void
     var circleDiameter: CGFloat = 32
     var tapTargetSide: CGFloat? = nil
 
     var body: some View {
-        Button(action: {}) {
+        Button(action: onTap) {
             RemodexCircleBadge(
-                systemName: "waveform",
-                foreground: .primary,
-                background: Color(.systemGray5),
+                systemName: isVoiceSessionActive ? "stop.fill" : "waveform",
+                foreground: isVoiceSessionActive ? Color(.systemBackground) : .primary,
+                background: isVoiceSessionActive ? Color(.systemRed) : Color(.systemGray5),
                 diameter: circleDiameter
             )
             .frame(width: tapTargetSide, height: tapTargetSide)
             .contentShape(Circle())
         }
-        .accessibilityLabel("Voice")
-        .accessibilityHint("Voice input is coming soon")
+        .accessibilityLabel(isVoiceSessionActive ? "End Voice" : "Voice")
+        .accessibilityHint(isVoiceSessionActive ? "Ends the local Voice session" : "Requests microphone access")
     }
 }
 

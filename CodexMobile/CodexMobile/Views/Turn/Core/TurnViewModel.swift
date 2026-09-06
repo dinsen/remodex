@@ -1540,7 +1540,7 @@ final class TurnViewModel {
         id attachmentID: String,
         viewModel: TurnViewModel?,
         expectedDraftMergeRevision: Int,
-        expectedDraftMergeEpoch: Int = 0,
+        expectedDraftMergeEpoch: Int,
         attachmentOrder: [String] = [],
         codex: CodexService,
         threadID: String
