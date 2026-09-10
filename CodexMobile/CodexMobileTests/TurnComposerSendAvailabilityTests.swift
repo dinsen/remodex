@@ -154,6 +154,182 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertFalse(controller.isVoiceSessionActive)
     }
 
+    func testRealtimeVoiceSessionRequestUsesThreadAndReturnsEphemeralSession() async throws {
+        let service = makeService()
+        service.isConnected = true
+        var requestedMethod: String?
+        var requestedThreadID: String?
+        service.requestTransportOverride = { method, params in
+            requestedMethod = method
+            requestedThreadID = params?.objectValue?["threadId"]?.stringValue
+            return RPCMessage(
+                id: .string("voice-session-response"),
+                result: .object([
+                    "clientSecret": .string("ephemeral-secret"),
+                    "expiresAt": .double(Date().timeIntervalSince1970 + 60)
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        let session = try await service.requestRealtimeVoiceSession(threadID: "thread-42")
+
+        XCTAssertEqual(requestedMethod, "voice/realtime/session")
+        XCTAssertEqual(requestedThreadID, "thread-42")
+        XCTAssertEqual(session.clientSecret, "ephemeral-secret")
+        XCTAssertTrue(session.expiresAt > Date())
+    }
+
+    func testRealtimeVoiceSessionRequestRejectsExpiredSession() async {
+        let service = makeService()
+        service.isConnected = true
+        service.requestTransportOverride = { _, _ in
+            RPCMessage(
+                id: .string("voice-session-response"),
+                result: .object([
+                    "clientSecret": .string("expired-secret"),
+                    "expiresAt": .double(Date().timeIntervalSince1970 - 1)
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        do {
+            _ = try await service.requestRealtimeVoiceSession(threadID: "thread-42")
+            XCTFail("Expected an expired realtime session to be rejected")
+        } catch {
+            XCTAssertTrue(error is CodexServiceError)
+        }
+    }
+
+    func testRealtimeVoiceSessionRequestRejectsMissingThreadID() async {
+        let service = makeService()
+        service.isConnected = true
+        var didSendRequest = false
+        service.requestTransportOverride = { _, _ in
+            didSendRequest = true
+            return RPCMessage(
+                id: .string("voice-session-response"),
+                result: .object([:]),
+                includeJSONRPC: false
+            )
+        }
+
+        do {
+            _ = try await service.requestRealtimeVoiceSession(threadID: "  ")
+            XCTFail("Expected a missing thread id to be rejected")
+        } catch {
+            XCTAssertTrue(error is CodexServiceError)
+        }
+
+        XCTAssertFalse(didSendRequest)
+    }
+
+    func testRealtimeVoiceConnectionUsesEphemeralSecretAndClosesSocket() async throws {
+        let socket = TestRealtimeVoiceSocket()
+        let session = CodexRealtimeVoiceSession(
+            clientSecret: "ephemeral-secret",
+            expiresAt: Date().addingTimeInterval(60)
+        )
+        var capturedRequest: URLRequest?
+        let connection = CodexRealtimeVoiceConnection(session: session) { request in
+            capturedRequest = request
+            return socket
+        }
+
+        try await connection.connect()
+
+        XCTAssertEqual(connection.state, .connected)
+        XCTAssertEqual(socket.connectCount, 1)
+        XCTAssertEqual(
+            capturedRequest?.url?.absoluteString,
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+        )
+        XCTAssertEqual(
+            capturedRequest?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer ephemeral-secret"
+        )
+        XCTAssertEqual(
+            capturedRequest?.value(forHTTPHeaderField: "OpenAI-Beta"),
+            "realtime=v1"
+        )
+
+        connection.close()
+
+        XCTAssertEqual(connection.state, .closed)
+        XCTAssertEqual(socket.closeCount, 1)
+    }
+
+    func testVoicePhaseTwoStartsAndStopsRealtimeConnectionAfterPermission() async {
+        let socket = TestRealtimeVoiceSocket()
+        let connection = CodexRealtimeVoiceConnection(
+            session: CodexRealtimeVoiceSession(
+                clientSecret: "ephemeral-secret",
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        ) { _ in socket }
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
+
+        await controller.handleWaveTap(isVoiceEnabled: true) {
+            try await connection.connect()
+            return connection
+        }
+
+        XCTAssertTrue(controller.isVoiceSessionActive)
+        XCTAssertEqual(connection.state, .connected)
+        XCTAssertEqual(socket.connectCount, 1)
+
+        await controller.handleWaveTap(isVoiceEnabled: true) {
+            XCTFail("Starter should not be called while stopping")
+            return connection
+        }
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(connection.state, .closed)
+        XCTAssertEqual(socket.closeCount, 1)
+    }
+
+    func testVoicePhaseTwoDoesNotStartRealtimeWhenVoiceIsDisabled() async {
+        var permissionRequestCount = 0
+        var starterCallCount = 0
+        let controller = VoiceComposerPhaseTwoController(requestPermission: {
+            permissionRequestCount += 1
+            return .granted
+        })
+
+        await controller.handleWaveTap(isVoiceEnabled: false) {
+            starterCallCount += 1
+            throw CodexServiceError.invalidInput("Should not start")
+        }
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(permissionRequestCount, 0)
+        XCTAssertEqual(starterCallCount, 0)
+    }
+
+    func testVoicePhaseTwoReportsConnectionFailureWithoutActivatingVoice() async {
+        let socket = TestRealtimeVoiceSocket()
+        socket.connectError = CodexServiceError.disconnected
+        let connection = CodexRealtimeVoiceConnection(
+            session: CodexRealtimeVoiceSession(
+                clientSecret: "ephemeral-secret",
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        ) { _ in socket }
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
+
+        await controller.handleWaveTap(isVoiceEnabled: true) {
+            try await connection.connect()
+            return connection
+        }
+
+        XCTAssertFalse(controller.isVoiceSessionActive)
+        XCTAssertEqual(connection.state, .failed)
+        XCTAssertEqual(socket.connectCount, 1)
+        XCTAssertEqual(socket.closeCount, 1)
+        XCTAssertNotNil(controller.voiceErrorExplanation)
+    }
+
     func testSendDisabledWhenDisconnected() {
         let state = makeState(isConnected: false)
         XCTAssertTrue(state.isSendDisabled)
@@ -1416,5 +1592,23 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         // Keep instances alive for process lifetime so assertions remain deterministic.
         Self.retainedServices.append(service)
         return service
+    }
+}
+
+@MainActor
+private final class TestRealtimeVoiceSocket: CodexRealtimeVoiceSocket {
+    var connectCount = 0
+    var closeCount = 0
+    var connectError: Error?
+
+    func connect() async throws {
+        connectCount += 1
+        if let connectError {
+            throw connectError
+        }
+    }
+
+    func close() {
+        closeCount += 1
     }
 }

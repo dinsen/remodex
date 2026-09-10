@@ -200,6 +200,9 @@ struct TurnComposerHostView: View {
             onTapAddImage: { viewModel.openPhotoLibraryPicker(codex: codex) },
             onTapTakePhoto: { viewModel.openCamera(codex: codex) },
             onTapVoice: onTapVoice,
+            onStartVoiceSession: {
+                try await codex.openRealtimeVoiceConnection(threadID: thread.id)
+            },
             onCancelVoiceRecording: onCancelVoiceRecording,
             onSetPlanModeArmed: { isArmed in
                 viewModel.setPlanModeArmed(isArmed)

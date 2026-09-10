@@ -66,30 +66,60 @@ enum VoiceMicrophonePermissionRequest {
 @Observable
 final class VoiceComposerPhaseTwoController {
     typealias PermissionRequester = () async -> VoiceMicrophonePermission
+    typealias VoiceSessionStarter = () async throws -> CodexRealtimeVoiceConnection
 
     private let requestPermission: PermissionRequester
     private var activePermissionRequestID: UUID?
+    private var realtimeConnection: CodexRealtimeVoiceConnection?
     private(set) var isVoiceSessionActive = false
     var permissionExplanation: String?
+    var voiceErrorExplanation: String?
 
     init(requestPermission: @escaping PermissionRequester = VoiceMicrophonePermissionRequest.request) {
         self.requestPermission = requestPermission
     }
 
-    func handleWaveTap() async {
+    func handleWaveTap(
+        isVoiceEnabled: Bool = true,
+        startSession: VoiceSessionStarter? = nil
+    ) async {
         if isVoiceSessionActive {
             endVoiceSession()
             return
         }
 
+        guard isVoiceEnabled else {
+            return
+        }
+
         permissionExplanation = nil
+        voiceErrorExplanation = nil
         let requestID = UUID()
         activePermissionRequestID = requestID
         switch await requestPermission() {
         case .granted:
             guard activePermissionRequestID == requestID else { return }
-            isVoiceSessionActive = true
-            activePermissionRequestID = nil
+            guard let startSession else {
+                isVoiceSessionActive = true
+                activePermissionRequestID = nil
+                return
+            }
+
+            do {
+                let connection = try await startSession()
+                guard activePermissionRequestID == requestID, isVoiceEnabled else {
+                    connection.close()
+                    return
+                }
+                realtimeConnection = connection
+                isVoiceSessionActive = true
+                activePermissionRequestID = nil
+            } catch {
+                guard activePermissionRequestID == requestID else { return }
+                isVoiceSessionActive = false
+                activePermissionRequestID = nil
+                voiceErrorExplanation = "Live Voice could not be started. Check the bridge connection and try again."
+            }
         case .denied, .restricted:
             guard activePermissionRequestID == requestID else { return }
             isVoiceSessionActive = false
@@ -99,6 +129,8 @@ final class VoiceComposerPhaseTwoController {
     }
 
     func endVoiceSession() {
+        realtimeConnection?.close()
+        realtimeConnection = nil
         isVoiceSessionActive = false
         activePermissionRequestID = nil
     }

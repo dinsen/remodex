@@ -77,6 +77,11 @@ struct TurnComposerView: View, Equatable {
     let onTapAddImage: () -> Void
     let onTapTakePhoto: () -> Void
     let onTapVoice: () -> Void
+    // Starts the short-lived Realtime session after microphone permission is granted.
+    // The composer keeps this injectable so previews/tests never open a network socket.
+    var onStartVoiceSession: () async throws -> CodexRealtimeVoiceConnection = {
+        throw CodexServiceError.invalidInput("Live Voice is unavailable.")
+    }
     let onCancelVoiceRecording: () -> Void
     let onSetPlanModeArmed: (Bool) -> Void
     let onRemoveAttachment: (String) -> Void
@@ -423,21 +428,27 @@ struct TurnComposerView: View, Equatable {
             }
             .zIndex(2)
         }
-        .alert("Microphone access needed", isPresented: permissionExplanationIsPresented) {
-            Button("Open Settings") {
-                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-                UIApplication.shared.open(url)
+        .alert(voiceAlertTitle, isPresented: voiceAlertIsPresented) {
+            if voicePhaseTwoController.permissionExplanation != nil {
+                Button("Open Settings") {
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                    UIApplication.shared.open(url)
+                }
             }
             Button("OK", role: .cancel) {
+                voicePhaseTwoController.voiceErrorExplanation = nil
                 voicePhaseTwoController.permissionExplanation = nil
             }
         } message: {
-            Text(voicePhaseTwoController.permissionExplanation ?? "")
+            Text(voiceAlertMessage)
         }
         .onChange(of: isVoiceEnabled) { _, isEnabled in
             if !isEnabled {
                 voicePhaseTwoController.disableVoice()
             }
+        }
+        .onDisappear {
+            voicePhaseTwoController.endVoiceSession()
         }
     }
 
@@ -484,12 +495,28 @@ struct TurnComposerView: View, Equatable {
         )
     }
 
-    private var permissionExplanationIsPresented: Binding<Bool> {
+    private var voiceAlertTitle: String {
+        voicePhaseTwoController.permissionExplanation == nil
+            ? "Voice unavailable"
+            : "Microphone access needed"
+    }
+
+    private var voiceAlertMessage: String {
+        voicePhaseTwoController.permissionExplanation
+            ?? voicePhaseTwoController.voiceErrorExplanation
+            ?? ""
+    }
+
+    private var voiceAlertIsPresented: Binding<Bool> {
         Binding(
-            get: { voicePhaseTwoController.permissionExplanation != nil },
+            get: {
+                voicePhaseTwoController.permissionExplanation != nil
+                    || voicePhaseTwoController.voiceErrorExplanation != nil
+            },
             set: { isPresented in
                 if !isPresented {
                     voicePhaseTwoController.permissionExplanation = nil
+                    voicePhaseTwoController.voiceErrorExplanation = nil
                 }
             }
         )
@@ -497,7 +524,10 @@ struct TurnComposerView: View, Equatable {
 
     private func handleVoiceWaveTap() {
         Task { @MainActor in
-            await voicePhaseTwoController.handleWaveTap()
+            await voicePhaseTwoController.handleWaveTap(
+                isVoiceEnabled: isVoiceEnabled,
+                startSession: onStartVoiceSession
+            )
         }
     }
 
