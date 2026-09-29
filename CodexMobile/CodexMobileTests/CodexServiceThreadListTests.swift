@@ -11,6 +11,18 @@ import XCTest
 final class CodexServiceThreadListTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
+    func testThreadListRevisionTracksThreadListMutations() {
+        let service = makeService()
+
+        XCTAssertEqual(service.threadListRevision, 0)
+
+        service.threads = [CodexThread(id: "thread", title: "Original")]
+        XCTAssertEqual(service.threadListRevision, 1)
+
+        service.threads[0].title = "Renamed"
+        XCTAssertEqual(service.threadListRevision, 2)
+    }
+
     func testApplyingSectionSnapshotClearsPriorMemberOmittedByRefresh() {
         let service = makeService()
         let planning = CodexThreadSection(id: "planning", name: "Planning")
@@ -32,6 +44,32 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertNil(service.thread(for: "moved-out")?.section)
         XCTAssertEqual(service.thread(for: "current-member")?.section, planning)
         XCTAssertEqual(service.thread(for: "unrelated")?.section, other)
+    }
+
+    func testRegularThreadRefreshPreservesHydratedSectionMetadataWhenItOmitsSection() {
+        let service = makeService()
+        let privateSection = CodexThreadSection(id: "private", name: "Private")
+        let hydratedThread = CodexThread(
+            id: "thread",
+            title: "Thread",
+            section: privateSection,
+            sectionEnteredAt: Date(timeIntervalSince1970: 1_700_000_000),
+            cwd: "/Users/me/work/app"
+        )
+        let regularListThread = CodexThread(
+            id: "thread",
+            title: "Thread",
+            cwd: "/Users/me/work/app"
+        )
+
+        let merged = service.mergedThread(
+            regularListThread,
+            with: hydratedThread,
+            treatAsServerState: true
+        )
+
+        XCTAssertEqual(merged.section, privateSection)
+        XCTAssertEqual(merged.sectionEnteredAt, hydratedThread.sectionEnteredAt)
     }
 
     func testSectionHydrationShowsSectionOnlyThreadsInNativeOrderWithoutHidingProjects() async throws {
@@ -86,9 +124,45 @@ final class CodexServiceThreadListTests: XCTestCase {
             "section-first",
         ])
         XCTAssertEqual(
-            Set(groups.first(where: { $0.id == "project:/Users/me/work/app" })?.threads.map(\.id) ?? []),
+            Set(groups.first(where: {
+                $0.parentSectionID == "planning" && $0.projectPath == "/Users/me/work/app"
+            })?.threads.map(\.id) ?? []),
             Set(["section-second", "section-first"])
         )
+    }
+
+    func testFetchSidebarSectionsDecodesDesktopProjectMembership() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.requestTransportOverride = { method, _ in
+            XCTAssertEqual(method, "project/sidebarSections")
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "sections": .array([
+                        .object([
+                            "id": .string("private"),
+                            "name": .string("Private"),
+                            "projects": .array([
+                                .object([
+                                    "id": .string("project:/Users/me/work/app"),
+                                    "label": .string("app"),
+                                    "path": .string("/Users/me/work/app"),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        let sections = try await service.fetchSidebarSections()
+
+        XCTAssertEqual(sections.map(\.id), ["private"])
+        XCTAssertEqual(sections[0].name, "Private")
+        XCTAssertEqual(sections[0].projects.map(\.path), ["/Users/me/work/app"])
     }
 
     func testDecodeThreadSectionMetadata() throws {

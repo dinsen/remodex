@@ -11,6 +11,10 @@ struct BridgeCLIInvocation {
     let nodePath: String
     let remodexPath: String
 
+    func arguments(_ arguments: [String]) -> [String] {
+        [remodexPath] + arguments
+    }
+
     // Executes the actual CLI entrypoint via an absolute Node binary so GUI PATH drift does not break nvm installs.
     func command(_ arguments: [String]) -> String {
         ([shellQuoted(nodePath), shellQuoted(remodexPath)] + arguments).joined(separator: " ")
@@ -38,8 +42,15 @@ enum BridgeControlError: LocalizedError {
 }
 
 final class ShellCommandRunner {
-    // Runs a login shell so Homebrew, nvm, asdf, and other user PATH customizations resolve naturally.
-    func run(command: String, environment: [String: String] = [:]) async throws -> ShellCommandResult {
+    // Runs a concrete executable without invoking a shell or loading user
+    // startup files. The LaunchAgent/GUI process PATH is intentionally kept as
+    // the source of command discovery; callers pass absolute paths whenever a
+    // CLI has already been resolved.
+    func run(
+        executablePath: String,
+        arguments: [String] = [],
+        environment: [String: String] = [:]
+    ) async throws -> ShellCommandResult {
         try await Task.detached(priority: .userInitiated) {
             let process = Process()
             let stdoutPipe = Pipe()
@@ -51,12 +62,10 @@ final class ShellCommandRunner {
                 stderrPipe.fileHandleForReading.readDataToEndOfFile()
             }
 
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-lc", self.wrappedShellCommand(command)]
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
             process.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
-            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, override in
-                override
-            }
+            process.environment = Self.sanitizedEnvironment(overrides: environment)
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
@@ -74,8 +83,10 @@ final class ShellCommandRunner {
             guard result.exitCode == 0 else {
                 let message = result.stderr.isEmpty ? result.stdout : result.stderr
                 throw BridgeControlError.commandFailed(
-                    command: command,
-                    message: message.isEmpty ? "Command failed: \(command)" : message
+                    command: ([executablePath] + arguments).joined(separator: " "),
+                    message: message.isEmpty
+                        ? "Command failed: \(executablePath)"
+                        : message
                 )
             }
 
@@ -83,13 +94,53 @@ final class ShellCommandRunner {
         }.value
     }
 
-    // Silently loads interactive zsh PATH customizations so GUI-launched commands see the same global CLI install as Terminal.
-    private func wrappedShellCommand(_ command: String) -> String {
-        [
-            "export TERM=dumb",
-            "source ~/.zshrc >/dev/null 2>/dev/null || true",
-            command,
-        ].joined(separator: "; ")
+    static func sanitizedEnvironment(overrides: [String: String] = [:]) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment.merge(overrides) { _, override in override }
+        // Long-lived OpenAI credentials are bridge-owned and must not be
+        // inherited by npm package scripts or other menu-bar child processes.
+        environment.removeValue(forKey: "REMODEX_OPENAI_REALTIME_API_KEY")
+        environment.removeValue(forKey: "OPENAI_API_KEY")
+        return environment
+    }
+
+    // npm is commonly a `#!/usr/bin/env node` shim (notably in nvm installs).
+    // Keep the child environment sanitized while making the resolved npm
+    // directory available so that its paired Node runtime can be found.
+    static func sanitizedEnvironment(
+        overrides: [String: String] = [:],
+        prependingPathDirectory directory: String
+    ) -> [String: String] {
+        sanitizedEnvironment(
+            overrides: overrides,
+            prependingPathDirectories: [directory]
+        )
+    }
+
+    static func sanitizedEnvironment(
+        overrides: [String: String] = [:],
+        prependingPathDirectories directories: [String]
+    ) -> [String: String] {
+        var environment = sanitizedEnvironment(overrides: overrides)
+        let normalizedDirectories = directories
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .reduce(into: [String]()) { result, directory in
+                if !result.contains(directory) {
+                    result.append(directory)
+                }
+            }
+        guard !normalizedDirectories.isEmpty else {
+            return environment
+        }
+
+        let existingPath = environment["PATH"]?
+            .split(separator: ":", omittingEmptySubsequences: true)
+            .map(String.init) ?? []
+        var pathEntries = normalizedDirectories
+        pathEntries.append(contentsOf: existingPath.filter { !normalizedDirectories.contains($0) })
+        environment["PATH"] = pathEntries.joined(separator: ":")
+        return environment
     }
 }
 
@@ -111,8 +162,11 @@ final class BridgeControlService {
     // Confirms the product contract for this companion: a global `remodex` CLI must be runnable first.
     func detectCLIAvailability() async -> BridgeCLIAvailability {
         do {
-            let invocation = try await resolveCLIInvocation()
-            let result = try await runner.run(command: invocation.command(["--version"]))
+            let invocation = try resolveCLIInvocation()
+            let result = try await runner.run(
+                executablePath: invocation.nodePath,
+                arguments: invocation.arguments(["--version"])
+            )
             guard let version = parseLatestVersion(result.stdout) else {
                 return .broken(message: "The installed CLI returned an unreadable version.")
             }
@@ -125,9 +179,10 @@ final class BridgeControlService {
 
     // Loads the daemon snapshot from the CLI so the menu bar stays aligned with the package's real control plane.
     func loadSnapshot(relayOverride: String?) async throws -> BridgeSnapshot {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         let result = try await runner.run(
-            command: invocation.command(["status", "--json"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["status", "--json"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
         guard let data = result.stdout.data(using: .utf8) else {
@@ -143,60 +198,76 @@ final class BridgeControlService {
     }
 
     func startBridge(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["start"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["start"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func restartBridge(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["restart"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["restart"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func stopBridge(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["stop"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["stop"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func refreshPairing(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["pair", "--json"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["pair", "--json"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func resumeLastThread(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["resume"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["resume"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func resetPairing(relayOverride: String?) async throws {
-        let invocation = try await resolveCLIInvocation()
+        let invocation = try resolveCLIInvocation()
         _ = try await runner.run(
-            command: invocation.command(["reset-pairing"]),
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["reset-pairing"]),
             environment: commandEnvironment(relayOverride: relayOverride)
         )
     }
 
     func updateBridgePackage() async throws {
-        _ = try await runner.run(command: "npm install -g remodex@latest")
+        let npmPath = try resolveExecutable(named: "npm")
+        _ = try await runner.run(
+            executablePath: npmPath,
+            arguments: ["install", "-g", "remodex@latest"],
+            environment: npmEnvironment(for: npmPath)
+        )
     }
 
     func fetchLatestPackageVersion() async -> Result<String, Error> {
         do {
-            let result = try await runner.run(command: "npm view remodex version --json")
+            let npmPath = try resolveExecutable(named: "npm")
+            let result = try await runner.run(
+                executablePath: npmPath,
+                arguments: ["view", "remodex", "version", "--json"],
+                environment: npmEnvironment(for: npmPath)
+            )
             let latestVersion = parseLatestVersion(result.stdout)
             guard let latestVersion else {
                 throw BridgeControlError.commandFailed(
@@ -235,7 +306,10 @@ final class BridgeControlService {
             throw BridgeControlError.invalidSnapshot("Bridge status returned malformed JSON.")
         }
 
-        let versionResult = try await runner.run(command: invocation.command(["--version"]))
+        let versionResult = try await runner.run(
+            executablePath: invocation.nodePath,
+            arguments: invocation.arguments(["--version"])
+        )
         guard let currentVersion = parseLatestVersion(versionResult.stdout) else {
             throw BridgeControlError.invalidSnapshot("Bridge status returned an unreadable CLI version.")
         }
@@ -294,10 +368,19 @@ final class BridgeControlService {
     }
 
     // Resolves both the CLI script and the Node runtime from stable absolute paths before the menu bar invokes them.
-    private func resolveCLIInvocation() async throws -> BridgeCLIInvocation {
-        let remodexPath = try await resolveExecutable(named: "remodex")
-        let nodePath = try await resolveNodePath(for: remodexPath)
+    private func resolveCLIInvocation() throws -> BridgeCLIInvocation {
+        let remodexPath = try resolveExecutable(named: "remodex")
+        let nodePath = try resolveNodePath(for: remodexPath)
         return BridgeCLIInvocation(nodePath: nodePath, remodexPath: remodexPath)
+    }
+
+    private func npmEnvironment(for npmPath: String) -> [String: String] {
+        let npmURL = URL(fileURLWithPath: npmPath)
+        let npmDirectory = npmURL.deletingLastPathComponent().path
+        let resolvedDirectory = npmURL.resolvingSymlinksInPath().deletingLastPathComponent().path
+        return ShellCommandRunner.sanitizedEnvironment(
+            prependingPathDirectories: [npmDirectory, resolvedDirectory]
+        )
     }
 
     private func parseStatusLines(_ output: String) -> [String: String] {
@@ -375,12 +458,12 @@ final class BridgeControlService {
     }
 
     // Prefers the Node runtime sitting next to the resolved CLI binary so mixed installs stay compatible.
-    private func resolveNodePath(for remodexPath: String) async throws -> String {
+    private func resolveNodePath(for remodexPath: String) throws -> String {
         if let colocatedNodePath = resolveColocatedNodePath(for: remodexPath) {
             return colocatedNodePath
         }
 
-        return try await resolveExecutable(named: "node")
+        return try resolveExecutable(named: "node")
     }
 
     private func resolveColocatedNodePath(for remodexPath: String) -> String? {
@@ -403,11 +486,17 @@ final class BridgeControlService {
         return nil
     }
 
-    private func resolveExecutable(named name: String) async throws -> String {
-        if let discovered = try? await runner.run(command: "command -v \(name)"),
-           let path = parseExecutablePath(discovered.stdout),
-           fileManager.isExecutableFile(atPath: path) {
-            return path
+    private func resolveExecutable(named name: String) throws -> String {
+        let pathEntries = ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":", omittingEmptySubsequences: true)
+            .map(String.init) ?? []
+        for directory in pathEntries {
+            let candidate = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent(name)
+                .path
+            if fileManager.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
         }
 
         if let fallback = fallbackExecutableCandidates(named: name).first(where: { fileManager.isExecutableFile(atPath: $0) }) {
@@ -418,11 +507,6 @@ final class BridgeControlService {
             command: name,
             message: "\(name) was not found in the app shell environment."
         )
-    }
-
-    private func parseExecutablePath(_ output: String) -> String? {
-        let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return path.isEmpty ? nil : path
     }
 
     private func fallbackExecutableCandidates(named name: String) -> [String] {

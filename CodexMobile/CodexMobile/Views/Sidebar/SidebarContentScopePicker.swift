@@ -1,13 +1,15 @@
 // FILE: SidebarContentScopePicker.swift
 // Purpose: Compact Liquid Glass chip picker that switches the sidebar between
-//          project-backed threads and rootless chats.
+//          project-backed threads, rootless chats, and automations. Native Codex
+//          sections are exposed through the adjacent menu button.
 //          The selected chip uses the same bubble-palette CTA fill as the
 //          composer send button and the sidebar Chat pill (read from the
 //          `UserBubbleColor` AppStorage, collapsed through `ctaPalette`),
 //          so the entire accent surface in the sidebar stays in sync with
 //          the user's chosen color.
 // Layer: View Component
-// Exports: SidebarContentScopePicker, SidebarFolderExpansionToggleButton
+// Exports: SidebarContentScopePicker, SidebarSectionsMenuButton,
+//          SidebarFolderExpansionToggleButton
 // Depends on: SwiftUI, SidebarContentScope, HapticButton, AppFont,
 //             UserBubbleColor, RemodexIcon, AdaptiveGlassModifier
 
@@ -15,12 +17,21 @@ import SwiftUI
 
 struct SidebarContentScopePicker: View {
     @Binding var selection: SidebarContentScope
+    @Binding var selectedSectionID: String?
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(UserBubbleColor.storageKey)
     private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
 
     private static let selectionAnimation: Animation = .spring(response: 0.34, dampingFraction: 0.78)
+
+    init(
+        selection: Binding<SidebarContentScope>,
+        selectedSectionID: Binding<String?> = .constant(nil)
+    ) {
+        self._selection = selection
+        self._selectedSectionID = selectedSectionID
+    }
 
     var body: some View {
         AdaptiveGlassContainer(spacing: 12) {
@@ -39,11 +50,12 @@ struct SidebarContentScopePicker: View {
     // so the swap reads less abrupt without adding a visible frame around the
     // chip.
     private func scopeButton(_ scope: SidebarContentScope) -> some View {
-        let isSelected = selection == scope
+        let isSelected = selection == scope && selectedSectionID == nil
 
         return HapticButton(hapticStyle: .light, action: {
             withAnimation(Self.selectionAnimation) {
                 selection = scope
+                selectedSectionID = nil
             }
         }) {
             Text(scope.title)
@@ -67,6 +79,85 @@ struct SidebarContentScopePicker: View {
     }
 
     // MARK: - Palette resolution (mirrors composer send button)
+
+    private var ctaPalette: UserBubbleColor {
+        (UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default).ctaPalette
+    }
+
+    private var selectedBackground: Color {
+        ctaPalette.bubbleBackground(for: colorScheme)
+    }
+
+    private var selectedForeground: Color {
+        ctaPalette.bubbleForeground(for: colorScheme)
+    }
+}
+
+// Native Codex sections are dynamic, so they live in a compact menu beside the
+// fixed Projects/Chats/Automations chips instead of expanding the chip row.
+struct SidebarSectionsMenuButton: View {
+    let sections: [CodexThreadSection]
+    @Binding var selection: SidebarContentScope
+    @Binding var selectedSectionID: String?
+
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(UserBubbleColor.storageKey)
+    private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
+
+    private var selectedSection: CodexThreadSection? {
+        guard let selectedSectionID else { return nil }
+        return sections.first(where: { $0.id == selectedSectionID })
+    }
+
+    var body: some View {
+        Menu {
+            Button {
+                withAnimation(.snappy(duration: 0.22)) {
+                    selectedSectionID = nil
+                }
+            } label: {
+                Label(
+                    "All sections",
+                    systemImage: selectedSectionID == nil ? "checkmark" : "rectangle.3.group"
+                )
+            }
+
+            if !sections.isEmpty {
+                Divider()
+            }
+
+            ForEach(sections) { section in
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        selection = .projects
+                        selectedSectionID = section.id
+                    }
+                } label: {
+                    Label(
+                        section.name,
+                        systemImage: selectedSectionID == section.id ? "checkmark" : "rectangle.3.group"
+                    )
+                }
+            }
+        } label: {
+            RemodexIcon.image(systemName: "rectangle.3.group")
+                .font(AppFont.system(size: 13, weight: .semibold))
+                .foregroundStyle(selectedSectionID == nil ? .primary : selectedForeground)
+                .frame(width: 36, height: 36)
+                .adaptiveGlass(
+                    .regular,
+                    isInteractive: true,
+                    tint: selectedSectionID == nil ? nil : selectedBackground,
+                    fallbackMaterial: .ultraThinMaterial,
+                    in: Circle()
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Sections")
+        .accessibilityValue(selectedSection?.name ?? "All sections")
+        .help("Sections")
+    }
 
     private var ctaPalette: UserBubbleColor {
         (UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default).ctaPalette

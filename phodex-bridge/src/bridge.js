@@ -979,6 +979,7 @@ function startBridge({
   });
   const realtimeSessionHandler = createRealtimeSessionHandler({
     sendCodexRequest,
+    sendApplicationResponse,
     logPrefix: "[remodex]",
   });
   const bridgeStatusPublisher = createBridgeStatusPublisher({
@@ -2560,17 +2561,8 @@ function startBridge({
     }
 
     try {
-      await execFileAsync("/bin/zsh", [
-        "-lc",
-        [
-          "export TERM=dumb",
-          "source ~/.zshrc >/dev/null 2>/dev/null || true",
-          BRIDGE_PACKAGE_UPDATE_COMMAND,
-        ].join("; "),
-      ], {
-        timeout: BRIDGE_PACKAGE_UPDATE_TIMEOUT_MS,
-        maxBuffer: 2 * 1024 * 1024,
-      });
+      const invocation = buildBridgePackageUpdateInvocation(process.env);
+      await execFileAsync(invocation.command, invocation.args, invocation.options);
     } catch (error) {
       const nextError = new Error(
         truncateCommandOutput(error?.stderr || error?.stdout || error?.message)
@@ -6027,6 +6019,24 @@ function truncateRelayTextTail(value, maxChars) {
   return `…\n${tail}`;
 }
 
+function buildBridgePackageUpdateInvocation(env = process.env) {
+  // launchd already supplies the PATH captured by `remodex start`; invoke npm
+  // directly so updates do not execute arbitrary shell startup files. Do not
+  // pass either supported API-key fallback into package scripts.
+  const updateEnv = { ...env };
+  delete updateEnv.REMODEX_OPENAI_REALTIME_API_KEY;
+  delete updateEnv.OPENAI_API_KEY;
+  return {
+    command: "npm",
+    args: ["install", "-g", "remodex@latest"],
+    options: {
+      timeout: BRIDGE_PACKAGE_UPDATE_TIMEOUT_MS,
+      maxBuffer: 2 * 1024 * 1024,
+      env: updateEnv,
+    },
+  };
+}
+
 function persistBridgePreferences(
   {
     keepMacAwakeEnabled,
@@ -6233,6 +6243,7 @@ function threadListTimestamp(value) {
 
 module.exports = {
   annotateTurnStateProbeWithMirrorActiveTurn,
+  buildBridgePackageUpdateInvocation,
   buildThreadTurnsListRelaySanitizeContext,
   buildHeartbeatBridgeStatus,
   canonicalThreadTurnsListRequest,

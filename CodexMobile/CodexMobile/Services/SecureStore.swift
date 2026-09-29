@@ -27,18 +27,40 @@ enum CodexSecureKeys {
     nonisolated static let terminalSSHKnownHostPrefix = "codex.terminal.sshKnownHost"
 }
 
+enum SecureStoreCodableReadResult<Value> {
+    case found(Value)
+    case missing
+    case unavailable
+}
+
+struct SecureStoreKeychainOperations: Sendable {
+    let copyMatching: @Sendable ([String: Any]) -> (OSStatus, [String: Any]?)
+    let update: @Sendable ([String: Any], [String: Any]) -> OSStatus
+    let add: @Sendable ([String: Any]) -> OSStatus
+    let delete: @Sendable ([String: Any]) -> OSStatus
+
+    nonisolated static let system = SecureStoreKeychainOperations(
+        copyMatching: { query in
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            return (status, result as? [String: Any])
+        },
+        update: { query, attributes in
+            SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        },
+        add: { query in
+            SecItemAdd(query as CFDictionary, nil)
+        },
+        delete: { query in
+            SecItemDelete(query as CFDictionary)
+        }
+    )
+}
+
 enum SecureStore {
     // Reads a UTF-8 string value from Keychain.
     nonisolated static func readString(for key: String) -> String? {
-        var query = baseQuery(for: key)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
+        guard let data = readData(for: key),
               let stringValue = String(data: data, encoding: .utf8) else {
             return nil
         }
@@ -48,19 +70,13 @@ enum SecureStore {
 
     // Reads opaque key material or encrypted payload blobs from Keychain.
     nonisolated static func readData(for key: String) -> Data? {
-        var query = baseQuery(for: key)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data else {
+        switch readDataResult(for: key) {
+        case .found(let data, let service):
+            migrateLegacyValueIfNeeded(data, for: key, service: service)
+            return data
+        case .missing, .unavailable:
             return nil
         }
-
-        return data
     }
 
     // Writes a UTF-8 string to Keychain; empty values are treated as delete.
@@ -84,54 +100,244 @@ enum SecureStore {
     }
 
     // Stores raw data in Keychain with optional accessibility constraints for key material.
-    nonisolated static func writeData(_ value: Data, for key: String, accessibility: CFString?) {
+    @discardableResult
+    nonisolated static func writeData(_ value: Data, for key: String, accessibility: CFString?) -> Bool {
         if value.isEmpty {
             deleteValue(for: key)
-            return
+            return true
         }
 
-        deleteValue(for: key)
+        return writeData(value, for: key, accessibility: accessibility, operations: .system)
+    }
 
-        var query = baseQuery(for: key)
-        query[kSecValueData as String] = value
+    @discardableResult
+    nonisolated static func writeData(
+        _ value: Data,
+        for key: String,
+        accessibility: CFString?,
+        operations: SecureStoreKeychainOperations
+    ) -> Bool {
+        if value.isEmpty {
+            deleteValue(for: key)
+            return true
+        }
+
+        let stableQuery = baseQuery(for: key, service: stableServiceName)
+        let requestedAccessibility = accessibility.map { $0 as String }
+        if let currentItem = readStableItem(for: key, using: operations),
+           currentItem.data == value,
+           requestedAccessibility == nil || currentItem.accessibility == requestedAccessibility {
+            return true
+        }
+
+        var updateAttributes: [String: Any] = [kSecValueData as String: value]
         if let accessibility {
-            query[kSecAttrAccessible as String] = accessibility
+            updateAttributes[kSecAttrAccessible as String] = accessibility
         }
 
-        SecItemAdd(query as CFDictionary, nil)
+        let updateStatus = operations.update(stableQuery, updateAttributes)
+        if updateStatus == errSecSuccess {
+            deleteLegacyValues(for: key, using: operations)
+            return true
+        }
+        guard updateStatus == errSecItemNotFound else {
+            return false
+        }
+
+        var addQuery = stableQuery
+        addQuery[kSecValueData as String] = value
+        if let accessibility {
+            addQuery[kSecAttrAccessible as String] = accessibility
+        }
+        let addStatus = operations.add(addQuery)
+        if addStatus == errSecSuccess {
+            deleteLegacyValues(for: key, using: operations)
+            return true
+        }
+        guard addStatus == errSecDuplicateItem else {
+            return false
+        }
+
+        let retryStatus = operations.update(stableQuery, updateAttributes)
+        guard retryStatus == errSecSuccess else {
+            return false
+        }
+        deleteLegacyValues(for: key, using: operations)
+        return true
     }
 
     // Convenience wrapper for small Codable payloads kept in Keychain.
     nonisolated static func readCodable<Value: Decodable>(_ type: Value.Type, for key: String) -> Value? {
-        guard let data = readData(for: key) else {
+        switch readCodableResult(type, for: key) {
+        case .found(let value):
+            return value
+        case .missing, .unavailable:
             return nil
         }
-        return try? JSONDecoder().decode(type, from: data)
+    }
+
+    nonisolated static func readCodableResult<Value: Decodable>(
+        _ type: Value.Type,
+        for key: String
+    ) -> SecureStoreCodableReadResult<Value> {
+        switch readDataResult(for: key) {
+        case .found(let data, let service):
+            migrateLegacyValueIfNeeded(data, for: key, service: service)
+            guard let value = try? JSONDecoder().decode(type, from: data) else {
+                return .missing
+            }
+            return .found(value)
+        case .missing:
+            return .missing
+        case .unavailable:
+            return .unavailable
+        }
     }
 
     // Convenience wrapper for small Codable payloads kept in Keychain.
-    nonisolated static func writeCodable<Value: Encodable>(_ value: Value, for key: String) {
+    @discardableResult
+    nonisolated static func writeCodable<Value: Encodable>(_ value: Value, for key: String) -> Bool {
+        writeCodable(value, for: key, accessibility: nil)
+    }
+
+    @discardableResult
+    nonisolated static func writeCodable<Value: Encodable>(
+        _ value: Value,
+        for key: String,
+        accessibility: CFString?
+    ) -> Bool {
         guard let data = try? JSONEncoder().encode(value) else {
+            return false
+        }
+        return writeData(data, for: key, accessibility: accessibility)
+    }
+
+    nonisolated static func updateAccessibilityIfNeeded(for key: String, accessibility: CFString) -> Bool {
+        updateAccessibilityIfNeeded(for: key, accessibility: accessibility, operations: .system)
+    }
+
+    nonisolated static func updateAccessibilityIfNeeded(
+        for key: String,
+        accessibility: CFString,
+        operations: SecureStoreKeychainOperations
+    ) -> Bool {
+        guard let currentItem = readStableItem(for: key, using: operations) else {
+            return false
+        }
+        guard currentItem.accessibility != (accessibility as String) else {
+            return true
+        }
+        return operations.update(
+            baseQuery(for: key, service: stableServiceName),
+            [kSecAttrAccessible as String: accessibility]
+        ) == errSecSuccess
+    }
+
+    nonisolated static func deleteValue(for key: String) {
+        for service in storageServiceNames {
+            let query = baseQuery(for: key, service: service)
+            SecItemDelete(query as CFDictionary)
+        }
+    }
+
+    private enum DataReadResult {
+        case found(Data, service: String)
+        case missing
+        case unavailable
+    }
+
+    private struct StableItem {
+        let data: Data
+        let accessibility: String?
+    }
+
+    private nonisolated static func readStableItem(
+        for key: String,
+        using operations: SecureStoreKeychainOperations
+    ) -> StableItem? {
+        var query = baseQuery(for: key, service: stableServiceName)
+        query[kSecReturnAttributes as String] = kCFBooleanTrue
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        let (status, attributes) = operations.copyMatching(query)
+        guard status == errSecSuccess,
+              let attributes,
+              let data = attributes[kSecValueData as String] as? Data else {
+            return nil
+        }
+        return StableItem(
+            data: data,
+            accessibility: attributes[kSecAttrAccessible as String] as? String
+        )
+    }
+
+    private nonisolated static func deleteLegacyValues(
+        for key: String,
+        using operations: SecureStoreKeychainOperations
+    ) {
+        for service in storageServiceNames.dropFirst() {
+            _ = operations.delete(baseQuery(for: key, service: service))
+        }
+    }
+
+    private nonisolated static func readDataResult(for key: String) -> DataReadResult {
+        var encounteredUnavailableStatus = false
+        for service in storageServiceNames {
+            var query = baseQuery(for: key, service: service)
+            query[kSecReturnData as String] = kCFBooleanTrue
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            if status == errSecSuccess, let data = result as? Data {
+                return .found(data, service: service)
+            }
+            if status != errSecItemNotFound {
+                encounteredUnavailableStatus = true
+            }
+        }
+
+        return encounteredUnavailableStatus ? .unavailable : .missing
+    }
+
+    private nonisolated static func migrateLegacyValueIfNeeded(
+        _ data: Data,
+        for key: String,
+        service: String
+    ) {
+        guard service != stableServiceName else {
             return
         }
         writeData(data, for: key)
     }
 
-    nonisolated static func deleteValue(for key: String) {
-        let query = baseQuery(for: key)
-        SecItemDelete(query as CFDictionary)
-    }
-
-    private nonisolated static func baseQuery(for key: String) -> [String: Any] {
+    private nonisolated static func baseQuery(for key: String, service: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
+            kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
     }
 
-    private nonisolated static var serviceName: String {
-        Bundle.main.bundleIdentifier ?? "com.codexmobile.app"
+    private nonisolated static let stableServiceName = "com.remodex.secure-store"
+
+    private nonisolated static var storageServiceNames: [String] {
+        var names = [stableServiceName]
+        if let bundleIdentifier = Bundle.main.bundleIdentifier {
+            names.append(bundleIdentifier)
+        }
+        names.append(contentsOf: [
+            "com.dinsen.remodex",
+            "com.emanueledipietro.Remodex",
+            "com.codexmobile.app",
+        ])
+
+        var uniqueNames: [String] = []
+        for name in names where !uniqueNames.contains(name) {
+            uniqueNames.append(name)
+        }
+        return uniqueNames
     }
 }
 

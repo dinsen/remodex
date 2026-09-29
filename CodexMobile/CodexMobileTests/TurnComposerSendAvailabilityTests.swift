@@ -154,7 +154,7 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertFalse(controller.isVoiceSessionActive)
     }
 
-    func testRealtimeVoiceSessionRequestUsesThreadAndReturnsEphemeralSession() async throws {
+    func testRealtimeVoiceSessionRequestUsesThreadAndReturnsBridgeHandle() async throws {
         let service = makeService()
         service.isConnected = true
         var requestedMethod: String?
@@ -165,8 +165,10 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             return RPCMessage(
                 id: .string("voice-session-response"),
                 result: .object([
-                    "clientSecret": .string("ephemeral-secret"),
-                    "expiresAt": .double(Date().timeIntervalSince1970 + 60)
+                    "sessionId": .string("live-session-42"),
+                    "model": .string("gpt-live-1"),
+                    "transport": .string("bridge"),
+                    "expiresAt": .double(Date().timeIntervalSince1970 + 60),
                 ]),
                 includeJSONRPC: false
             )
@@ -176,7 +178,8 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         XCTAssertEqual(requestedMethod, "voice/realtime/session")
         XCTAssertEqual(requestedThreadID, "thread-42")
-        XCTAssertEqual(session.clientSecret, "ephemeral-secret")
+        XCTAssertEqual(session.sessionID, "live-session-42")
+        XCTAssertEqual(session.model, "gpt-live-1")
         XCTAssertTrue(session.expiresAt > Date())
     }
 
@@ -187,7 +190,8 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
             RPCMessage(
                 id: .string("voice-session-response"),
                 result: .object([
-                    "clientSecret": .string("expired-secret"),
+                    "sessionId": .string("expired-session"),
+                    "model": .string("gpt-live-1"),
                     "expiresAt": .double(Date().timeIntervalSince1970 - 1)
                 ]),
                 includeJSONRPC: false
@@ -225,49 +229,40 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         XCTAssertFalse(didSendRequest)
     }
 
-    func testRealtimeVoiceConnectionUsesEphemeralSecretAndClosesSocket() async throws {
-        let socket = TestRealtimeVoiceSocket()
+    func testRealtimeVoiceConnectionUsesBridgeEventsAndCloses() async throws {
+        var sentMethods: [String] = []
         let session = CodexRealtimeVoiceSession(
-            clientSecret: "ephemeral-secret",
-            expiresAt: Date().addingTimeInterval(60)
+            sessionID: "live-session-42",
+            expiresAt: Date().addingTimeInterval(60),
+            model: "gpt-live-1"
         )
-        var capturedRequest: URLRequest?
-        let connection = CodexRealtimeVoiceConnection(session: session) { request in
-            capturedRequest = request
-            return socket
+        let connection = CodexRealtimeVoiceConnection(session: session) { method, _ in
+            sentMethods.append(method)
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
         }
 
         try await connection.connect()
+        try await connection.sendAudio(base64PCM: "AQI=")
 
         XCTAssertEqual(connection.state, .connected)
-        XCTAssertEqual(socket.connectCount, 1)
-        XCTAssertEqual(
-            capturedRequest?.url?.absoluteString,
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
-        )
-        XCTAssertEqual(
-            capturedRequest?.value(forHTTPHeaderField: "Authorization"),
-            "Bearer ephemeral-secret"
-        )
-        XCTAssertEqual(
-            capturedRequest?.value(forHTTPHeaderField: "OpenAI-Beta"),
-            "realtime=v1"
-        )
 
         connection.close()
+        await Task.yield()
 
         XCTAssertEqual(connection.state, .closed)
-        XCTAssertEqual(socket.closeCount, 1)
+        XCTAssertEqual(sentMethods, ["voice/realtime/audio", "voice/realtime/close"])
     }
 
     func testVoicePhaseTwoStartsAndStopsRealtimeConnectionAfterPermission() async {
-        let socket = TestRealtimeVoiceSocket()
         let connection = CodexRealtimeVoiceConnection(
             session: CodexRealtimeVoiceSession(
-                clientSecret: "ephemeral-secret",
-                expiresAt: Date().addingTimeInterval(60)
+                sessionID: "live-session-42",
+                expiresAt: Date().addingTimeInterval(60),
+                model: "gpt-live-1"
             )
-        ) { _ in socket }
+        ) { _, _ in
+            RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
         let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
 
         await controller.handleWaveTap(isVoiceEnabled: true) {
@@ -277,7 +272,6 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         XCTAssertTrue(controller.isVoiceSessionActive)
         XCTAssertEqual(connection.state, .connected)
-        XCTAssertEqual(socket.connectCount, 1)
 
         await controller.handleWaveTap(isVoiceEnabled: true) {
             XCTFail("Starter should not be called while stopping")
@@ -286,7 +280,6 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         XCTAssertFalse(controller.isVoiceSessionActive)
         XCTAssertEqual(connection.state, .closed)
-        XCTAssertEqual(socket.closeCount, 1)
     }
 
     func testVoicePhaseTwoDoesNotStartRealtimeWhenVoiceIsDisabled() async {
@@ -308,14 +301,15 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
     }
 
     func testVoicePhaseTwoReportsConnectionFailureWithoutActivatingVoice() async {
-        let socket = TestRealtimeVoiceSocket()
-        socket.connectError = CodexServiceError.disconnected
         let connection = CodexRealtimeVoiceConnection(
             session: CodexRealtimeVoiceSession(
-                clientSecret: "ephemeral-secret",
-                expiresAt: Date().addingTimeInterval(60)
+                sessionID: "live-session-42",
+                expiresAt: Date().addingTimeInterval(60),
+                model: "unsupported-model"
             )
-        ) { _ in socket }
+        ) { _, _ in
+            RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
         let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
 
         await controller.handleWaveTap(isVoiceEnabled: true) {
@@ -325,9 +319,41 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         XCTAssertFalse(controller.isVoiceSessionActive)
         XCTAssertEqual(connection.state, .failed)
-        XCTAssertEqual(socket.connectCount, 1)
-        XCTAssertEqual(socket.closeCount, 1)
         XCTAssertNotNil(controller.voiceErrorExplanation)
+    }
+
+    func testVoicePhaseTwoClearsAfterProviderTerminationAndCanRestart() async throws {
+        func makeConnection(id: String) -> CodexRealtimeVoiceConnection {
+            CodexRealtimeVoiceConnection(
+                session: CodexRealtimeVoiceSession(
+                    sessionID: id,
+                    expiresAt: Date().addingTimeInterval(60),
+                    model: "gpt-live-1"
+                )
+            ) { _, _ in
+                RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        let firstConnection = makeConnection(id: "live-session-1")
+        let secondConnection = makeConnection(id: "live-session-2")
+        let controller = VoiceComposerPhaseTwoController(requestPermission: { .granted })
+
+        await controller.handleWaveTap(isVoiceEnabled: true) {
+            try await firstConnection.connect()
+            return firstConnection
+        }
+        XCTAssertTrue(controller.isVoiceSessionActive)
+
+        firstConnection.handleBridgeEvent(.object(["type": .string("session.closed")]))
+        XCTAssertFalse(controller.isVoiceSessionActive)
+
+        await controller.handleWaveTap(isVoiceEnabled: true) {
+            try await secondConnection.connect()
+            return secondConnection
+        }
+        XCTAssertTrue(controller.isVoiceSessionActive)
+        secondConnection.close()
     }
 
     func testSendDisabledWhenDisconnected() {
@@ -1592,23 +1618,5 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         // Keep instances alive for process lifetime so assertions remain deterministic.
         Self.retainedServices.append(service)
         return service
-    }
-}
-
-@MainActor
-private final class TestRealtimeVoiceSocket: CodexRealtimeVoiceSocket {
-    var connectCount = 0
-    var closeCount = 0
-    var connectError: Error?
-
-    func connect() async throws {
-        connectCount += 1
-        if let connectError {
-            throw connectError
-        }
-    }
-
-    func close() {
-        closeCount += 1
     }
 }

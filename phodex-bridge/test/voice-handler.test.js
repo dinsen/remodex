@@ -10,22 +10,597 @@ const assert = require("node:assert/strict");
 const {
   createRealtimeSessionHandler,
   createVoiceHandler,
+  resolveOpenAIAPIKey,
   resolveVoiceAuth,
 } = require("../src/voice-handler");
 
-test("voice/realtime/session returns only a short-lived client secret through the paired bridge", async () => {
+test("resolveOpenAIAPIKey prefers the Mac Keychain and never includes the key in its metadata", () => {
+  const commandCalls = [];
+  const result = resolveOpenAIAPIKey({
+    platform: "darwin",
+    env: {
+      REMODEX_OPENAI_REALTIME_API_KEY: "env-realtime-secret",
+      OPENAI_API_KEY: "env-openai-secret",
+    },
+    commandRunner(command, args) {
+      commandCalls.push({ command, args });
+      return "keychain-secret\n";
+    },
+  });
+
+  assert.deepEqual(result, { apiKey: "keychain-secret", source: "keychain" });
+  assert.deepEqual(commandCalls, [{
+    command: "security",
+    args: [
+      "find-generic-password",
+      "-s",
+      "com.remodex.bridge.openai",
+      "-a",
+      "api-key",
+      "-w",
+    ],
+  }]);
+  assert.equal(JSON.stringify(result).includes("env-realtime-secret"), false);
+});
+
+test("resolveOpenAIAPIKey falls back from the explicit Remodex env var to OPENAI_API_KEY", () => {
+  assert.deepEqual(
+    resolveOpenAIAPIKey({
+      platform: "linux",
+      env: { REMODEX_OPENAI_REALTIME_API_KEY: "remodex-secret", OPENAI_API_KEY: "openai-secret" },
+      commandRunner() {
+        throw new Error("security should not run outside macOS");
+      },
+    }),
+    { apiKey: "remodex-secret", source: "env:REMODEX_OPENAI_REALTIME_API_KEY" }
+  );
+  assert.deepEqual(
+    resolveOpenAIAPIKey({
+      platform: "linux",
+      env: { OPENAI_API_KEY: "openai-secret" },
+    }),
+    { apiKey: "openai-secret", source: "env:OPENAI_API_KEY" }
+  );
+});
+
+test("resolveOpenAIAPIKey ignores Keychain errors and reports no credential without leaking values", () => {
+  const result = resolveOpenAIAPIKey({
+    platform: "darwin",
+    env: {},
+    commandRunner() {
+      const error = new Error("security: password for api-key is unavailable");
+      error.stderr = "keychain-secret";
+      throw error;
+    },
+  });
+
+  assert.equal(result, null);
+});
+
+test("GPT-Live session starts with client delegation and routes audio through the bridge", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const applicationEvents = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    platform: "linux",
+    env: { OPENAI_API_KEY: "mac-only-key" },
+    sendCodexRequest: activeThreadRequest(),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+    sendApplicationResponse(rawMessage) {
+      applicationEvents.push(JSON.parse(rawMessage));
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-1",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+
+  await tick();
+  assert.equal(upstreamMessages.length, 1);
+  assert.deepEqual(upstreamMessages[0].type, "session.start");
+  assert.equal(upstreamMessages[0].session.model, "gpt-live-1");
+  assert.deepEqual(upstreamMessages[0].session.audio, {
+    format: { type: "audio/pcm", rate: 24_000 },
+    output: { voice: "marin" },
+  });
+  assert.deepEqual(upstreamMessages[0].session.delegation, { type: "client" });
+  assert.equal(responses[0].result?.model, "gpt-live-1");
+  assert.equal(responses[0].result?.clientSecret, undefined);
+
+  const sessionId = responses[0].result.sessionId;
+  const audioHandled = handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "audio-1",
+    method: "voice/realtime/audio",
+    params: { sessionId, audio: "AQI=" },
+  }), (response) => responses.push(JSON.parse(response)));
+  assert.equal(audioHandled, true);
+  await tick();
+  assert.deepEqual(upstreamMessages[1], {
+    type: "session.input_audio.append",
+    audio: "AQI=",
+  });
+  assert.deepEqual(responses.at(-1), { id: "audio-1", result: { ok: true } });
+  assert.equal(applicationEvents.some((message) => message.method === "voice/realtime/event"), true);
+});
+
+test("GPT-Live client delegation invokes the scoped Codex adapter and appends a concise result", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({
+    upstreamMessages,
+    startedEvent: { type: "session.started", session: { id: "live_provider_1", expires_at: 1_800_000_000 } },
+  });
+  const delegationCalls = [];
+  const handler = createRealtimeSessionHandler({
+    platform: "linux",
+    env: { OPENAI_API_KEY: "mac-only-key" },
+    sendCodexRequest: activeThreadRequest(),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+    runDelegatedTask: async (context) => {
+      delegationCalls.push(context);
+      return "Codex verified the requested result.";
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-2",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_1",
+    start_ms: 0,
+    end_ms: 500,
+    delta: "Check the current branch.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "item_delegate_1", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  assert.deepEqual(delegationCalls, [{
+    threadId: "thread-123",
+    sessionId,
+    delegationId: "item_delegate_1",
+    transcript: "Check the current branch.",
+  }]);
+  assert.deepEqual(upstreamMessages.at(-1), {
+    type: "session.commentary.append",
+    event_id: upstreamMessages.at(-1).event_id,
+    delegation_id: "item_delegate_1",
+    content: "Codex verified the requested result.",
+  });
+  assert.equal(typeof upstreamMessages.at(-1).event_id, "string");
+});
+
+test("GPT-Live drops delayed delegation work after the session begins closing", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  let releaseDelegation;
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    runDelegatedTask: () => new Promise((resolve) => {
+      releaseDelegation = resolve;
+    }),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-delayed-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_delayed",
+    start_ms: 0,
+    end_ms: 500,
+    delta: "Run the build.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "item_delegate_delayed", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-delayed-close",
+    method: "voice/realtime/close",
+    params: { sessionId },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  assert.equal(upstreamMessages.at(-1).type, "session.close");
+
+  releaseDelegation?.("This must not be sent after close.");
+  await tick();
+  assert.equal(
+    upstreamMessages.some((event) => event.type === "session.commentary.append"),
+    false
+  );
+});
+
+test("GPT-Live scopes each delegation to its transcript and waits for late transcript deltas", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const delegationCalls = [];
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    runDelegatedTask: async (context) => {
+      delegationCalls.push(context);
+      return "Done.";
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-scoped-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  const firstDelegation = {
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "item_delegate_late", type: "delegation", target: "client" },
+  };
+  fakeSocket.emitMessage(firstDelegation);
+  fakeSocket.emitMessage(firstDelegation);
+  await tick();
+  assert.equal(delegationCalls.length, 0, "a delegation without transcript must wait");
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_late",
+    start_ms: 50,
+    end_ms: 500,
+    delta: "Show me open pull requests.",
+  });
+  await delay(150);
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_followup",
+    start_ms: 900,
+    end_ms: 1_200,
+    delta: "Filter them to assigned reviews.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 1_200,
+    delegation: { id: "item_delegate_followup", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  assert.deepEqual(delegationCalls.map(({ delegationId, transcript }) => ({ delegationId, transcript })), [
+    { delegationId: "item_delegate_late", transcript: "Show me open pull requests." },
+    { delegationId: "item_delegate_followup", transcript: "Filter them to assigned reviews." },
+  ]);
+  assert.ok(delegationCalls.every((call) => call.sessionId === sessionId));
+});
+
+test("GPT-Live does not start a generic Codex command when a delegation has no transcript", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const codexCalls = [];
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: async (method, params) => {
+      codexCalls.push({ method, params });
+      return { thread: { id: "thread-123" } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-no-transcript-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "item_delegate_empty", type: "delegation", target: "client" },
+  });
+  await tick();
+
+  assert.equal(codexCalls.some(({ method }) => method === "turn/start"), false);
+  const sessionId = responses[0].result.sessionId;
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-no-transcript-close",
+    method: "voice/realtime/close",
+    params: { sessionId },
+  }), () => {});
+  await tick();
+});
+
+test("GPT-Live rejects odd-byte PCM16 chunks before provider append", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-odd-byte-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-odd-byte",
+    method: "voice/realtime/audio",
+    params: { sessionId, audio: "AQID" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  assert.equal(responses.at(-1).error?.data?.errorCode, "invalid_realtime_audio");
+  assert.equal(upstreamMessages.some((event) => event.type === "session.input_audio.append"), false);
+});
+
+test("GPT-Live rejects response.create from client delegation controls", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-control-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-response-create",
+    method: "voice/realtime/event",
+    params: { sessionId, event: { type: "response.create" } },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  assert.equal(responses.at(-1).error?.data?.errorCode, "unsupported_realtime_event");
+  assert.equal(upstreamMessages.some((event) => event.type === "response.create"), false);
+});
+
+test("GPT-Live close waits for session.closed before closing the provider socket", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    closeFinalizationTimeoutMs: 100,
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-close-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-close",
+    method: "voice/realtime/close",
+    params: { sessionId },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  assert.deepEqual(responses.at(-1), { id: "live-close", result: { ok: true } });
+  assert.deepEqual(upstreamMessages.at(-1), { type: "session.close" });
+  assert.equal(fakeSocket.closeCount, 0);
+
+  for (const [id, method, params] of [
+    ["live-close-audio", "voice/realtime/audio", { sessionId, audio: "AQI=" }],
+    ["live-close-control", "voice/realtime/event", { sessionId, event: { type: "session.input_audio.mute" } }],
+  ]) {
+    handler.handleRealtimeSessionRequest(JSON.stringify({ id, method, params }), (response) => {
+      responses.push(JSON.parse(response));
+    });
+    await tick();
+    assert.equal(responses.at(-1).error?.data?.errorCode, "invalid_realtime_session");
+  }
+  assert.equal(
+    upstreamMessages.some((event) => event.type === "session.input_audio.append" || event.type === "session.input_audio.mute"),
+    false
+  );
+
+  fakeSocket.emitMessage({ type: "session.closed" });
+  await tick();
+  assert.equal(fakeSocket.closeCount, 1);
+});
+
+test("GPT-Live finalizes a close when the provider never sends session.closed", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    closeFinalizationTimeoutMs: 5,
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-timeout-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-timeout-close",
+    method: "voice/realtime/close",
+    params: { sessionId },
+  }), () => {});
+  await delay(20);
+
+  assert.equal(fakeSocket.closeCount, 1);
+});
+
+test("GPT-Live abandons idle sessions after the cleanup deadline", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    sendCodexRequest: activeThreadRequest(),
+    idleTimeoutMs: 5,
+    closeFinalizationTimeoutMs: 50,
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-idle-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  await delay(20);
+
+  assert.equal(upstreamMessages.at(-1).type, "session.close");
+  assert.equal(fakeSocket.closeCount, 0);
+  await delay(60);
+  assert.equal(fakeSocket.closeCount, 1);
+});
+
+test("GPT-Live expiry cleanup requests provider close before bounded finalization", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const timerHandles = [];
+  const fakeSocket = makeLiveSocket({
+    upstreamMessages,
+    startedEvent: {
+      type: "session.started",
+      session: { expires_at: 1_800_000_001 },
+    },
+  });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-key",
+    now: () => 1_800_000_000_000,
+    sendCodexRequest: activeThreadRequest(),
+    closeFinalizationTimeoutMs: 5_000,
+    setTimeoutImpl(callback, delayMs) {
+      const handle = { callback, delayMs, cleared: false };
+      timerHandles.push(handle);
+      return handle;
+    },
+    clearTimeoutImpl(handle) {
+      if (handle) handle.cleared = true;
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-expiry-start",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  const expiryTimer = timerHandles.find((handle) => !handle.cleared && handle.delayMs === 1_000);
+  assert.ok(expiryTimer, "expected a one-second provider expiry timer");
+  expiryTimer.callback();
+
+  assert.equal(upstreamMessages.at(-1).type, "session.close");
+  assert.equal(fakeSocket.closeCount, 0);
+
+  const closeTimer = timerHandles.find((handle) => !handle.cleared && handle.delayMs === 5_000);
+  assert.ok(closeTimer, "expected bounded close finalization timer");
+  closeTimer.callback();
+  assert.equal(fakeSocket.closeCount, 1);
+});
+
+test("voice/realtime/session returns only a bridge-owned session handle", async () => {
   const responses = [];
   const loggerCapture = makeLogger();
-  const createClientSecretCalls = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
   const handler = createRealtimeSessionHandler({
+    apiKey: "mac-only-api-key",
     logger: loggerCapture.logger,
     sendCodexRequest: activeThreadRequest(),
-    createClientSecret: async (request) => {
-      createClientSecretCalls.push(request);
-      return {
-        value: "ephemeral-client-secret",
-        expires_at: 1_800_000_000,
-      };
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
     },
   });
 
@@ -40,18 +615,22 @@ test("voice/realtime/session returns only a short-lived client secret through th
   assert.equal(handled, true);
   await tick();
 
-  assert.equal(createClientSecretCalls.length, 1);
-  assert.equal(createClientSecretCalls[0].model, "gpt-realtime-2.1");
-  assert.match(createClientSecretCalls[0].safetyIdentifier, /^remodex-[a-f0-9]{64}$/);
-  assert.equal(createClientSecretCalls[0].safetyIdentifier.includes("thread-123"), false);
+  assert.equal(upstreamMessages[0].type, "session.start");
+  assert.equal(upstreamMessages[0].session.model, "gpt-live-1");
+  assert.deepEqual(upstreamMessages[0].session.delegation, { type: "client" });
+  assert.equal(responses[0].result?.sessionId?.startsWith("live-"), true);
+  assert.equal(responses[0].result?.transport, "bridge");
+  assert.equal(responses[0].result?.clientSecret, undefined);
   assert.deepEqual(responses, [{
     id: "realtime-1",
     result: {
-      clientSecret: "ephemeral-client-secret",
+      sessionId: responses[0].result.sessionId,
+      model: "gpt-live-1",
+      transport: "bridge",
       expiresAt: 1_800_000_000,
     },
   }]);
-  assert.equal(loggerCapture.messages.join("\n").includes("ephemeral-client-secret"), false);
+  assert.equal(loggerCapture.messages.join("\n").includes("mac-only-api-key"), false);
 });
 
 test("voice/realtime/session is unavailable until a local bridge credential provider is configured", async () => {
@@ -72,22 +651,21 @@ test("voice/realtime/session is unavailable until a local bridge credential prov
   assert.match(responses[0].error?.message || "", /not configured/i);
 });
 
-test("voice/realtime/session mints the client secret with the Mac-only credential", async () => {
+test("voice/realtime/session opens the official GPT-Live endpoint with the Mac-only credential", async () => {
   const responses = [];
   const calls = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
   const loggerCapture = makeLogger();
   const handler = createRealtimeSessionHandler({
     apiKey: "local-only-api-key",
     logger: loggerCapture.logger,
     sendCodexRequest: activeThreadRequest(),
-    fetchImpl: async (url, options) => {
-      calls.push({ url, options });
-      return {
-        ok: true,
-        async json() {
-          return { value: "client-secret", expires_at: 1_800_000_000 };
-        },
-      };
+    WebSocketImpl: class {
+      constructor(url, options) {
+        calls.push({ url, options });
+        return fakeSocket;
+      }
     },
   });
 
@@ -102,25 +680,26 @@ test("voice/realtime/session mints the client secret with the Mac-only credentia
   await tick();
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://api.openai.com/v1/realtime/client_secrets");
+  assert.equal(calls[0].url, "wss://api.openai.com/v1/live/sessions");
   assert.equal(calls[0].options.headers.Authorization, "Bearer local-only-api-key");
   assert.equal(calls[0].options.headers["OpenAI-Safety-Identifier"].includes("thread-123"), false);
-  assert.deepEqual(JSON.parse(calls[0].options.body), {
-    session: { type: "realtime", model: "gpt-realtime-2.1" },
-  });
-  assert.equal(responses[0].result?.clientSecret, "client-secret");
+  assert.equal(upstreamMessages[0].session.model, "gpt-live-1");
+  assert.deepEqual(upstreamMessages[0].session.delegation, { type: "client" });
+  assert.equal(responses[0].result?.clientSecret, undefined);
   assert.equal(loggerCapture.messages.join("\n").includes("local-only-api-key"), false);
-  assert.equal(loggerCapture.messages.join("\n").includes("client-secret"), false);
 });
 
-test("voice/realtime/session rejects unscoped requests before creating a client secret", async () => {
+test("voice/realtime/session rejects unscoped requests before opening a provider socket", async () => {
   const responses = [];
-  let createClientSecretCalls = 0;
+  let socketCalls = 0;
   const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
     sendCodexRequest: activeThreadRequest(),
-    createClientSecret: async () => {
-      createClientSecretCalls += 1;
-      return { value: "should-not-be-created", expires_at: 1_800_000_000 };
+    WebSocketImpl: class {
+      constructor() {
+        socketCalls += 1;
+        throw new Error("should not open");
+      }
     },
   });
 
@@ -134,26 +713,29 @@ test("voice/realtime/session rejects unscoped requests before creating a client 
 
   await tick();
 
-  assert.equal(createClientSecretCalls, 0);
+  assert.equal(socketCalls, 0);
   assert.equal(responses[0].error?.data?.errorCode, "invalid_realtime_scope");
 });
 
-test("voice/realtime/session rejects an unknown or inactive Codex thread before creating a client secret", async () => {
+test("voice/realtime/session rejects an unknown or inactive Codex thread before opening a provider socket", async () => {
   for (const [name, response] of [
     ["unknown", { thread: null }],
     ["inactive", { thread: { id: "thread-123", archived: true } }],
   ]) {
     const responses = [];
-    let createClientSecretCalls = 0;
+    let socketCalls = 0;
     const codexCalls = [];
     const handler = createRealtimeSessionHandler({
+      apiKey: "local-only-api-key",
       sendCodexRequest: async (method, params) => {
         codexCalls.push({ method, params });
         return response;
       },
-      createClientSecret: async () => {
-        createClientSecretCalls += 1;
-        return { value: "should-not-be-created", expires_at: 1_800_000_000 };
+      WebSocketImpl: class {
+        constructor() {
+          socketCalls += 1;
+          throw new Error("should not open");
+        }
       },
     });
 
@@ -169,20 +751,27 @@ test("voice/realtime/session rejects an unknown or inactive Codex thread before 
       method: "thread/read",
       params: { threadId: "thread-123", includeTurns: false },
     }]);
-    assert.equal(createClientSecretCalls, 0);
+    assert.equal(socketCalls, 0);
     assert.equal(responses[0].error?.data?.errorCode, "invalid_realtime_scope");
   }
 });
 
-test("voice/realtime/session rejects an already expired client secret", async () => {
+test("voice/realtime/session rejects an already expired provider session", async () => {
   const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({
+    upstreamMessages,
+    startedEvent: { type: "session.started", session: { expires_at: 1_699_999_999 } },
+  });
   const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
     sendCodexRequest: activeThreadRequest(),
     now: () => 1_700_000_000_000,
-    createClientSecret: async () => ({
-      value: "expired-client-secret",
-      expires_at: 1_699_999_999,
-    }),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
   });
 
   handler.handleRealtimeSessionRequest(JSON.stringify({
@@ -1521,6 +2110,40 @@ function makeLogger() {
       },
     },
   };
+}
+
+function makeLiveSocket({ upstreamMessages, startedEvent = null } = {}) {
+  const listeners = new Map();
+  const socket = {
+    readyState: 1,
+    closeCount: 0,
+    on(eventName, listener) {
+      listeners.set(eventName, listener);
+    },
+    send(rawMessage) {
+      const event = JSON.parse(String(rawMessage));
+      upstreamMessages.push(event);
+      if (event.type === "session.start") {
+        queueMicrotask(() => {
+          listeners.get("message")?.({
+            data: JSON.stringify(startedEvent || {
+              type: "session.started",
+              session: { expires_at: 1_800_000_000 },
+            }),
+          });
+        });
+      }
+    },
+    close() {
+      socket.closeCount += 1;
+      socket.readyState = 3;
+      listeners.get("close")?.();
+    },
+    emitMessage(event) {
+      listeners.get("message")?.({ data: JSON.stringify(event) });
+    },
+  };
+  return socket;
 }
 
 function tick() {

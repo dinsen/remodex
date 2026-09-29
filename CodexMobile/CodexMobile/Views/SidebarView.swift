@@ -73,6 +73,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var configuredProjectChoices: [SidebarProjectChoice] = []
     @State private var codexThreadSections: [CodexThreadSection] = []
     @State private var sectionThreadIDsBySection: [String: [String]] = [:]
+    @State private var sectionProjectChoicesBySection: [String: [SidebarProjectChoice]] = [:]
+    @State private var selectedCodexSectionID: String?
     @AppStorage(SidebarProjectSource.storageKey)
     private var projectSourceRawValue = SidebarProjectSource.defaultSource.rawValue
     @AppStorage(SidebarProjectExpansionState.collapsedProjectGroupIDsStorageKey)
@@ -111,11 +113,18 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                     await refreshThreads()
                 }
             }
-            .onChange(of: codex.threads) { _, _ in
+            .onChange(of: codex.threadListRevision) { _, _ in
                 debugSidebarLog(
                     "threads changed while \(isVisible ? "visible" : "hidden-prewarmed") "
                         + "threadCount=\(codex.threads.count)"
                 )
+                scheduleSidebarDataRebuild(needsGroups: true, needsRunBadges: true)
+            }
+            .onChange(of: codex.isLoadingThreads) { _, isLoading in
+                guard !isLoading else { return }
+                // Full hydration can replace the thread list once per page.
+                // Rebuild the expensive project buckets once after the final
+                // page instead of competing with scrolling on every page.
                 scheduleSidebarDataRebuild(needsGroups: true, needsRunBadges: true)
             }
             .onChange(of: searchText) { _, _ in
@@ -124,6 +133,10 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             }
             .onChange(of: selectedContentScope) { _, scope in
                 debugSidebarLog("content scope changed scope=\(scope.rawValue)")
+                scheduleSidebarDataRebuild(needsGroups: true)
+            }
+            .onChange(of: selectedCodexSectionID) { _, sectionID in
+                debugSidebarLog("Codex section changed sectionID=\(sectionID ?? "none")")
                 scheduleSidebarDataRebuild(needsGroups: true)
             }
             .onChange(of: projectSourceRawValue) { _, rawValue in
@@ -292,20 +305,76 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     private func refreshCodexThreadSections() async {
         guard codex.isConnected else { return }
 
+        // These are two independent sources of truth: the app-server owns native
+        // thread membership, while the local bridge owns Desktop's project
+        // assignments. Start both reads together and apply the bridge result as
+        // soon as it arrives so a slow threadSection endpoint cannot hide projects.
+        async let sidebarSectionsResult = fetchSidebarSectionsForRefresh()
+        async let snapshotResult = fetchThreadSectionsForRefresh()
+
+        let sidebarSections = await sidebarSectionsResult
+        if let sidebarSections {
+            applySectionRefresh(snapshot: nil, sidebarSections: sidebarSections)
+        }
+
+        if let snapshot = await snapshotResult {
+            applySectionRefresh(snapshot: snapshot, sidebarSections: sidebarSections)
+        }
+    }
+
+    private func fetchSidebarSectionsForRefresh() async -> [CodexSidebarSection]? {
         do {
-            let snapshot = try await codex.fetchThreadSections()
-            let sectionIDsToClear = Set(codexThreadSections.map(\.id)).union(snapshot.sections.map(\.id))
-            codex.applyThreadSectionSnapshot(snapshot, clearingMembershipIn: sectionIDsToClear)
-            guard snapshot.sections != codexThreadSections
-                || snapshot.threadIDsBySection != sectionThreadIDsBySection else { return }
-            codexThreadSections = snapshot.sections
-            sectionThreadIDsBySection = snapshot.threadIDsBySection
-            scheduleSidebarDataRebuild(needsGroups: true)
+            return try await codex.fetchSidebarSections()
+        } catch {
+            debugSidebarLog("sidebar section projects unavailable error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func fetchThreadSectionsForRefresh() async -> CodexThreadSectionsSnapshot? {
+        do {
+            return try await codex.fetchThreadSections()
         } catch {
             // Older app servers can lack sections; thread metadata still preserves
             // any section represented in the regular thread list.
             debugSidebarLog("Codex sections unavailable error=\(error.localizedDescription)")
+            return nil
         }
+    }
+
+    @MainActor
+    private func applySectionRefresh(
+        snapshot: CodexThreadSectionsSnapshot?,
+        sidebarSections: [CodexSidebarSection]?
+    ) {
+        if let snapshot {
+            let sectionIDsToClear = Set(codexThreadSections.map(\.id))
+                .union(sectionThreadIDsBySection.keys)
+                .union(snapshot.sections.map(\.id))
+            codex.applyThreadSectionSnapshot(snapshot, clearingMembershipIn: sectionIDsToClear)
+        }
+
+        let appServerSections = snapshot?.sections ?? codexThreadSections
+        let allSections = appServerSections + (sidebarSections?.map {
+            CodexThreadSection(id: $0.id, name: $0.name)
+        } ?? [])
+        let selectableSections = SidebarThreadGrouping.selectableSections(allSections)
+        if let selectedCodexSectionID,
+           !selectableSections.contains(where: { $0.id == selectedCodexSectionID }) {
+            self.selectedCodexSectionID = nil
+        }
+
+        let nextThreadIDsBySection = snapshot?.threadIDsBySection ?? sectionThreadIDsBySection
+        let nextProjectChoicesBySection = sidebarSections.map(Self.sidebarSectionProjectChoices)
+            ?? sectionProjectChoicesBySection
+        guard selectableSections != codexThreadSections
+            || nextThreadIDsBySection != sectionThreadIDsBySection
+            || nextProjectChoicesBySection != sectionProjectChoicesBySection else { return }
+
+        codexThreadSections = selectableSections
+        sectionThreadIDsBySection = nextThreadIDsBySection
+        sectionProjectChoicesBySection = nextProjectChoicesBySection
+        scheduleSidebarDataRebuild(needsGroups: true)
     }
 
     // Opens a draft composer first; the real thread is created only after the first send.
@@ -330,6 +399,11 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     private func handleBottomChatTap() {
         guard taskViewMode == .projects else {
             handleNewChatButtonTap()
+            return
+        }
+
+        if selectedCodexSectionID != nil {
+            handleRootlessChatDraftTap()
             return
         }
         switch selectedContentScope {
@@ -491,11 +565,22 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     ) {
         sidebarDataRebuildCoalescer.needsGroups = sidebarDataRebuildCoalescer.needsGroups || needsGroups
         sidebarDataRebuildCoalescer.needsRunBadges = sidebarDataRebuildCoalescer.needsRunBadges || needsRunBadges
+        guard !SidebarThreadsLoadingPresentation.shouldDeferSidebarDataRebuild(
+            isLoadingThreads: codex.isLoadingThreads
+        ) else { return }
         guard sidebarDataRebuildCoalescer.task == nil else { return }
 
         sidebarDataRebuildCoalescer.task = Task { @MainActor in
             await Task.yield()
             guard !Task.isCancelled else { return }
+            guard !SidebarThreadsLoadingPresentation.shouldDeferSidebarDataRebuild(
+                isLoadingThreads: codex.isLoadingThreads
+            ) else {
+                // Leave the pending flags set; the isLoadingThreads observer
+                // schedules the single final rebuild when hydration completes.
+                sidebarDataRebuildCoalescer.task = nil
+                return
+            }
 
             let shouldRebuildGroups = sidebarDataRebuildCoalescer.needsGroups
             let shouldRebuildRunBadges = sidebarDataRebuildCoalescer.needsRunBadges
@@ -525,6 +610,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 || ($0.normalizedProjectPath?.localizedCaseInsensitiveContains(query) ?? false)
             }
         let configuredChoices = configuredProjectChoicesForGrouping(query: query)
+        let sectionProjectChoices = sectionProjectChoicesForGrouping(query: query)
         // Run badges participate in ordering, so grouping reads the same state the
         // badge column shows; the shared fingerprint keeps the two from diverging.
         var runBadges: [String: CodexThreadRunBadgeState] = [:]
@@ -537,6 +623,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             query: query,
             source: source,
             configuredProjectChoices: configuredChoices,
+            sectionProjectChoicesBySection: sectionProjectChoices,
             runBadges: runBadges
         )
         guard fingerprint != lastGroupedThreadsFingerprint else { return }
@@ -546,6 +633,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             pinnedThreadIDs: codex.pinnedThreadIDs,
             sections: codexThreadSections,
             sectionThreadIDsBySection: sectionThreadIDsBySection,
+            sectionProjectChoicesBySection: sectionProjectChoices,
             scope: sidebarGroupingScope,
             projectlessRootPaths: projectlessChatRootPaths,
             projectSource: selectedProjectSource,
@@ -566,16 +654,30 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         cachedScopedSidebarThreads = SidebarThreadGrouping.threadsForScope(
             sidebarGroupingScope,
             from: codex.threads,
-            projectlessRootPaths: projectlessChatRootPaths
+            projectlessRootPaths: projectlessChatRootPaths,
+            sectionThreadIDsBySection: sectionThreadIDsBySection,
+            sectionProjectPathsBySection: SidebarThreadGrouping.sectionProjectPaths(
+                from: sectionProjectChoicesBySection
+            )
         )
     }
 
     private func scopedThreadsFingerprint() -> Int {
         var hasher = Hasher()
         hasher.combine(selectedContentScope)
+        hasher.combine(selectedCodexSectionID)
         hasher.combine(projectlessChatRootPaths)
+        hasher.combine(sectionThreadIDsBySection)
+        for sectionID in sectionProjectChoicesBySection.keys.sorted() {
+            hasher.combine(sectionID)
+            for choice in sectionProjectChoicesBySection[sectionID] ?? [] {
+                hasher.combine(choice.id)
+                hasher.combine(choice.label)
+                hasher.combine(choice.projectPath)
+            }
+        }
         for thread in codex.threads {
-            hasher.combine(thread)
+            hasher.combine(SidebarThreadGrouping.threadFingerprint(thread))
         }
         return hasher.finalize()
     }
@@ -584,11 +686,13 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         query: String,
         source: [CodexThread],
         configuredProjectChoices: [SidebarProjectChoice],
+        sectionProjectChoicesBySection: [String: [SidebarProjectChoice]],
         runBadges: [String: CodexThreadRunBadgeState]
     ) -> Int {
         var hasher = Hasher()
         hasher.combine(query)
         hasher.combine(selectedContentScope)
+        hasher.combine(selectedCodexSectionID)
         hasher.combine(projectSourceRawValue)
         hasher.combine(projectlessChatRootPaths)
         hasher.combine(codexThreadSections)
@@ -598,9 +702,17 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             hasher.combine(choice.label)
             hasher.combine(choice.projectPath)
         }
+        for sectionID in sectionProjectChoicesBySection.keys.sorted() {
+            hasher.combine(sectionID)
+            for choice in sectionProjectChoicesBySection[sectionID] ?? [] {
+                hasher.combine(choice.id)
+                hasher.combine(choice.label)
+                hasher.combine(choice.projectPath)
+            }
+        }
         hasher.combine(codex.pinnedThreadIDs)
         for thread in source {
-            hasher.combine(thread)
+            hasher.combine(SidebarThreadGrouping.threadFingerprint(thread))
             hasher.combine(runBadges[thread.id])
         }
         return hasher.finalize()
@@ -665,6 +777,12 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         SidebarProjectSource(rawValue: projectSourceRawValue) ?? SidebarProjectSource.defaultSource
     }
 
+    private var selectableCodexThreadSections: [CodexThreadSection] {
+        SidebarThreadGrouping.selectableSections(
+            codexThreadSections + codex.threads.compactMap(\.section)
+        )
+    }
+
     private func configuredProjectChoicesForGrouping(query: String) -> [SidebarProjectChoice] {
         guard selectedProjectSource == .configuredProjects else {
             return []
@@ -679,7 +797,24 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         }
     }
 
+    private func sectionProjectChoicesForGrouping(query: String) -> [String: [SidebarProjectChoice]] {
+        guard !query.isEmpty else {
+            return sectionProjectChoicesBySection
+        }
+
+        return sectionProjectChoicesBySection.mapValues { choices in
+            choices.filter {
+                $0.label.localizedCaseInsensitiveContains(query)
+                    || $0.projectPath.localizedCaseInsensitiveContains(query)
+            }
+        }
+    }
+
     private var sidebarGroupingScope: SidebarThreadGroupingScope {
+        if let selectedCodexSectionID {
+            return .section(selectedCodexSectionID)
+        }
+
         switch selectedContentScope {
         case .projects:
             return .projects
@@ -713,6 +848,11 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
 
     private var emptySidebarTitle: String {
         if taskViewMode == .activity { return "No tasks" }
+        if let selectedCodexSectionID {
+            let sectionName = selectableCodexThreadSections
+                .first(where: { $0.id == selectedCodexSectionID })?.name ?? "section"
+            return "No chats in \(sectionName)"
+        }
         switch selectedContentScope {
         case .projects:
             return selectedProjectSource == .configuredProjects ? "No configured projects" : "No project chats"
@@ -725,6 +865,11 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
 
     private var emptySidebarFilterTitle: String {
         if taskViewMode == .activity { return "No matching tasks" }
+        if let selectedCodexSectionID {
+            let sectionName = selectableCodexThreadSections
+                .first(where: { $0.id == selectedCodexSectionID })?.name ?? "section"
+            return "No matching chats in \(sectionName)"
+        }
         switch selectedContentScope {
         case .projects:
             return "No matching projects"
@@ -764,7 +909,9 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                         .padding(.top, 12)
                         .padding(.bottom, 8)
 
-                    if selectedContentScope == .automations {
+                    if taskViewMode == .projects
+                        && selectedCodexSectionID == nil
+                        && selectedContentScope == .automations {
                         SidebarAutomationsView(
                             query: searchText,
                             isConnected: codex.isConnected,
@@ -906,6 +1053,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         .refreshable {
             await refreshThreads()
             await refreshConfiguredProjects()
+            await refreshCodexThreadSections()
         }
     }
 
@@ -914,36 +1062,87 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     private var sidebarScopeRow: some View {
         let projectGroupIDs = visibleProjectGroupIDs
         let shouldShowToggle = taskViewMode == .projects
-            && selectedContentScope == .projects && !projectGroupIDs.isEmpty
+            && selectedCodexSectionID == nil
+            && selectedContentScope == .projects
+            && !projectGroupIDs.isEmpty
+        let availableSections = selectableCodexThreadSections
         let areAllCollapsed = areAllProjectFoldersCollapsed(projectGroupIDs)
         let shouldShowSyncStatus = SidebarThreadsLoadingPresentation.shouldShowInlineStatus(
             isLoadingThreads: codex.isLoadingThreads,
             threadCount: codex.threads.count
         )
+        let shouldShowProjectControls = taskViewMode == .projects && !shouldShowSyncStatus
 
-        return HStack(spacing: 12) {
-            if shouldShowSyncStatus {
-                SidebarThreadsInlineLoadingView()
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
-
-                Spacer(minLength: 0)
-            } else {
-                if taskViewMode == .projects {
-                    SidebarContentScopePicker(selection: $selectedContentScope)
-                        .fixedSize(horizontal: true, vertical: false)
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                if shouldShowSyncStatus {
+                    SidebarThreadsInlineLoadingView()
                         .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                } else if shouldShowProjectControls {
+                    sidebarContentScopePicker
                 }
 
                 Spacer(minLength: 0)
 
-                if shouldShowToggle {
-                    SidebarFolderExpansionToggleButton(
-                        areAllFoldersCollapsed: areAllCollapsed,
-                        action: { toggleAllProjectFolders(projectGroupIDs) }
+                if shouldShowProjectControls {
+                    sidebarScopeAuxiliaryButtons(
+                        shouldShowToggle: shouldShowToggle,
+                        areAllCollapsed: areAllCollapsed,
+                        projectGroupIDs: projectGroupIDs,
+                        sections: availableSections
                     )
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 }
             }
+
+            if shouldShowProjectControls {
+                VStack(alignment: .leading, spacing: 8) {
+                    sidebarContentScopePicker
+
+                    HStack(spacing: 12) {
+                        Spacer(minLength: 0)
+                        sidebarScopeAuxiliaryButtons(
+                            shouldShowToggle: shouldShowToggle,
+                            areAllCollapsed: areAllCollapsed,
+                            projectGroupIDs: projectGroupIDs,
+                            sections: availableSections
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private var sidebarContentScopePicker: some View {
+        SidebarContentScopePicker(
+            selection: $selectedContentScope,
+            selectedSectionID: $selectedCodexSectionID
+        )
+            .fixedSize(horizontal: true, vertical: false)
+            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+    }
+
+    @ViewBuilder
+    private func sidebarScopeAuxiliaryButtons(
+        shouldShowToggle: Bool,
+        areAllCollapsed: Bool,
+        projectGroupIDs: Set<String>,
+        sections: [CodexThreadSection]
+    ) -> some View {
+        if shouldShowToggle {
+            SidebarFolderExpansionToggleButton(
+                areAllFoldersCollapsed: areAllCollapsed,
+                action: { toggleAllProjectFolders(projectGroupIDs) }
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        }
+
+        if !sections.isEmpty {
+            SidebarSectionsMenuButton(
+                sections: sections,
+                selection: $selectedContentScope,
+                selectedSectionID: $selectedCodexSectionID
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.96)))
         }
     }
 
@@ -1002,6 +1201,14 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         }
 
         return choices
+    }
+
+    private static func sidebarSectionProjectChoices(
+        from sections: [CodexSidebarSection]
+    ) -> [String: [SidebarProjectChoice]] {
+        Dictionary(uniqueKeysWithValues: sections.map { section in
+            (section.id, sidebarProjectChoices(from: section.projects))
+        })
     }
 }
 
@@ -1077,6 +1284,12 @@ enum SidebarThreadsLoadingPresentation {
     // Populated sidebars still need feedback while the complete metadata pass is running.
     static func shouldShowInlineStatus(isLoadingThreads: Bool, threadCount: Int) -> Bool {
         isLoadingThreads && threadCount > 0
+    }
+
+    // Project grouping scans and sorts the full thread list. Defer that work
+    // while paginated hydration is replacing the list one page at a time.
+    static func shouldDeferSidebarDataRebuild(isLoadingThreads: Bool) -> Bool {
+        isLoadingThreads
     }
 }
 

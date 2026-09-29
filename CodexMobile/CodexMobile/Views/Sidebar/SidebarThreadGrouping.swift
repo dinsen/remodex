@@ -1,6 +1,7 @@
 // FILE: SidebarThreadGrouping.swift
-// Purpose: Produces a global Activity list or sidebar groups by project path
-//          (`cwd`) and rootless chat scope while excluding archived chats.
+// Purpose: Produces the global Activity list or sidebar groups by native Codex
+//          section, project path (`cwd`), and rootless chat scope while excluding
+//          archived chats.
 // Layer: View Helper
 // Exports: SidebarTaskViewMode, SidebarThreadGroupKind, SidebarContentScope, SidebarThreadGroup,
 //          SidebarThreadGrouping
@@ -73,10 +74,11 @@ enum SidebarProjectSource: String, CaseIterable, Hashable, Identifiable {
     }
 }
 
-enum SidebarThreadGroupingScope {
+enum SidebarThreadGroupingScope: Equatable {
     case all
     case projects
     case chats
+    case section(String)
 }
 
 struct SidebarProjectChoice: Identifiable, Equatable {
@@ -94,7 +96,28 @@ struct SidebarThreadGroup: Identifiable {
     let sortDate: Date
     let projectPath: String?
     let threads: [CodexThread]
-    var includesDescendantProjectPaths = false
+    let parentSectionID: String?
+    var includesDescendantProjectPaths: Bool
+
+    init(
+        id: String,
+        label: String,
+        kind: SidebarThreadGroupKind,
+        sortDate: Date,
+        projectPath: String?,
+        threads: [CodexThread],
+        parentSectionID: String? = nil,
+        includesDescendantProjectPaths: Bool = false
+    ) {
+        self.id = id
+        self.label = label
+        self.kind = kind
+        self.sortDate = sortDate
+        self.projectPath = projectPath
+        self.threads = threads
+        self.parentSectionID = parentSectionID
+        self.includesDescendantProjectPaths = includesDescendantProjectPaths
+    }
 
     var iconSystemName: String {
         switch kind {
@@ -128,11 +151,56 @@ enum SidebarThreadGrouping {
         )
     }
 
+    // Sidebar grouping never depends on the arbitrary metadata dictionary that
+    // the app-server can attach to a thread. Hashing the whole CodexThread
+    // during every sync therefore made large metadata payloads part of the
+    // scrolling hot path. Keep this projection limited to fields that affect
+    // filtering, ordering, hierarchy, row labels, or project membership.
+    static func threadFingerprint(_ thread: CodexThread) -> Int {
+        var hasher = Hasher()
+        hasher.combine(thread.id)
+        hasher.combine(thread.title)
+        hasher.combine(thread.name)
+        hasher.combine(thread.preview)
+        hasher.combine(thread.createdAt)
+        hasher.combine(thread.updatedAt)
+        hasher.combine(thread.section)
+        hasher.combine(thread.sectionEnteredAt)
+        hasher.combine(thread.cwd)
+        hasher.combine(thread.worktreeOriginPath)
+        hasher.combine(thread.forkedFromThreadId)
+        hasher.combine(thread.threadSource)
+        hasher.combine(thread.parentThreadId)
+        hasher.combine(thread.agentId)
+        hasher.combine(thread.agentNickname)
+        hasher.combine(thread.agentRole)
+        hasher.combine(thread.model)
+        hasher.combine(thread.modelProvider)
+        hasher.combine(thread.goalStatus)
+        hasher.combine(thread.reasoningEffort)
+        hasher.combine(thread.serviceTier)
+        hasher.combine(thread.runtimeSettingsRevision)
+        hasher.combine(thread.runtimeSettingsUpdatedAt)
+        hasher.combine(thread.runtimeSettingsSource)
+        hasher.combine(thread.syncState)
+        return hasher.finalize()
+    }
+
+    static func threadsFingerprint(_ threads: [CodexThread]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(threads.count)
+        for thread in threads {
+            hasher.combine(threadFingerprint(thread))
+        }
+        return hasher.finalize()
+    }
+
     static func makeGroups(
         from threads: [CodexThread],
         pinnedThreadIDs: [String] = [],
         sections: [CodexThreadSection] = [],
         sectionThreadIDsBySection: [String: [String]] = [:],
+        sectionProjectChoicesBySection: [String: [SidebarProjectChoice]] = [:],
         scope: SidebarThreadGroupingScope = .all,
         projectlessRootPaths: [String] = [],
         projectSource: SidebarProjectSource = .recentThreadProjects,
@@ -142,7 +210,16 @@ enum SidebarThreadGrouping {
         calendar _: Calendar = .current
     ) -> [SidebarThreadGroup] {
         var groups: [SidebarThreadGroup] = []
-        let scopedThreads = threadsForScope(scope, from: threads, projectlessRootPaths: projectlessRootPaths)
+        let sectionProjectPathsBySection = sectionProjectPaths(
+            from: sectionProjectChoicesBySection
+        )
+        let scopedThreads = threadsForScope(
+            scope,
+            from: threads,
+            projectlessRootPaths: projectlessRootPaths,
+            sectionThreadIDsBySection: sectionThreadIDsBySection,
+            sectionProjectPathsBySection: sectionProjectPathsBySection
+        )
         let pinnedThreads = collectPinnedThreads(from: scopedThreads, pinnedRootThreadIDs: pinnedThreadIDs)
         let pinnedThreadIDSet = Set(pinnedThreads.map(\.id))
 
@@ -159,20 +236,33 @@ enum SidebarThreadGrouping {
             )
         }
 
-        if scope != .chats {
+        switch scope {
+        case .all, .projects:
             groups.append(contentsOf: makeSectionGroups(
                 from: scopedThreads,
                 sections: sections,
                 threadIDsBySection: sectionThreadIDsBySection,
+                sectionProjectPathsBySection: sectionProjectPathsBySection,
+                sectionProjectChoicesBySection: sectionProjectChoicesBySection,
+                projectlessRootPaths: projectlessRootPaths,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
                 runBadgeStateByThreadID: runBadgeStateByThreadID
             ))
+        case .chats, .section:
+            // Rootless Chats stays separate from native Codex sections. A selected
+            // native section is rendered as its project buckets in the switch below.
+            break
         }
 
         switch scope {
         case .all:
-            let projectThreads = threadsForScope(.projects, from: scopedThreads, projectlessRootPaths: projectlessRootPaths)
-            let chatThreads = threadsForScope(.chats, from: scopedThreads, projectlessRootPaths: projectlessRootPaths)
+            let unsectionedThreads = unsectionedThreads(
+                from: scopedThreads,
+                sectionThreadIDsBySection: sectionThreadIDsBySection,
+                sectionProjectPathsBySection: sectionProjectPathsBySection
+            )
+            let projectThreads = threadsForScope(.projects, from: unsectionedThreads, projectlessRootPaths: projectlessRootPaths)
+            let chatThreads = threadsForScope(.chats, from: unsectionedThreads, projectlessRootPaths: projectlessRootPaths)
             groups.append(contentsOf: makeProjectGroups(
                 from: projectThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
@@ -188,8 +278,13 @@ enum SidebarThreadGrouping {
                 groups.append(chatGroup)
             }
         case .projects:
-            groups.append(contentsOf: makeProjectGroups(
+            let unsectionedThreads = unsectionedThreads(
                 from: scopedThreads,
+                sectionThreadIDsBySection: sectionThreadIDsBySection,
+                sectionProjectPathsBySection: sectionProjectPathsBySection
+            )
+            groups.append(contentsOf: makeProjectGroups(
+                from: unsectionedThreads,
                 excludingPinnedThreadIDs: pinnedThreadIDSet,
                 projectSource: projectSource,
                 configuredProjectChoices: configuredProjectChoices,
@@ -203,29 +298,117 @@ enum SidebarThreadGrouping {
             ) {
                 groups.append(chatGroup)
             }
+        case .section:
+            let sectionID: String
+            if case let .section(selectedSectionID) = scope {
+                sectionID = selectedSectionID
+            } else {
+                sectionID = ""
+            }
+            let projectThreads = threadsForScope(
+                .projects,
+                from: scopedThreads,
+                projectlessRootPaths: projectlessRootPaths,
+                sectionThreadIDsBySection: sectionThreadIDsBySection,
+                sectionProjectPathsBySection: sectionProjectPathsBySection
+            )
+            groups.append(contentsOf: makeProjectGroups(
+                from: projectThreads,
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                projectSource: .configuredProjects,
+                configuredProjectChoices: sectionProjectChoicesBySection[sectionID] ?? [],
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ))
+            if let chatGroup = makeRootlessChatGroup(
+                from: threadsForScope(
+                    .chats,
+                    from: scopedThreads,
+                    projectlessRootPaths: projectlessRootPaths,
+                    sectionThreadIDsBySection: sectionThreadIDsBySection,
+                    sectionProjectPathsBySection: sectionProjectPathsBySection
+                ),
+                excludingPinnedThreadIDs: pinnedThreadIDSet,
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ) {
+                groups.append(chatGroup)
+            }
         }
 
         return groups
+    }
+
+    // Native Codex keeps Pinned as a section, but the sidebar renders it in its
+    // own leading group. Preserve the runtime order for all other sections.
+    static func selectableSections(_ sections: [CodexThreadSection]) -> [CodexThreadSection] {
+        var seenIDs: Set<String> = []
+        return sections.filter { section in
+            let sectionID = section.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            let sectionName = section.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sectionID.isEmpty,
+                  !sectionName.isEmpty,
+                  sectionName.localizedCaseInsensitiveCompare("Pinned") != .orderedSame,
+                  seenIDs.insert(section.id).inserted else {
+                return false
+            }
+
+            return true
+        }
     }
 
     private static func makeSectionGroups(
         from threads: [CodexThread],
         sections: [CodexThreadSection],
         threadIDsBySection: [String: [String]],
+        sectionProjectPathsBySection: [String: [String]],
+        sectionProjectChoicesBySection: [String: [SidebarProjectChoice]],
+        projectlessRootPaths: [String],
         excludingPinnedThreadIDs pinnedThreadIDs: Set<String>,
         runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
     ) -> [SidebarThreadGroup] {
         var knownSectionsByID: [String: CodexThreadSection] = [:]
-        for section in sections where section.name.localizedCaseInsensitiveCompare("Pinned") != .orderedSame {
+        let sectionMembership = threadIDsBySection.mapValues(Set.init)
+        for section in selectableSections(sections) {
             knownSectionsByID[section.id] = section
         }
-        for section in threads.compactMap(\.section)
-        where section.name.localizedCaseInsensitiveCompare("Pinned") != .orderedSame {
+        for section in selectableSections(threads.compactMap(\.section)) {
             knownSectionsByID[section.id] = section
         }
 
-        return knownSectionsByID.values.map { section in
-            let matchingThreads = threads.filter { $0.section?.id == section.id && !pinnedThreadIDs.contains($0.id) }
+        let sortedSections = knownSectionsByID.values.sorted { lhs, rhs in
+            let lhsThreads = threads.filter {
+                threadBelongsToSection(
+                    $0,
+                    sectionID: lhs.id,
+                    sectionMembership: sectionMembership[lhs.id],
+                    hasAuthoritativeMembership: threadIDsBySection[lhs.id] != nil,
+                    sectionProjectPaths: sectionProjectPathsBySection[lhs.id] ?? []
+                ) && !pinnedThreadIDs.contains($0.id)
+            }
+            let rhsThreads = threads.filter {
+                threadBelongsToSection(
+                    $0,
+                    sectionID: rhs.id,
+                    sectionMembership: sectionMembership[rhs.id],
+                    hasAuthoritativeMembership: threadIDsBySection[rhs.id] != nil,
+                    sectionProjectPaths: sectionProjectPathsBySection[rhs.id] ?? []
+                ) && !pinnedThreadIDs.contains($0.id)
+            }
+            let lhsSortDate = lhsThreads.first?.updatedAt ?? lhsThreads.first?.createdAt ?? .distantPast
+            let rhsSortDate = rhsThreads.first?.updatedAt ?? rhsThreads.first?.createdAt ?? .distantPast
+            if lhsSortDate != rhsSortDate { return lhsSortDate > rhsSortDate }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+
+        return sortedSections.flatMap { section in
+            let matchingThreads = threads.filter {
+                threadBelongsToSection(
+                    $0,
+                    sectionID: section.id,
+                    sectionMembership: sectionMembership[section.id],
+                    hasAuthoritativeMembership: threadIDsBySection[section.id] != nil,
+                    sectionProjectPaths: sectionProjectPathsBySection[section.id] ?? []
+                ) && !pinnedThreadIDs.contains($0.id)
+            }
             let threadsByID = Dictionary(uniqueKeysWithValues: matchingThreads.map { ($0.id, $0) })
             let nativeOrderedThreads = (threadIDsBySection[section.id] ?? []).compactMap { threadsByID[$0] }
             let nativeOrderedThreadIDs = Set(nativeOrderedThreads.map(\.id))
@@ -234,7 +417,7 @@ enum SidebarThreadGrouping {
                 runBadgeStateByThreadID: runBadgeStateByThreadID
             )
             let sectionThreads = nativeOrderedThreads + remainingThreads
-            return SidebarThreadGroup(
+            let sectionGroup = SidebarThreadGroup(
                 id: "section:\(section.id)",
                 label: section.name,
                 kind: .section,
@@ -242,10 +425,55 @@ enum SidebarThreadGrouping {
                 projectPath: nil,
                 threads: sectionThreads
             )
-        }
-        .sorted { lhs, rhs in
-            if lhs.sortDate != rhs.sortDate { return lhs.sortDate > rhs.sortDate }
-            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+
+            let projectGroups = makeProjectGroups(
+                from: threadsForScope(
+                    .projects,
+                    from: sectionThreads,
+                    projectlessRootPaths: projectlessRootPaths,
+                    sectionThreadIDsBySection: threadIDsBySection,
+                    sectionProjectPathsBySection: sectionProjectPathsBySection
+                ),
+                projectSource: .configuredProjects,
+                configuredProjectChoices: sectionProjectChoicesBySection[section.id] ?? [],
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ).map { group in
+                SidebarThreadGroup(
+                    id: "section:\(section.id)/\(group.id)",
+                    label: group.label,
+                    kind: group.kind,
+                    sortDate: group.sortDate,
+                    projectPath: group.projectPath,
+                    threads: group.threads,
+                    parentSectionID: section.id,
+                    includesDescendantProjectPaths: group.includesDescendantProjectPaths
+                )
+            }
+
+            let chatGroup = makeRootlessChatGroup(
+                from: threadsForScope(
+                    .chats,
+                    from: sectionThreads,
+                    projectlessRootPaths: projectlessRootPaths,
+                    sectionThreadIDsBySection: threadIDsBySection,
+                    sectionProjectPathsBySection: sectionProjectPathsBySection
+                ),
+                excludingPinnedThreadIDs: [],
+                runBadgeStateByThreadID: runBadgeStateByThreadID
+            ).map { group in
+                SidebarThreadGroup(
+                    id: "section:\(section.id)/\(group.id)",
+                    label: group.label,
+                    kind: group.kind,
+                    sortDate: group.sortDate,
+                    projectPath: group.projectPath,
+                    threads: group.threads,
+                    parentSectionID: section.id,
+                    includesDescendantProjectPaths: group.includesDescendantProjectPaths
+                )
+            }
+
+            return [sectionGroup] + projectGroups + (chatGroup.map { [$0] } ?? [])
         }
     }
 
@@ -253,7 +481,9 @@ enum SidebarThreadGrouping {
     static func threadsForScope(
         _ scope: SidebarThreadGroupingScope,
         from threads: [CodexThread],
-        projectlessRootPaths: [String] = []
+        projectlessRootPaths: [String] = [],
+        sectionThreadIDsBySection: [String: [String]] = [:],
+        sectionProjectPathsBySection: [String: [String]] = [:]
     ) -> [CodexThread] {
         switch scope {
         case .all:
@@ -262,6 +492,94 @@ enum SidebarThreadGrouping {
             return threads.filter { !isRootlessChatThread($0, projectlessRootPaths: projectlessRootPaths) }
         case .chats:
             return threads.filter { isRootlessChatThread($0, projectlessRootPaths: projectlessRootPaths) }
+        case let .section(sectionID):
+            let sectionMembership = sectionThreadIDsBySection[sectionID].map(Set.init)
+            return threads.filter {
+                threadBelongsToSection(
+                    $0,
+                    sectionID: sectionID,
+                    sectionMembership: sectionMembership,
+                    hasAuthoritativeMembership: sectionThreadIDsBySection[sectionID] != nil,
+                    sectionProjectPaths: sectionProjectPathsBySection[sectionID] ?? []
+                )
+            }
+        }
+    }
+
+    private static func unsectionedThreads(
+        from threads: [CodexThread],
+        sectionThreadIDsBySection: [String: [String]],
+        sectionProjectPathsBySection: [String: [String]]
+    ) -> [CodexThread] {
+        let sectionMembership = sectionThreadIDsBySection.mapValues(Set.init)
+        return threads.filter { thread in
+            if let sectionID = thread.section?.id,
+               sectionThreadIDsBySection[sectionID] == nil {
+                return false
+            }
+
+            return !sectionThreadIDsBySection.keys.contains(where: { sectionID in
+                threadBelongsToSection(
+                    thread,
+                    sectionID: sectionID,
+                    sectionMembership: sectionMembership[sectionID],
+                    hasAuthoritativeMembership: sectionThreadIDsBySection[sectionID] != nil,
+                    sectionProjectPaths: sectionProjectPathsBySection[sectionID] ?? []
+                )
+            })
+        }
+    }
+
+    // The section-specific thread/list response is authoritative. Regular
+    // thread/list responses can omit section metadata, so grouping must use the
+    // membership map whenever it has a key for the section and only fall back to
+    // the per-thread field for older servers without that map.
+    private static func threadBelongsToSection(
+        _ thread: CodexThread,
+        sectionID: String,
+        sectionMembership: Set<String>?,
+        hasAuthoritativeMembership: Bool,
+        sectionProjectPaths: [String]
+    ) -> Bool {
+        if threadProjectPathMatchesAny(thread, projectPaths: sectionProjectPaths) {
+            return true
+        }
+
+        if hasAuthoritativeMembership {
+            return sectionMembership?.contains(thread.id) == true
+        }
+
+        return thread.section?.id == sectionID
+    }
+
+    static func sectionProjectPaths(
+        from choicesBySection: [String: [SidebarProjectChoice]]
+    ) -> [String: [String]] {
+        choicesBySection.mapValues { choices in
+            var seenPaths: Set<String> = []
+            return choices.compactMap { choice in
+                guard let path = CodexThread.normalizedFilesystemProjectPath(choice.projectPath),
+                      seenPaths.insert(path).inserted else {
+                    return nil
+                }
+                return path
+            }
+        }
+    }
+
+    private static func threadProjectPathMatchesAny(
+        _ thread: CodexThread,
+        projectPaths: [String]
+    ) -> Bool {
+        guard let threadPath = thread.projectGroupPath,
+              !projectPaths.isEmpty else {
+            return false
+        }
+
+        let threadComponents = projectPathComponents(threadPath)
+        return projectPaths.contains { projectPath in
+            let projectComponents = projectPathComponents(projectPath)
+            return isPathComponents(threadComponents, sameOrDescendantOf: projectComponents)
         }
     }
 
@@ -630,6 +948,10 @@ enum SidebarThreadGrouping {
         }
 
         if projectSource == .configuredProjects {
+            // Codex Desktop supplies configuredProjectChoices in its sidebar
+            // itemKeys order. Use that explicit order for every configured
+            // group, including empty projects; activity is only a fallback
+            // for groups that cannot be matched to a configured choice.
             let configuredOrderByGroupID = Dictionary(uniqueKeysWithValues: configuredProjectScopes.map {
                 (projectGroupID(forProjectPath: $0.projectPath), $0.order)
             })
@@ -753,11 +1075,27 @@ enum SidebarThreadGrouping {
         guard group.kind == .project else {
             return false
         }
+        if let parentSectionID = group.parentSectionID,
+           thread.section?.id != parentSectionID,
+           !group.threads.contains(where: { $0.id == thread.id }) {
+            return false
+        }
+
+        let unscopedGroupID: String
+        if let parentSectionID = group.parentSectionID {
+            let sectionPrefix = "section:\(parentSectionID)/"
+            unscopedGroupID = group.id.hasPrefix(sectionPrefix)
+                ? String(group.id.dropFirst(sectionPrefix.count))
+                : group.id
+        } else {
+            unscopedGroupID = group.id
+        }
+
         guard group.includesDescendantProjectPaths,
               let projectPath = group.projectPath,
               let normalizedProjectPath = CodexThread.normalizedFilesystemProjectPath(projectPath),
               let normalizedThreadPath = CodexThread.normalizedFilesystemProjectPath(thread.projectGroupPath) else {
-            return projectGroupID(for: thread) == group.id
+            return projectGroupID(for: thread) == unscopedGroupID
         }
 
         let normalizedThreadPathComponents = projectPathComponents(normalizedThreadPath)

@@ -72,15 +72,15 @@ struct TurnComposerView: View, Equatable {
     let gitState: TurnComposerGitState
     let gitActions: TurnComposerGitActions
     let onRefreshUsageStatus: () async -> Void
-    // Re-requests model/list when the runtime picker opens without options
-    // (bootstrap fetch failed or still in flight). Defaulted for previews.
+    // Refreshes model/list when the runtime picker opens so newly available
+    // models appear without reconnecting. Defaulted for previews.
     var onRefreshModelsIfNeeded: () -> Void = {}
 
     let onSelectAccessMode: (CodexAccessMode) -> Void
     let onTapAddImage: () -> Void
     let onTapTakePhoto: () -> Void
     let onTapVoice: () -> Void
-    // Starts the short-lived Realtime session after microphone permission is granted.
+    // Starts the bridge-owned GPT-Live session after microphone permission is granted.
     // The composer keeps this injectable so previews/tests never open a network socket.
     var onStartVoiceSession: () async throws -> CodexRealtimeVoiceConnection = {
         throw CodexServiceError.invalidInput("Live Voice is unavailable.")

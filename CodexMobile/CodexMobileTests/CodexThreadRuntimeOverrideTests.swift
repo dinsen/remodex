@@ -358,6 +358,40 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         )
     }
 
+    func testEmptyOrUndecodableModelListRefreshPreservesGPT6CatalogAndSelection() async throws {
+        let responseItemSets: [[JSONValue]] = [
+            [],
+            [
+                .string("invalid model entry"),
+                .object([:]),
+            ],
+        ]
+
+        for responseItems in responseItemSets {
+            let service = makeService()
+            let selectedModel = makeGPT56Model(id: "gpt-6-sol")
+            service.availableModels = [selectedModel]
+            service.setSelectedModelId(selectedModel.id)
+            service.requestTransportOverride = { method, _ in
+                XCTAssertEqual(method, "model/list")
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["items": .array(responseItems)]),
+                    includeJSONRPC: false
+                )
+            }
+
+            try await service.listModels()
+
+            XCTAssertEqual(service.availableModels.map(\.id), [selectedModel.id])
+            XCTAssertEqual(service.selectedModelId, selectedModel.id)
+            XCTAssertEqual(
+                service.defaults.string(forKey: CodexService.selectedModelIdDefaultsKey),
+                selectedModel.id
+            )
+        }
+    }
+
     func testGPT56ModelsAreFirstClassRuntimeMenuModels() {
         let orderedModels = TurnComposerMetaMapper.orderedModels(
             from: [
@@ -376,6 +410,18 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertEqual(TurnComposerMetaMapper.modelTitle(forIdentifier: "gpt-5.6-sol"), "GPT-5.6-Sol")
         XCTAssertEqual(TurnComposerMetaMapper.modelTitle(forIdentifier: "gpt-5.6-terra"), "GPT-5.6-Terra")
         XCTAssertEqual(TurnComposerMetaMapper.modelTitle(forIdentifier: "gpt-5.6-luna"), "GPT-5.6-Luna")
+    }
+
+    func testNewerModelVersionsSortAheadOfKnownModels() {
+        let orderedModels = TurnComposerMetaMapper.orderedModels(
+            from: [
+                makeModel(),
+                makeGPT55Model(),
+                makeGPT56Model(id: "gpt-6-sol"),
+            ]
+        )
+
+        XCTAssertEqual(orderedModels.first?.id, "gpt-6-sol")
     }
 
     func testGPT56ReasoningDisplayIncludesMaxAboveExtraHigh() {

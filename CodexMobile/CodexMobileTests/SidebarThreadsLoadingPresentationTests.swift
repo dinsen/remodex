@@ -43,4 +43,17 @@ final class SidebarThreadsLoadingPresentationTests: XCTestCase {
 
         XCTAssertFalse(shouldShow)
     }
+
+    func testDefersSidebarDataRebuildUntilThreadHydrationCompletes() {
+        XCTAssertTrue(
+            SidebarThreadsLoadingPresentation.shouldDeferSidebarDataRebuild(
+                isLoadingThreads: true
+            )
+        )
+        XCTAssertFalse(
+            SidebarThreadsLoadingPresentation.shouldDeferSidebarDataRebuild(
+                isLoadingThreads: false
+            )
+        )
+    }
 }

@@ -31,6 +31,12 @@ struct CodexConfiguredProject: Identifiable, Equatable, Sendable {
     let path: String
 }
 
+struct CodexSidebarSection: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let projects: [CodexConfiguredProject]
+}
+
 struct CodexProjectlessChatRoots: Equatable, Sendable {
     let roots: [String]
     let codexHome: String?
@@ -57,6 +63,17 @@ extension CodexService {
         }
 
         return projects.compactMap(Self.decodeConfiguredProject)
+    }
+
+    // Mirrors Codex Desktop's local custom sidebar sections. These memberships
+    // are project assignments, not app-server thread-section membership.
+    func fetchSidebarSections() async throws -> [CodexSidebarSection] {
+        let response = try await sendRequest(method: "project/sidebarSections", params: .object([:]))
+        guard let rawSections = response.result?.objectValue?["sections"]?.arrayValue else {
+            throw CodexServiceError.invalidResponse("project/sidebarSections response missing sections")
+        }
+
+        return rawSections.compactMap(Self.decodeSidebarSection)
     }
 
     // Reads host-side Codex chat roots so projectless classification survives custom CODEX_HOME.
@@ -175,6 +192,21 @@ private extension CodexService {
         }
 
         return CodexConfiguredProject(id: id, label: label, path: path)
+    }
+
+    static func decodeSidebarSection(_ value: JSONValue) -> CodexSidebarSection? {
+        guard let object = value.objectValue,
+              let id = object["id"]?.stringValue,
+              let name = object["name"]?.stringValue,
+              let rawProjects = object["projects"]?.arrayValue else {
+            return nil
+        }
+
+        return CodexSidebarSection(
+            id: id,
+            name: name,
+            projects: rawProjects.compactMap(Self.decodeConfiguredProject)
+        )
     }
 
     static func decodeProjectDirectoryEntry(_ value: JSONValue) -> CodexProjectDirectoryEntry? {

@@ -71,6 +71,8 @@ async function handleProjectMethod(method, params, options = {}) {
       return projectQuickLocations(options);
     case "project/configuredProjects":
       return projectConfiguredProjects(options);
+    case "project/sidebarSections":
+      return projectSidebarSections(options);
     case "project/projectlessRoots":
       return projectProjectlessRoots(options);
     case "project/listDirectory":
@@ -138,6 +140,155 @@ async function projectConfiguredProjects(options = {}) {
     configPath,
     projects,
   };
+}
+
+// Codex Desktop stores custom sidebar sections separately from the app-server's
+// thread sections. Their itemKeys are project identities, so threadSection/list
+// alone cannot reproduce the desktop sidebar hierarchy on another client.
+async function projectSidebarSections(options = {}) {
+  const codexHome = path.resolve(readString(options.codexHome) || resolveCodexHome());
+  const globalStatePath = path.resolve(
+    readString(options.globalStatePath) || path.join(codexHome, CODEX_GLOBAL_STATE_FILE)
+  );
+
+  let globalState;
+  try {
+    globalState = JSON.parse(await fs.promises.readFile(globalStatePath, "utf8"));
+  } catch {
+    return { sections: [] };
+  }
+
+  const localProjects = globalState?.["local-projects"];
+  const appServerProjectIDs = reverseAppServerProjectIDs(
+    globalState?.["app-server-project-id-by-legacy-project-id-by-host"]
+  );
+  const persistedState = globalState?.["electron-persisted-atom-state"];
+  const sectionStateByAccount = persistedState?.["sidebar-custom-sections-v3"];
+  if (!sectionStateByAccount || typeof sectionStateByAccount !== "object") {
+    return { sections: [] };
+  }
+
+  const sectionsByID = new Map();
+  for (const sectionState of Object.values(sectionStateByAccount)) {
+    if (!sectionState || typeof sectionState !== "object" || !Array.isArray(sectionState.sections)) {
+      continue;
+    }
+
+    const sectionOrder = new Map(
+      (Array.isArray(sectionState.sectionOrder) ? sectionState.sectionOrder : [])
+        .map((value, index) => [readString(value)?.replace(/^custom:/u, ""), index])
+        .filter(([id]) => Boolean(id))
+    );
+    const orderedSections = [...sectionState.sections].sort((left, right) => {
+      const leftOrder = sectionOrder.get(readString(left?.id)) ?? Number.MAX_SAFE_INTEGER;
+      const rightOrder = sectionOrder.get(readString(right?.id)) ?? Number.MAX_SAFE_INTEGER;
+      return leftOrder - rightOrder;
+    });
+
+    for (const rawSection of orderedSections) {
+      const name = readString(rawSection?.name);
+      const hostSectionIDs = rawSection?.hostSectionIds;
+      const sectionID = readString(hostSectionIDs?.local)
+        || (hostSectionIDs && typeof hostSectionIDs === "object"
+          ? Object.values(hostSectionIDs).map(readString).find(Boolean)
+          : null);
+      if (!name || !sectionID) {
+        continue;
+      }
+
+      const projects = resolveSidebarSectionProjects(
+        rawSection?.itemKeys,
+        localProjects,
+        appServerProjectIDs
+      );
+      const existing = sectionsByID.get(sectionID);
+      if (existing) {
+        existing.projects = mergeSidebarProjects(existing.projects, projects);
+      } else {
+        sectionsByID.set(sectionID, { id: sectionID, name, projects });
+      }
+    }
+  }
+
+  return { sections: Array.from(sectionsByID.values()) };
+}
+
+function reverseAppServerProjectIDs(mappingByHost) {
+  const reverse = new Map();
+  if (!mappingByHost || typeof mappingByHost !== "object") {
+    return reverse;
+  }
+
+  for (const mapping of Object.values(mappingByHost)) {
+    if (!mapping || typeof mapping !== "object") {
+      continue;
+    }
+    for (const [legacyID, appServerID] of Object.entries(mapping)) {
+      const normalizedLegacyID = readString(legacyID);
+      const normalizedAppServerID = readString(appServerID);
+      if (normalizedLegacyID && normalizedAppServerID && !reverse.has(normalizedAppServerID)) {
+        reverse.set(normalizedAppServerID, normalizedLegacyID);
+      }
+    }
+  }
+
+  return reverse;
+}
+
+function resolveSidebarSectionProjects(itemKeys, localProjects, appServerProjectIDs) {
+  if (!Array.isArray(itemKeys) || !localProjects || typeof localProjects !== "object") {
+    return [];
+  }
+
+  // Codex Desktop's itemKeys array is the user-visible project order. Keep the
+  // first occurrence of every root path in that order; do not sort by label or
+  // recent activity here because the iOS sidebar mirrors this sequence.
+  const projects = [];
+  const seenPaths = new Set();
+  for (const itemKey of itemKeys) {
+    const normalizedKey = readString(itemKey);
+    if (!normalizedKey || !normalizedKey.startsWith("codex:project:")) {
+      continue;
+    }
+
+    const projectID = normalizedKey.slice("codex:project:".length);
+    const project = localProjects[projectID]
+      || localProjects[appServerProjectIDs.get(projectID)];
+    if (!project || typeof project !== "object" || !Array.isArray(project.rootPaths)) {
+      continue;
+    }
+
+    for (const rootPath of project.rootPaths) {
+      const normalizedRootPath = readString(rootPath);
+      if (!normalizedRootPath) {
+        continue;
+      }
+      const resolvedPath = realpathSyncIfAvailable(path.resolve(normalizedRootPath));
+      if (!resolvedPath || seenPaths.has(resolvedPath)) {
+        continue;
+      }
+      seenPaths.add(resolvedPath);
+      projects.push({
+        id: `project:${resolvedPath}`,
+        label: readString(project.name) || path.basename(resolvedPath) || resolvedPath,
+        path: resolvedPath,
+      });
+    }
+  }
+
+  return projects;
+}
+
+function mergeSidebarProjects(existingProjects, additionalProjects) {
+  const merged = [...existingProjects];
+  const seenPaths = new Set(merged.map((project) => project.path));
+  for (const project of additionalProjects) {
+    if (!seenPaths.has(project.path)) {
+      seenPaths.add(project.path);
+      merged.push(project);
+    }
+  }
+  return merged;
 }
 
 async function projectProjectlessRoots(options = {}) {
@@ -816,6 +967,7 @@ module.exports = {
   handleProjectMethod,
   projectQuickLocations,
   projectConfiguredProjects,
+  projectSidebarSections,
   projectProjectlessRoots,
   projectListDirectory,
   projectSearchDirectories,

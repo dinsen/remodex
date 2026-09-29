@@ -11,7 +11,8 @@ import Foundation
 enum TurnComposerMetaMapper {
     // ─── Model Mapping ────────────────────────────────────────────────
 
-    // Returns models sorted using the explicit product order expected by the UI.
+    // Newer numeric model versions sort first, so newly advertised families
+    // appear in the main picker without adding their identifiers here.
     static func orderedModels(from models: [CodexModelOption]) -> [CodexModelOption] {
         let preferredOrder: [String] = [
             "gpt-5.6-sol",
@@ -30,13 +31,42 @@ enum TurnComposerMetaMapper {
         })
 
         return models.sorted { lhs, rhs in
+            let versionOrder = compareModelVersions(
+                modelVersionComponents(for: lhs),
+                modelVersionComponents(for: rhs)
+            )
+            if versionOrder != .orderedSame {
+                return versionOrder == .orderedDescending
+            }
+
             let lhsRank = rankByModel[lhs.model.lowercased()] ?? Int.max
             let rhsRank = rankByModel[rhs.model.lowercased()] ?? Int.max
-            if lhsRank == rhsRank {
-                return modelTitle(for: lhs) > modelTitle(for: rhs)
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
             }
-            return lhsRank < rhsRank
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault
+            }
+            return modelTitle(for: lhs) > modelTitle(for: rhs)
         }
+    }
+
+    private static func modelVersionComponents(for model: CodexModelOption) -> [Int] {
+        let modelIdentifier = model.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identifier = modelIdentifier.isEmpty ? model.id : modelIdentifier
+        return identifier
+            .components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .compactMap(Int.init)
+    }
+
+    private static func compareModelVersions(_ lhs: [Int], _ rhs: [Int]) -> ComparisonResult {
+        for index in 0..<max(lhs.count, rhs.count) {
+            let lhsComponent = index < lhs.count ? lhs[index] : 0
+            let rhsComponent = index < rhs.count ? rhs[index] : 0
+            guard lhsComponent != rhsComponent else { continue }
+            return lhsComponent < rhsComponent ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
     }
 
     // Normalizes backend ids into consistent menu labels.

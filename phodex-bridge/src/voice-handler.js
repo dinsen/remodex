@@ -11,10 +11,28 @@ const {
   readWavInfo,
   wavDurationMs,
 } = require("./voice-audio");
+const { randomUUID, createHash } = require("crypto");
+const {
+  OPENAI_KEYCHAIN_ACCOUNT,
+  OPENAI_KEYCHAIN_SERVICE,
+  resolveOpenAIAPIKey,
+} = require("./openai-credential");
+const DefaultWebSocket = require("ws");
 
 const CHATGPT_TRANSCRIPTIONS_URL = "https://chatgpt.com/backend-api/transcribe";
-const OPENAI_REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets";
-const DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1";
+const OPENAI_LIVE_WEBSOCKET_URL = "wss://api.openai.com/v1/live/sessions";
+const DEFAULT_LIVE_MODEL = "gpt-live-1";
+const DEFAULT_LIVE_AUDIO_FORMAT = Object.freeze({ type: "audio/pcm", rate: 24_000 });
+const DEFAULT_LIVE_VOICE = "marin";
+const LIVE_SESSION_TTL_MS = 15 * 60 * 1_000;
+const LIVE_START_TIMEOUT_MS = 15_000;
+const LIVE_CLOSE_FINALIZATION_TIMEOUT_MS = 5_000;
+const LIVE_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
+const LIVE_DELEGATION_TRANSCRIPT_SETTLE_MS = 100;
+const LIVE_DELEGATION_TRANSCRIPT_TIMEOUT_MS = 3_000;
+const MAX_TIMER_DELAY_MS = 0x7fff_ffff;
+const MAX_LIVE_AUDIO_CHUNK_BYTES = 512 * 1024;
+const MAX_LIVE_EVENT_BYTES = 64 * 1024;
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 const MAX_DURATION_SECONDS = 150;
 const MAX_DURATION_MS = MAX_DURATION_SECONDS * 1_000;
@@ -170,28 +188,86 @@ function createVoiceHandler({
   };
 }
 
-// Creates short-lived Realtime credentials only after the phone has reached the
-// bridge through its existing paired, encrypted application channel. The bridge
-// never persists, logs, or forwards the long-lived OpenAI API key.
+// Owns GPT-Live sessions on the Mac bridge. The phone reaches this handler only
+// after secure-transport pairing/decryption, so the long-lived OpenAI key never
+// crosses the relay or device boundary. The bridge also keeps Codex delegation
+// context here and returns only a short, user-visible commentary summary.
 function createRealtimeSessionHandler({
-  apiKey = process.env.REMODEX_OPENAI_REALTIME_API_KEY,
-  createClientSecret = null,
-  fetchImpl = globalThis.fetch,
+  apiKey,
+  apiKeyResolver = resolveOpenAIAPIKey,
+  credentialResolver = null,
+  env = process.env,
+  platform = process.platform,
+  commandRunner,
+  WebSocketImpl = DefaultWebSocket,
   sendCodexRequest = null,
+  runDelegatedTask = null,
+  sendApplicationResponse = null,
   logger = console,
   logPrefix = "[remodex]",
   now = Date.now,
+  sessionTimeoutMs = LIVE_START_TIMEOUT_MS,
+  closeFinalizationTimeoutMs = LIVE_CLOSE_FINALIZATION_TIMEOUT_MS,
+  idleTimeoutMs = LIVE_IDLE_TIMEOUT_MS,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
 } = {}) {
-  const mintClientSecret = typeof createClientSecret === "function"
-    ? createClientSecret
-    : createConfiguredRealtimeClientSecret({ apiKey, fetchImpl });
+  const sessions = new Map();
+  const resolveCredential = () => {
+    // apiKey is an explicit dependency-injection hook for tests and local
+    // embedding. Production bridge construction leaves it undefined so the
+    // Keychain-first resolver is used at session start.
+    if (apiKey !== undefined) {
+      const normalized = readString(apiKey);
+      return normalized ? { apiKey: normalized, source: "injected" } : null;
+    }
+    const resolver = typeof credentialResolver === "function"
+      ? credentialResolver
+      : apiKeyResolver;
+    if (typeof resolver !== "function") {
+      return null;
+    }
+    try {
+      const result = resolver({ env, platform, commandRunner });
+      if (typeof result === "string") {
+        return result.trim() ? { apiKey: result.trim(), source: "resolver" } : null;
+      }
+      const normalized = readString(result?.apiKey);
+      return normalized ? { apiKey: normalized, source: readString(result?.source) || "resolver" } : null;
+    } catch {
+      // Resolver failures are deliberately opaque; command output may contain
+      // the credential and must never reach logs or phone-facing errors.
+      return null;
+    }
+  };
 
   function handleRealtimeSessionRequest(rawMessage, sendResponse, parsedMessage = null) {
     const parsed = parsedMessage || parseJsonMessage(rawMessage);
-    if (!parsed || parsed.method !== "voice/realtime/session") {
+    if (!parsed || typeof parsed.method !== "string") {
       return false;
     }
 
+    const method = parsed.method;
+    if (method === "voice/realtime/session") {
+      handleSessionStart(parsed, sendResponse);
+      return true;
+    }
+    if (method === "voice/realtime/audio") {
+      handleAudioAppend(parsed, sendResponse);
+      return true;
+    }
+    if (method === "voice/realtime/event") {
+      handleClientEvent(parsed, sendResponse);
+      return true;
+    }
+    if (method === "voice/realtime/close") {
+      handleSessionClose(parsed, sendResponse);
+      return true;
+    }
+    return false;
+  }
+
+  function handleSessionStart(parsed, sendResponse) {
     const threadId = readString(parsed.params?.threadId);
     const id = parsed.id;
     Promise.resolve()
@@ -199,7 +275,8 @@ function createRealtimeSessionHandler({
         if (!threadId) {
           throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can start.");
         }
-        if (typeof mintClientSecret !== "function") {
+        const credential = resolveCredential();
+        if (!credential?.apiKey) {
           throw voiceError(
             "realtime_not_configured",
             "Live Voice is not configured on this Mac bridge."
@@ -208,20 +285,16 @@ function createRealtimeSessionHandler({
 
         await verifyRealtimeThread(sendCodexRequest, threadId);
 
-        const result = await mintClientSecret({
-          model: DEFAULT_REALTIME_MODEL,
-          safetyIdentifier: createRealtimeSafetyIdentifier(threadId),
+        return await openLiveSession({
+          threadId,
+          apiKey: credential.apiKey,
+          now,
+          sessionTimeoutMs,
+          closeFinalizationTimeoutMs,
+          idleTimeoutMs,
+          setTimeoutImpl,
+          clearTimeoutImpl,
         });
-        const clientSecret = readString(result?.value || result?.clientSecret);
-        const expiresAt = Number(result?.expires_at ?? result?.expiresAt);
-        if (!clientSecret || !isPlausibleFutureRealtimeExpiry(expiresAt, now)) {
-          throw voiceError("realtime_invalid_response", "The Live Voice session could not be started.");
-        }
-
-        logRealtimeEvent(logger, "log", logPrefix, "session issued", {
-          hasExpiry: true,
-        });
-        return { clientSecret, expiresAt };
       })
       .then((result) => {
         if (id != null) {
@@ -243,7 +316,551 @@ function createRealtimeSessionHandler({
           }));
         }
       });
+  }
+
+  function handleAudioAppend(parsed, sendResponse) {
+    const id = parsed.id;
+    const params = parsed.params || {};
+    const state = readSession(sessions, params.sessionId);
+    const encodedAudio = readString(params.audio || params.audioBase64);
+    Promise.resolve()
+      .then(() => {
+        if (!state) {
+          throw voiceError("invalid_realtime_session", "The Live Voice session is no longer available.");
+        }
+        if (state.closeRequested) {
+          throw voiceError("invalid_realtime_session", "The Live Voice session is closing.");
+        }
+        const requestedThreadId = readString(params.threadId);
+        if (requestedThreadId && requestedThreadId !== state.threadId) {
+          throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can continue.");
+        }
+        const audioBuffer = decodeLiveAudioBase64(encodedAudio);
+        if (!audioBuffer
+          || audioBuffer.length === 0
+          || audioBuffer.length % 2 !== 0
+          || audioBuffer.length > MAX_LIVE_AUDIO_CHUNK_BYTES) {
+          throw voiceError("invalid_realtime_audio", "Live Voice audio was not valid PCM data.");
+        }
+        touchLiveSession(state);
+        sendLiveSocketEvent(state, {
+          type: "session.input_audio.append",
+          audio: encodedAudio,
+        });
+        return { ok: true };
+      })
+      .then((result) => {
+        if (id != null) {
+          sendResponse(JSON.stringify({ id, result }));
+        }
+      })
+      .catch((error) => sendRealtimeErrorResponse(id, sendResponse, error, logger, logPrefix));
+  }
+
+  function handleClientEvent(parsed, sendResponse) {
+    const id = parsed.id;
+    const params = parsed.params || {};
+    const state = readSession(sessions, params.sessionId);
+    const event = params.event && typeof params.event === "object"
+      ? params.event
+      : params;
+    Promise.resolve()
+      .then(() => {
+        if (!state) {
+          throw voiceError("invalid_realtime_session", "The Live Voice session is no longer available.");
+        }
+        if (state.closeRequested) {
+          throw voiceError("invalid_realtime_session", "The Live Voice session is closing.");
+        }
+        const requestedThreadId = readString(params.threadId);
+        if (requestedThreadId && requestedThreadId !== state.threadId) {
+          throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can continue.");
+        }
+        if (!isAllowedLiveClientEvent(event)) {
+          throw voiceError("unsupported_realtime_event", "That Live Voice control is not supported.");
+        }
+        touchLiveSession(state);
+        sendLiveSocketEvent(state, event);
+        return { ok: true };
+      })
+      .then((result) => {
+        if (id != null) {
+          sendResponse(JSON.stringify({ id, result }));
+        }
+      })
+      .catch((error) => sendRealtimeErrorResponse(id, sendResponse, error, logger, logPrefix));
+  }
+
+  function handleSessionClose(parsed, sendResponse) {
+    const id = parsed.id;
+    const state = readSession(sessions, parsed.params?.sessionId);
+    Promise.resolve()
+      .then(() => {
+        if (!state) {
+          throw voiceError("invalid_realtime_session", "The Live Voice session is no longer available.");
+        }
+        const requestedThreadId = readString(parsed.params?.threadId);
+        if (requestedThreadId && requestedThreadId !== state.threadId) {
+          throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can continue.");
+        }
+        if (!state.closed && !state.closeRequested) {
+          if (!requestLiveSessionClose(state)) {
+            throw voiceError("invalid_realtime_session", "The Live Voice session is no longer available.");
+          }
+        }
+        return { ok: true };
+      })
+      .then((result) => {
+        if (id != null) {
+          sendResponse(JSON.stringify({ id, result }));
+        }
+      })
+      .catch((error) => sendRealtimeErrorResponse(id, sendResponse, error, logger, logPrefix));
+  }
+
+  async function openLiveSession({
+    threadId,
+    apiKey: normalizedApiKey,
+    now: clock,
+    sessionTimeoutMs: timeoutMs,
+    closeFinalizationTimeoutMs: finalizationTimeoutMs,
+    idleTimeoutMs: idleTimeout,
+    setTimeoutImpl: setTimer,
+    clearTimeoutImpl: clearTimer,
+  }) {
+    if (typeof WebSocketImpl !== "function") {
+      throw voiceError("realtime_unavailable", "Live Voice is unavailable right now.");
+    }
+
+    const sessionId = `live-${randomUUID()}`;
+    const safetyIdentifier = createRealtimeSafetyIdentifier(threadId);
+    let socket;
+    try {
+      socket = instantiateLiveSocket(WebSocketImpl, normalizedApiKey, safetyIdentifier);
+    } catch {
+      throw voiceError("realtime_unavailable", "Live Voice is unavailable right now.");
+    }
+
+    const state = {
+      sessionId,
+      threadId,
+      socket,
+      inputTranscriptSegments: [],
+      inputTranscriptEventIds: new Set(),
+      lastDelegationOffsetMs: 0,
+      delegations: new Set(),
+      pendingDelegations: new Map(),
+      started: false,
+      startSent: false,
+      closed: false,
+      closeRequested: false,
+      expiresAt: null,
+      startTimer: null,
+      closeTimer: null,
+      expiryTimer: null,
+      idleTimer: null,
+      closeFinalizationTimeoutMs: finalizationTimeoutMs,
+      idleTimeoutMs: idleTimeout,
+      setTimeoutImpl: setTimer,
+      clearTimeoutImpl: clearTimer,
+      startedResolve: null,
+      startedReject: null,
+    };
+    sessions.set(sessionId, state);
+
+    const startedPromise = new Promise((resolve, reject) => {
+      state.startedResolve = resolve;
+      state.startedReject = reject;
+      const timeout = Number.isFinite(timeoutMs) ? Math.max(0, Number(timeoutMs)) : LIVE_START_TIMEOUT_MS;
+      state.startTimer = setTimer(() => {
+        if (!state.started) {
+          reject(voiceError("realtime_timeout", "Live Voice took too long to start."));
+          closeLiveSocket(state);
+        }
+      }, timeout);
+      state.startTimer?.unref?.();
+    });
+
+    addLiveSocketListener(socket, "open", () => sendSessionStart(state));
+    addLiveSocketListener(socket, "message", (message) => handleLiveSocketMessage(state, message));
+    addLiveSocketListener(socket, "error", () => {
+      if (!state.started) {
+        state.startedReject?.(voiceError("realtime_unavailable", "Live Voice is unavailable right now."));
+      }
+      terminateLiveSession(state);
+      logRealtimeEvent(logger, "error", logPrefix, "provider error", { session: "live" });
+    });
+    addLiveSocketListener(socket, "close", () => {
+      if (!state.started) {
+        state.startedReject?.(voiceError("realtime_unavailable", "Live Voice is unavailable right now."));
+      }
+      terminateLiveSession(state, { closeSocket: false });
+    });
+
+    // Some injected transports are already open synchronously; ws normally
+    // emits `open` on a later turn.
+    if (isLiveSocketOpen(socket, WebSocketImpl)) {
+      sendSessionStart(state);
+    }
+
+    const startedEvent = await startedPromise.catch((error) => {
+      terminateLiveSession(state);
+      throw error;
+    });
+    if (state.startTimer) {
+      clearTimer(state.startTimer);
+      state.startTimer = null;
+    }
+    const providerExpiry = Number(startedEvent?.session?.expires_at ?? startedEvent?.expires_at);
+    if (Number.isFinite(providerExpiry) && !isPlausibleFutureRealtimeExpiry(providerExpiry, clock)) {
+      terminateLiveSession(state);
+      throw voiceError("realtime_invalid_response", "The Live Voice session could not be started.");
+    }
+    state.expiresAt = Number.isFinite(providerExpiry)
+      ? providerExpiry
+      : Math.floor(Number(clock()) / 1_000) + Math.floor(LIVE_SESSION_TTL_MS / 1_000);
+    scheduleLiveSessionExpiry(state, clock);
+    touchLiveSession(state);
+
+    logRealtimeEvent(logger, "log", logPrefix, "session started", {
+      model: DEFAULT_LIVE_MODEL,
+      source: "bridge",
+    });
+    return {
+      sessionId,
+      model: DEFAULT_LIVE_MODEL,
+      transport: "bridge",
+      expiresAt: state.expiresAt,
+    };
+  }
+
+  function sendSessionStart(state) {
+    if (state.closed || state.started || state.startSent) {
+      return;
+    }
+    state.startSent = true;
+    try {
+      sendLiveSocketEvent(state, {
+        type: "session.start",
+        event_id: randomUUID(),
+        session: {
+          model: DEFAULT_LIVE_MODEL,
+          instructions: "You are the live voice interface for the user's local Codex task. Keep spoken replies concise and delegate task execution to the paired Mac bridge.",
+          audio: {
+            format: { ...DEFAULT_LIVE_AUDIO_FORMAT },
+            output: { voice: DEFAULT_LIVE_VOICE },
+          },
+          delegation: { type: "client" },
+        },
+      });
+    } catch (error) {
+      state.startedReject?.(voiceError("realtime_unavailable", "Live Voice is unavailable right now."));
+      closeLiveSocket(state);
+    }
+  }
+
+  function handleLiveSocketMessage(state, rawMessage) {
+    const event = parseLiveSocketMessage(rawMessage);
+    if (!event || state.closed) {
+      return;
+    }
+    if (event.type !== "session.closed") {
+      touchLiveSession(state);
+    }
+    if (event.type === "session.started") {
+      state.started = true;
+      state.startedResolve?.(event);
+    }
+    if (event.type === "session.input_transcript.delta") {
+      recordLiveInputTranscript(state, event);
+    }
+    if (event.type === "session.delegation.created") {
+      queueLiveDelegation(state, event);
+    }
+    sendLiveApplicationEvent(sendApplicationResponse, state.sessionId, event);
+    if (event.type === "session.closed") {
+      terminateLiveSession(state);
+    } else if (event.type === "error") {
+      terminateLiveSession(state);
+    }
+  }
+
+  function recordLiveInputTranscript(state, event) {
+    const text = readString(event.delta || event.text || event.transcript);
+    const startMs = Number(event.start_ms);
+    const endMs = Number(event.end_ms);
+    if (!text || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+      return;
+    }
+
+    const eventId = readString(event.event_id) || `${startMs}:${endMs}:${text}`;
+    if (state.inputTranscriptEventIds.has(eventId)) {
+      return;
+    }
+    state.inputTranscriptEventIds.add(eventId);
+    state.inputTranscriptSegments.push({ startMs, endMs, text });
+    state.inputTranscriptSegments.sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs);
+
+    for (const pending of state.pendingDelegations.values()) {
+      if (liveDelegationHasTranscript(state, pending)) {
+        scheduleLiveDelegationRun(state, pending);
+      }
+    }
+  }
+
+  function queueLiveDelegation(state, event) {
+    if (state.closed || state.closeRequested) {
+      return;
+    }
+    const delegation = event.delegation;
+    const delegationId = readString(delegation?.id || delegation?.delegation_id);
+    if (!delegationId || readString(delegation?.target).toLowerCase() !== "client" || state.delegations.has(delegationId)) {
+      return;
+    }
+    state.delegations.add(delegationId);
+
+    const offsetMs = Number(event.offset_ms);
+    if (!Number.isFinite(offsetMs) || offsetMs < state.lastDelegationOffsetMs) {
+      return;
+    }
+    const pending = {
+      delegationId,
+      startOffsetMs: state.lastDelegationOffsetMs,
+      endOffsetMs: offsetMs,
+      settleTimer: null,
+      timeoutTimer: null,
+      started: false,
+    };
+    state.lastDelegationOffsetMs = offsetMs;
+    state.pendingDelegations.set(delegationId, pending);
+    pending.timeoutTimer = state.setTimeoutImpl(() => {
+      pending.timeoutTimer = null;
+      if (pending.started || state.closed || state.closeRequested) {
+        return;
+      }
+      state.pendingDelegations.delete(delegationId);
+      try {
+        sendLiveSocketEvent(state, {
+          type: "session.commentary.append",
+          event_id: randomUUID(),
+          delegation_id: delegationId,
+          content: "I didn't receive a voice request to send to Codex, so I didn't start a task.",
+        });
+      } catch {
+        // A transcript timeout should not affect live-session cleanup.
+      }
+    }, LIVE_DELEGATION_TRANSCRIPT_TIMEOUT_MS);
+    pending.timeoutTimer?.unref?.();
+    scheduleLiveDelegationRun(state, pending);
+  }
+
+  function liveDelegationHasTranscript(state, pending) {
+    return state.inputTranscriptSegments.some((segment) => (
+      segment.endMs > pending.startOffsetMs
+      && segment.endMs <= pending.endOffsetMs
+      && segment.startMs < pending.endOffsetMs
+    ));
+  }
+
+  function scheduleLiveDelegationRun(state, pending) {
+    if (pending.started || !liveDelegationHasTranscript(state, pending)) {
+      return;
+    }
+    if (pending.settleTimer) {
+      state.clearTimeoutImpl(pending.settleTimer);
+      pending.settleTimer = null;
+    }
+    pending.settleTimer = state.setTimeoutImpl(() => {
+      pending.settleTimer = null;
+      runLiveDelegation(state, pending).catch(() => {});
+    }, LIVE_DELEGATION_TRANSCRIPT_SETTLE_MS);
+    pending.settleTimer?.unref?.();
+  }
+
+  async function runLiveDelegation(state, pending) {
+    if (state.closed || state.closeRequested || pending.started) {
+      return;
+    }
+    const transcript = state.inputTranscriptSegments
+      .filter((segment) => (
+        segment.endMs > pending.startOffsetMs
+        && segment.endMs <= pending.endOffsetMs
+        && segment.startMs < pending.endOffsetMs
+      ))
+      .map((segment) => segment.text)
+      .join("")
+      .trim();
+    if (!transcript) {
+      return;
+    }
+    pending.started = true;
+    state.pendingDelegations.delete(pending.delegationId);
+    if (pending.timeoutTimer) {
+      state.clearTimeoutImpl(pending.timeoutTimer);
+      pending.timeoutTimer = null;
+    }
+
+    const context = {
+      threadId: state.threadId,
+      sessionId: state.sessionId,
+      delegationId: pending.delegationId,
+      transcript,
+    };
+    let result;
+    try {
+      result = typeof runDelegatedTask === "function"
+        ? await runDelegatedTask(context)
+        : await runDefaultLiveDelegation(context);
+    } catch {
+      result = "I couldn't complete that Codex request on the Mac.";
+    }
+    if (state.closed || state.closeRequested) {
+      return;
+    }
+    sendLiveSocketEvent(state, {
+      type: "session.commentary.append",
+      event_id: randomUUID(),
+      delegation_id: pending.delegationId,
+      content: truncateLiveCommentary(result),
+    });
+  }
+
+  async function runDefaultLiveDelegation({ threadId, transcript }) {
+    if (typeof sendCodexRequest !== "function") {
+      return "Codex is unavailable on this Mac right now.";
+    }
+    const text = readString(transcript);
+    if (!text) {
+      return "I didn't catch a voice request to send to Codex.";
+    }
+    try {
+      await sendCodexRequest("turn/start", {
+        threadId,
+        input: [{ type: "text", text }],
+      });
+      return "Codex started the requested task on the Mac.";
+    } catch {
+      return "Codex could not start the requested task on the Mac.";
+    }
+  }
+
+function touchLiveSession(state) {
+    if (!state || state.closed || state.closeRequested) {
+      return;
+    }
+    if (state.idleTimer) {
+      state.clearTimeoutImpl(state.idleTimer);
+      state.idleTimer = null;
+    }
+    const timeout = Number(state.idleTimeoutMs);
+    if (!Number.isFinite(timeout) || timeout <= 0) {
+      return;
+    }
+    scheduleBoundedLiveTimer(state, "idleTimer", timeout, () => {
+      requestLiveSessionClose(state);
+    });
+  }
+
+  function scheduleLiveSessionExpiry(state, clock) {
+    const expiresAtMs = Number(state.expiresAt) * 1_000;
+    const nowMs = Number(clock());
+    if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs)) {
+      return;
+    }
+    const delay = Math.max(0, expiresAtMs - nowMs);
+    scheduleBoundedLiveTimer(state, "expiryTimer", delay, () => {
+      requestLiveSessionClose(state);
+    });
+  }
+
+  function requestLiveSessionClose(state) {
+    if (!state || state.closed || state.closeRequested) {
+      return;
+    }
+    // Mark the session as closing before writing the provider event so a
+    // synchronous provider callback cannot race another close/audio operation
+    // into the live socket. Idle/expiry cleanup uses this same graceful path.
+    state.closeRequested = true;
+    try {
+      sendLiveSocketEvent(state, { type: "session.close" });
+    } catch (error) {
+      terminateLiveSession(state);
+      return false;
+    }
+    scheduleLiveCloseFinalization(state);
     return true;
+  }
+
+  function scheduleLiveCloseFinalization(state) {
+    if (!state || state.closed) {
+      return;
+    }
+    if (state.closeTimer) {
+      state.clearTimeoutImpl(state.closeTimer);
+      state.closeTimer = null;
+    }
+    const timeout = Number(state.closeFinalizationTimeoutMs);
+    if (!Number.isFinite(timeout) || timeout <= 0) {
+      terminateLiveSession(state);
+      return;
+    }
+    scheduleBoundedLiveTimer(state, "closeTimer", timeout, () => {
+      terminateLiveSession(state);
+    });
+  }
+
+  function terminateLiveSession(state, { closeSocket = true } = {}) {
+    if (!state) {
+      return;
+    }
+    state.closed = true;
+    sessions.delete(state.sessionId);
+    if (state.startTimer) {
+      state.clearTimeoutImpl(state.startTimer);
+      state.startTimer = null;
+    }
+    if (state.closeTimer) {
+      state.clearTimeoutImpl(state.closeTimer);
+      state.closeTimer = null;
+    }
+    if (state.expiryTimer) {
+      state.clearTimeoutImpl(state.expiryTimer);
+      state.expiryTimer = null;
+    }
+    if (state.idleTimer) {
+      state.clearTimeoutImpl(state.idleTimer);
+      state.idleTimer = null;
+    }
+    clearPendingLiveDelegations(state);
+    if (closeSocket) {
+      closeLiveSocket(state);
+    }
+  }
+
+  function clearPendingLiveDelegations(state) {
+    for (const pending of state.pendingDelegations.values()) {
+      if (pending.settleTimer) {
+        state.clearTimeoutImpl(pending.settleTimer);
+      }
+      if (pending.timeoutTimer) {
+        state.clearTimeoutImpl(pending.timeoutTimer);
+      }
+    }
+    state.pendingDelegations.clear();
+  }
+
+  function scheduleBoundedLiveTimer(state, timerKey, delayMs, callback) {
+    const delay = Math.max(0, Number(delayMs) || 0);
+    const slice = Math.min(delay, MAX_TIMER_DELAY_MS);
+    state[timerKey] = state.setTimeoutImpl(() => {
+      if (delay > slice && !state.closed) {
+        scheduleBoundedLiveTimer(state, timerKey, delay - slice, callback);
+        return;
+      }
+      state[timerKey] = null;
+      callback();
+    }, slice);
+    state[timerKey]?.unref?.();
   }
 
   return { handleRealtimeSessionRequest };
@@ -289,47 +906,186 @@ function isPlausibleFutureRealtimeExpiry(expiresAt, now) {
   return Number.isFinite(nowSeconds) && expiresAt > nowSeconds;
 }
 
-function createConfiguredRealtimeClientSecret({ apiKey, fetchImpl }) {
-  const normalizedApiKey = readString(apiKey);
-  if (!normalizedApiKey || typeof fetchImpl !== "function") {
-    return null;
-  }
-
-  return async ({ model, safetyIdentifier }) => {
-    let response;
-    try {
-      response = await fetchImpl(OPENAI_REALTIME_CLIENT_SECRETS_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${normalizedApiKey}`,
-          "Content-Type": "application/json",
-          "OpenAI-Safety-Identifier": safetyIdentifier,
-        },
-        body: JSON.stringify({
-          session: {
-            type: "realtime",
-            model,
-          },
-        }),
-      });
-    } catch {
-      throw voiceError("realtime_unavailable", "Live Voice is unavailable right now.");
-    }
-
-    if (!response?.ok) {
-      throw voiceError("realtime_provider_rejected", "Live Voice could not be started.");
-    }
-    try {
-      return await response.json();
-    } catch {
-      throw voiceError("realtime_invalid_response", "The Live Voice session could not be started.");
-    }
-  };
+function createRealtimeSafetyIdentifier(threadId) {
+  return `remodex-${createHash("sha256").update(threadId).digest("hex")}`;
 }
 
-function createRealtimeSafetyIdentifier(threadId) {
-  const { createHash } = require("crypto");
-  return `remodex-${createHash("sha256").update(threadId).digest("hex")}`;
+function instantiateLiveSocket(WebSocketImpl, apiKey, safetyIdentifier) {
+  const options = {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "OpenAI-Safety-Identifier": safetyIdentifier,
+    },
+  };
+  try {
+    return new WebSocketImpl(OPENAI_LIVE_WEBSOCKET_URL, options);
+  } catch (error) {
+    // A tiny function-based fake is useful in unit tests; support it without
+    // weakening the production ws constructor path.
+    if (/not a constructor|is not a constructor/i.test(String(error?.message || ""))) {
+      return WebSocketImpl(OPENAI_LIVE_WEBSOCKET_URL, options);
+    }
+    throw error;
+  }
+}
+
+function addLiveSocketListener(socket, eventName, listener) {
+  if (typeof socket?.on === "function") {
+    socket.on(eventName, listener);
+  } else if (typeof socket?.addEventListener === "function") {
+    socket.addEventListener(eventName, listener);
+  } else if (socket) {
+    socket[`on${eventName}`] = listener;
+  }
+}
+
+function isLiveSocketOpen(socket, WebSocketImpl) {
+  const openValue = Number(WebSocketImpl?.OPEN ?? 1);
+  return socket?.readyState === openValue;
+}
+
+function sendLiveSocketEvent(state, event) {
+  if (!state?.socket || state.closed || typeof state.socket.send !== "function") {
+    throw voiceError("invalid_realtime_session", "The Live Voice session is no longer available.");
+  }
+  const payload = JSON.stringify(event);
+  if (Buffer.byteLength(payload, "utf8") > MAX_LIVE_EVENT_BYTES) {
+    throw voiceError("realtime_event_too_large", "The Live Voice event was too large.");
+  }
+  state.socket.send(payload);
+}
+
+function closeLiveSocket(state) {
+  if (!state) {
+    return;
+  }
+  state.closed = true;
+  if (state.startTimer) {
+    clearLiveTimer(state, state.startTimer);
+    state.startTimer = null;
+  }
+  if (state.closeTimer) {
+    clearLiveTimer(state, state.closeTimer);
+    state.closeTimer = null;
+  }
+  if (state.expiryTimer) {
+    clearLiveTimer(state, state.expiryTimer);
+    state.expiryTimer = null;
+  }
+  if (state.idleTimer) {
+    clearLiveTimer(state, state.idleTimer);
+    state.idleTimer = null;
+  }
+  if (state.pendingDelegations instanceof Map) {
+    for (const pending of state.pendingDelegations.values()) {
+      clearLiveTimer(state, pending.settleTimer);
+      clearLiveTimer(state, pending.timeoutTimer);
+    }
+    state.pendingDelegations.clear();
+  }
+  try {
+    const closedState = Number(state.socket?.CLOSED ?? 3);
+    if (state.socket && state.socket.readyState !== closedState) {
+      state.socket.close?.();
+    }
+  } catch {
+    // Cleanup must remain best-effort and opaque.
+  }
+}
+
+function clearLiveTimer(state, timer) {
+  if (typeof state?.clearTimeoutImpl === "function") {
+    state.clearTimeoutImpl(timer);
+  } else {
+    clearTimeout(timer);
+  }
+}
+
+function readSession(sessions, sessionId) {
+  const normalized = readString(sessionId);
+  return normalized ? sessions.get(normalized) || null : null;
+}
+
+function parseLiveSocketMessage(rawMessage) {
+  const value = rawMessage && typeof rawMessage === "object" && "data" in rawMessage
+    ? rawMessage.data
+    : rawMessage;
+  try {
+    return JSON.parse(Buffer.isBuffer(value) ? value.toString("utf8") : String(value));
+  } catch {
+    return null;
+  }
+}
+
+function decodeLiveAudioBase64(value) {
+  if (!value || typeof value !== "string" || value.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    return null;
+  }
+  try {
+    const buffer = Buffer.from(value, "base64");
+    // Buffer.from is permissive; reject non-canonical encodings so malformed
+    // input cannot be smuggled into the provider event stream.
+    if (buffer.length === 0 || buffer.toString("base64").replace(/=+$/, "") !== value.replace(/=+$/, "")) {
+      return null;
+    }
+    return buffer;
+  } catch {
+    return null;
+  }
+}
+
+const ALLOWED_LIVE_CLIENT_EVENTS = new Set([
+  "session.input_audio.mute",
+  "session.input_audio.unmute",
+]);
+
+function isAllowedLiveClientEvent(event) {
+  const type = readString(event?.type);
+  if (!ALLOWED_LIVE_CLIENT_EVENTS.has(type)) {
+    return false;
+  }
+  return JSON.stringify(event).length <= MAX_LIVE_EVENT_BYTES;
+}
+
+function sendLiveApplicationEvent(sendApplicationResponse, sessionId, event) {
+  if (typeof sendApplicationResponse !== "function") {
+    return;
+  }
+  try {
+    sendApplicationResponse(JSON.stringify({
+      method: "voice/realtime/event",
+      params: { sessionId, event },
+    }));
+  } catch {
+    // A disconnected phone should not tear down the provider session.
+  }
+}
+
+function truncateLiveCommentary(value) {
+  const text = typeof value === "string"
+    ? value
+    : readString(value?.content || value?.summary || value?.text);
+  const normalized = text || "Codex handled the delegated request on the Mac.";
+  // GPT-Live limits commentary content to 500 tokens. Four characters per
+  // token is conservative for ordinary English and keeps the wire payload
+  // comfortably below that limit.
+  return normalized.length <= 2_000 ? normalized : `${normalized.slice(0, 1_997)}...`;
+}
+
+function sendRealtimeErrorResponse(id, sendResponse, error, logger, logPrefix) {
+  logRealtimeEvent(logger, "error", logPrefix, "session request failed", {
+    errorCode: error?.errorCode || "realtime_session_failed",
+  });
+  if (id != null) {
+    sendResponse(JSON.stringify({
+      id,
+      error: {
+        code: -32000,
+        message: error?.userMessage || "Live Voice could not be started.",
+        data: voiceErrorData(error),
+      },
+    }));
+  }
 }
 
 function parseJsonMessage(rawMessage) {
@@ -775,7 +1531,12 @@ async function resolveVoiceAuth(sendCodexRequest) {
 }
 
 module.exports = {
+  OPENAI_KEYCHAIN_ACCOUNT,
+  OPENAI_KEYCHAIN_SERVICE,
+  OPENAI_LIVE_WEBSOCKET_URL,
+  DEFAULT_LIVE_MODEL,
   createRealtimeSessionHandler,
   createVoiceHandler,
+  resolveOpenAIAPIKey,
   resolveVoiceAuth,
 };

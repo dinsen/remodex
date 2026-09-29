@@ -9,8 +9,46 @@ import Foundation
 import Security
 
 extension CodexService {
+    // A device install can launch the app before Keychain is readable. Never
+    // let that transient state turn into a new trusted-phone identity.
+    func refreshPhoneIdentityStateIfNeeded() throws {
+        guard phoneIdentityStateNeedsSecureStoreRetry else {
+            return
+        }
+
+        switch SecureStore.readCodableResult(
+            CodexPhoneIdentityState.self,
+            for: CodexSecureKeys.phoneIdentityState
+        ) {
+        case .found(let storedState):
+            phoneIdentityState = storedState
+            phoneIdentityStateNeedsSecureStoreRetry = !SecureStore.updateAccessibilityIfNeeded(
+                for: CodexSecureKeys.phoneIdentityState,
+                accessibility: codexPhoneIdentityKeychainAccessibility
+            )
+        case .missing:
+            // No previous identity is available, so the temporary value below
+            // becomes the identity used for the next explicit pair.
+            guard SecureStore.writeCodable(
+                phoneIdentityState,
+                for: CodexSecureKeys.phoneIdentityState,
+                accessibility: codexPhoneIdentityKeychainAccessibility
+            ) else {
+                throw CodexSecureTransportError.invalidHandshake(
+                    "The iPhone identity could not be saved securely. Try reconnecting again."
+                )
+            }
+            phoneIdentityStateNeedsSecureStoreRetry = false
+        case .unavailable:
+            throw CodexSecureTransportError.invalidHandshake(
+                "The iPhone Keychain is still locked. Unlock the iPhone and try reconnecting again."
+            )
+        }
+    }
+
     // Completes the secure handshake before any JSON-RPC traffic is sent over the relay.
     func performSecureHandshake() async throws {
+        try refreshPhoneIdentityStateIfNeeded()
         guard let sessionId = normalizedRelaySessionId,
               let macDeviceId = normalizedRelayMacDeviceId else {
             throw CodexSecureTransportError.invalidHandshake(
@@ -1071,6 +1109,7 @@ private extension CodexService {
 
     // Resolves the live relay session for the preferred trusted Mac before we reconnect the socket.
     func resolveTrustedMacSessionImpl(deviceId: String? = nil) async throws -> CodexTrustedSessionResolveResponse {
+        try refreshPhoneIdentityStateIfNeeded()
         guard let trustedMac = trustedMacRecord(for: deviceId) ?? currentTrustedMacRecord else {
             throw CodexTrustedSessionResolveError.noTrustedMac
         }

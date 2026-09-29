@@ -425,8 +425,12 @@ final class CodexService {
 
     // --- Public state ---------------------------------------------------------
 
+    // Monotonic change token for consumers that need to react to thread-list
+    // replacements without hashing every thread during SwiftUI body updates.
+    var threadListRevision = 0
     var threads: [CodexThread] = [] {
         didSet {
+            threadListRevision &+= 1
             rebuildThreadLookupCaches()
             refreshPinnedThreadSnapshots()
             scheduleCurrentMacThreadListSnapshotPersistence()
@@ -633,6 +637,9 @@ final class CodexService {
     var pendingRequests: [String: CheckedContinuation<RPCMessage, Error>] = [:]
     // Test hook: intercepts outbound RPC requests without requiring a live socket.
     @ObservationIgnored var requestTransportOverride: ((String, JSONValue?) async throws -> RPCMessage)?
+    // Live Voice events are routed by opaque bridge session id; handlers stay
+    // on the main actor and are never persisted or forwarded to another client.
+    @ObservationIgnored var realtimeVoiceEventHandlersBySessionID: [String: (JSONValue) -> Void] = [:]
     // Test hook: stubs trusted-session lookup without performing a real relay HTTP request.
     @ObservationIgnored var trustedSessionResolverOverride: (() async throws -> CodexTrustedSessionResolveResponse)?
     // Test hooks: exercise keepalive lifecycle without waiting 25s or opening a real socket.
@@ -818,6 +825,7 @@ final class CodexService {
     var secureSession: CodexSecureSession?
     var pendingHandshake: CodexPendingHandshake?
     var phoneIdentityState: CodexPhoneIdentityState
+    @ObservationIgnored var phoneIdentityStateNeedsSecureStoreRetry = false
     var trustedMacRegistry: CodexTrustedMacRegistry
     var currentTrustedMacDeviceId: String?
     var lastTrustedMacDeviceId: String?
@@ -929,7 +937,9 @@ final class CodexService {
         self.defaults = defaults
         self.userNotificationCenter = userNotificationCenter ?? UNUserNotificationCenter.current()
         self.remoteNotificationRegistrar = remoteNotificationRegistrar ?? CodexApplicationRemoteNotificationRegistrar()
-        self.phoneIdentityState = codexPhoneIdentityStateFromSecureStore()
+        let phoneIdentityResolution = codexPhoneIdentityStateResolutionFromSecureStore()
+        self.phoneIdentityState = phoneIdentityResolution.state
+        self.phoneIdentityStateNeedsSecureStoreRetry = phoneIdentityResolution.needsSecureStoreRetry
         self.trustedMacRegistry = codexTrustedMacRegistryFromSecureStore()
         self.currentTrustedMacDeviceId = SecureStore.readString(for: CodexSecureKeys.currentTrustedMacDeviceId)
         self.lastTrustedMacDeviceId = SecureStore.readString(for: CodexSecureKeys.lastTrustedMacDeviceId)

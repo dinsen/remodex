@@ -52,7 +52,8 @@ struct SidebarThreadListView: View {
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
 
-            if groups.isEmpty && !isFiltering {
+            if (taskViewMode == .activity ? activityThreads.isEmpty : groups.isEmpty)
+                && !isFiltering {
                 Text(isConnected ? emptyStateTitle : "Connect to view conversations")
                     .foregroundStyle(.secondary)
                     .font(AppFont.subheadline())
@@ -122,15 +123,26 @@ struct SidebarThreadListView: View {
         case .section:
             sectionGroupSection(group)
         case .project:
-            projectGroupSection(group)
+            if isNestedGroupVisible(group) {
+                projectGroupSection(group)
+            }
         case .chat:
-            chatGroupSection(group)
+            if isNestedGroupVisible(group) {
+                chatGroupSection(group)
+            }
         }
+    }
+
+    private func isNestedGroupVisible(_ group: SidebarThreadGroup) -> Bool {
+        guard let parentSectionID = group.parentSectionID else {
+            return true
+        }
+
+        return expandedSectionGroupIDs.contains("section:\(parentSectionID)")
     }
 
     private func sectionGroupSection(_ group: SidebarThreadGroup) -> some View {
         let isExpanded = expandedSectionGroupIDs.contains(group.id)
-        let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
 
         return VStack(alignment: .leading, spacing: 0) {
             SidebarSectionHeader(
@@ -155,19 +167,6 @@ struct SidebarThreadListView: View {
             )
             .padding(.horizontal)
 
-            if isExpanded {
-                SidebarThreadGroupBlock(bottomPadding: 0) {
-                    VStack(spacing: 2) {
-                        ForEach(hierarchy.rootThreads) { thread in
-                            threadRowTree(
-                                thread,
-                                childrenByParentID: hierarchy.childrenByParentID,
-                                leadingInset: SidebarThreadListLayout.projectThreadLeadingInset
-                            )
-                        }
-                    }
-                }
-            }
         }
         .clipped()
     }
@@ -224,6 +223,7 @@ struct SidebarThreadListView: View {
         // `.clipped()` keeps the disappearing rows from briefly painting over
         // the next project header while SwiftUI animates the height delta.
         .clipped()
+        .padding(.leading, group.parentSectionID == nil ? 0 : 16)
     }
 
     @ViewBuilder
@@ -329,6 +329,7 @@ struct SidebarThreadListView: View {
             }
         }
         .clipped()
+        .padding(.leading, group.parentSectionID == nil ? 0 : 16)
     }
 
     private func threadRowTree(
@@ -457,6 +458,7 @@ struct SidebarThreadListView: View {
                     )
                 }
             case .project:
+                guard isNestedGroupVisible(group) else { continue }
                 guard expandedProjectGroupIDs.contains(group.id) else { continue }
                 let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
                 let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
@@ -474,6 +476,7 @@ struct SidebarThreadListView: View {
                     )
                 }
             case .chat:
+                guard isNestedGroupVisible(group) else { continue }
                 guard isChatGroupExpanded else { continue }
                 let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
                 for rootThread in hierarchy.rootThreads {

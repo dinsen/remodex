@@ -111,6 +111,9 @@ final class VoiceComposerPhaseTwoController {
                     connection.close()
                     return
                 }
+                connection.addTerminalHandler { [weak self, weak connection] in
+                    self?.handleVoiceConnectionTerminated(connection)
+                }
                 realtimeConnection = connection
                 isVoiceSessionActive = true
                 activePermissionRequestID = nil
@@ -137,6 +140,13 @@ final class VoiceComposerPhaseTwoController {
 
     func disableVoice() {
         endVoiceSession()
+    }
+
+    private func handleVoiceConnectionTerminated(_ connection: CodexRealtimeVoiceConnection?) {
+        guard let connection, realtimeConnection === connection else { return }
+        realtimeConnection = nil
+        isVoiceSessionActive = false
+        activePermissionRequestID = nil
     }
 }
 

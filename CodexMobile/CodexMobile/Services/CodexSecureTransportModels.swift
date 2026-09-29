@@ -6,6 +6,7 @@
 
 import CryptoKit
 import Foundation
+import Security
 
 let codexSecureProtocolVersion = 2
 let codexPairingQRVersion = 2
@@ -14,6 +15,7 @@ let codexSecureHandshakeLabel = "client-auth"
 let codexSecureClockSkewToleranceSeconds: TimeInterval = 60
 let codexTrustedSessionResolveTag = "remodex-trusted-session-resolve-v1"
 let codexTrustedSessionResolveClockSkewToleranceSeconds: TimeInterval = 90
+let codexPhoneIdentityKeychainAccessibility: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
 enum CodexSecureHandshakeMode: String, Codable, Sendable {
     case qrBootstrap = "qr_bootstrap"
@@ -45,6 +47,11 @@ struct CodexPhoneIdentityState: Codable, Sendable {
     let phoneDeviceId: String
     let phoneIdentityPrivateKey: String
     let phoneIdentityPublicKey: String
+}
+
+struct CodexPhoneIdentityStateResolution: Sendable {
+    let state: CodexPhoneIdentityState
+    let needsSecureStoreRetry: Bool
 }
 
 struct CodexTrustedMacRecord: Codable, Sendable {
@@ -380,22 +387,57 @@ func codexSecureFingerprint(for publicKeyBase64: String) -> String {
     return digest.compactMap { String(format: "%02x", $0) }.joined().prefix(12).uppercased()
 }
 
-func codexPhoneIdentityStateFromSecureStore() -> CodexPhoneIdentityState {
-    if let existing: CodexPhoneIdentityState = SecureStore.readCodable(
+func codexPhoneIdentityStateResolutionFromSecureStore() -> CodexPhoneIdentityStateResolution {
+    switch SecureStore.readCodableResult(
         CodexPhoneIdentityState.self,
         for: CodexSecureKeys.phoneIdentityState
     ) {
-        return existing
+    case .found(let existing):
+        // Migrate older items that used the default WhenUnlocked policy. The
+        // identity must remain readable when the app is resumed after install
+        // while the phone is still locked, otherwise a transient Keychain read
+        // failure would create a new identity and break trusted reconnect.
+        let accessibilityUpdated = SecureStore.updateAccessibilityIfNeeded(
+            for: CodexSecureKeys.phoneIdentityState,
+            accessibility: codexPhoneIdentityKeychainAccessibility
+        )
+        return CodexPhoneIdentityStateResolution(
+            state: existing,
+            needsSecureStoreRetry: !accessibilityUpdated
+        )
+    case .missing:
+        let state = makeCodexPhoneIdentityState()
+        let statePersisted = SecureStore.writeCodable(
+            state,
+            for: CodexSecureKeys.phoneIdentityState,
+            accessibility: codexPhoneIdentityKeychainAccessibility
+        )
+        return CodexPhoneIdentityStateResolution(
+            state: state,
+            needsSecureStoreRetry: !statePersisted
+        )
+    case .unavailable:
+        // Do not overwrite a potentially valid identity while the device is
+        // locked. This temporary value is replaced from Keychain immediately
+        // before trusted resolve/handshake once access becomes available.
+        return CodexPhoneIdentityStateResolution(
+            state: makeCodexPhoneIdentityState(),
+            needsSecureStoreRetry: true
+        )
     }
+}
 
+func codexPhoneIdentityStateFromSecureStore() -> CodexPhoneIdentityState {
+    codexPhoneIdentityStateResolutionFromSecureStore().state
+}
+
+private func makeCodexPhoneIdentityState() -> CodexPhoneIdentityState {
     let privateKey = Curve25519.Signing.PrivateKey()
-    let next = CodexPhoneIdentityState(
+    return CodexPhoneIdentityState(
         phoneDeviceId: UUID().uuidString,
         phoneIdentityPrivateKey: privateKey.rawRepresentation.base64EncodedString(),
         phoneIdentityPublicKey: privateKey.publicKey.rawRepresentation.base64EncodedString()
     )
-    SecureStore.writeCodable(next, for: CodexSecureKeys.phoneIdentityState)
-    return next
 }
 
 func codexTrustedMacRegistryFromSecureStore() -> CodexTrustedMacRegistry {

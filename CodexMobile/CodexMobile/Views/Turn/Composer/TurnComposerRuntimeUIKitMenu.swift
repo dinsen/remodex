@@ -28,19 +28,12 @@ enum TurnComposerRuntimeUIKitMenuBuilder {
         let onRequestAllModelsSheet: () -> Void
     }
 
-    // Identifiers pinned to the top of the model menu; the rest are reachable
-    // via "Other models…" so the menu stays glanceable as the list grows.
-    private static let featuredModelIdentifiers: Set<String> = [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.4",
-    ]
+    // Keep the menu glanceable while featuring the newest runtime entries.
+    private static let featuredModelCount = 5
 
     static func makeModelMenu(_ input: Input) -> UIMenu {
         let modelChildren: [UIMenuElement] = {
-            if input.isLoadingModels {
+            if input.orderedModelOptions.isEmpty, input.isLoadingModels {
                 return [
                     disabledInfoAction(title: "Loading models…"),
                 ]
@@ -96,12 +89,8 @@ enum TurnComposerRuntimeUIKitMenuBuilder {
         var seen = Set<String>()
         var result: [CodexModelOption] = []
 
-        for model in input.orderedModelOptions {
-            let normalizedID = model.id.lowercased()
-            let normalizedModel = model.model.lowercased()
-            let isFeatured = featuredModelIdentifiers.contains(normalizedID)
-                || featuredModelIdentifiers.contains(normalizedModel)
-            guard isFeatured, seen.insert(model.id).inserted else { continue }
+        for model in input.orderedModelOptions.prefix(featuredModelCount) {
+            guard seen.insert(model.id).inserted else { continue }
             result.append(model)
         }
 

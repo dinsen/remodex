@@ -1,5 +1,5 @@
 // FILE: SidebarThreadGroupingTests.swift
-// Purpose: Guards sidebar grouping so chats stay partitioned by project path instead of time buckets.
+// Purpose: Guards sidebar grouping across native sections, project paths, and rootless chats.
 // Layer: Unit Test
 // Exports: SidebarThreadGroupingTests
 // Depends on: XCTest, CodexMobile
@@ -8,6 +8,204 @@ import XCTest
 @testable import CodexMobile
 
 final class SidebarThreadGroupingTests: XCTestCase {
+    func testThreadFingerprintIgnoresUnrelatedMetadataPayload() {
+        let base = makeThread(id: "thread", updatedAt: Date(), cwd: "/Users/me/work/app")
+        var metadataHeavy = base
+        metadataHeavy.metadata = [
+            "largePayload": .string(String(repeating: "metadata", count: 20_000))
+        ]
+
+        XCTAssertEqual(
+            SidebarThreadGrouping.threadFingerprint(base),
+            SidebarThreadGrouping.threadFingerprint(metadataHeavy)
+        )
+        XCTAssertEqual(
+            SidebarThreadGrouping.threadsFingerprint([base]),
+            SidebarThreadGrouping.threadsFingerprint([metadataHeavy])
+        )
+    }
+
+    func testSectionScopeShowsProjectsInsideTheSelectedCodexSection() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(
+                id: "private-project-thread",
+                updatedAt: now,
+                cwd: "/Users/me/work/app",
+                section: .init(id: "private", name: "Private")
+            ),
+            makeThread(
+                id: "private-chat-thread",
+                updatedAt: now.addingTimeInterval(-30),
+                cwd: nil,
+                section: .init(id: "private", name: "Private")
+            ),
+            makeThread(
+                id: "mobility-thread",
+                updatedAt: now.addingTimeInterval(-60),
+                cwd: "/Users/me/work/finn",
+                section: .init(id: "mobility", name: "Mobility Private Seller Journey")
+            ),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [
+                .init(id: "private", name: "Private"),
+                .init(id: "mobility", name: "Mobility Private Seller Journey"),
+            ],
+            scope: .section("private"),
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), ["project:/Users/me/work/app", "chats:rootless"])
+        XCTAssertEqual(groups[0].kind, .project)
+        XCTAssertEqual(groups[0].threads.map(\.id), ["private-project-thread"])
+        XCTAssertEqual(groups[1].kind, .chat)
+        XCTAssertEqual(groups[1].threads.map(\.id), ["private-chat-thread"])
+
+        let configuredSourceGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [
+                .init(id: "private", name: "Private"),
+                .init(id: "mobility", name: "Mobility Private Seller Journey"),
+            ],
+            scope: .section("private"),
+            projectSource: .configuredProjects,
+            configuredProjectChoices: [makeProjectChoice(path: "/Users/me/work/other")],
+            now: now
+        )
+
+        XCTAssertEqual(configuredSourceGroups.map(\.id), ["project:/Users/me/work/app", "chats:rootless"])
+    }
+
+    func testDesktopSidebarSectionProjectsIncludeUnsectionedThreadsAndEmptyProjects() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let section = CodexThreadSection(id: "private", name: "Private")
+        let appChoice = makeProjectChoice(path: "/Users/me/work/app")
+        let emptyChoice = makeProjectChoice(path: "/Users/me/work/empty")
+        let threads = [
+            makeThread(id: "private-project-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(id: "unsectioned-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/site"),
+        ]
+
+        let sectionGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [section],
+            sectionProjectChoicesBySection: ["private": [appChoice, emptyChoice]],
+            scope: .section("private"),
+            now: now
+        )
+
+        XCTAssertEqual(sectionGroups.map(\.id), [
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/empty",
+        ])
+        XCTAssertEqual(sectionGroups[0].threads.map(\.id), ["private-project-thread"])
+        XCTAssertTrue(sectionGroups[1].threads.isEmpty)
+
+        let allGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [section],
+            sectionProjectChoicesBySection: ["private": [appChoice, emptyChoice]],
+            now: now
+        )
+
+        XCTAssertEqual(allGroups.map(\.id), [
+            "section:private",
+            "section:private/project:/Users/me/work/app",
+            "section:private/project:/Users/me/work/empty",
+            "project:/Users/me/work/site",
+        ])
+        XCTAssertEqual(allGroups[1].threads.map(\.id), ["private-project-thread"])
+    }
+
+    func testDesktopSidebarSectionProjectOrderMatchesCodexItemKeysInsteadOfActivity() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let section = CodexThreadSection(id: "private", name: "Private")
+        let firstChoice = makeProjectChoice(path: "/Users/me/work/zeta")
+        let secondChoice = makeProjectChoice(path: "/Users/me/work/alpha")
+        let thirdChoice = makeProjectChoice(path: "/Users/me/work/middle")
+        let threads = [
+            makeThread(id: "alpha-thread", updatedAt: now, cwd: secondChoice.projectPath),
+            makeThread(id: "middle-thread", updatedAt: now.addingTimeInterval(-60), cwd: thirdChoice.projectPath),
+            makeThread(id: "zeta-thread", updatedAt: now.addingTimeInterval(-120), cwd: firstChoice.projectPath),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [section],
+            sectionProjectChoicesBySection: [
+                "private": [firstChoice, secondChoice, thirdChoice]
+            ],
+            scope: .section("private"),
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/zeta",
+            "project:/Users/me/work/alpha",
+            "project:/Users/me/work/middle",
+        ])
+
+        let allGroups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [section],
+            sectionProjectChoicesBySection: [
+                "private": [firstChoice, secondChoice, thirdChoice]
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(allGroups.map(\.id), [
+            "section:private",
+            "section:private/project:/Users/me/work/zeta",
+            "section:private/project:/Users/me/work/alpha",
+            "section:private/project:/Users/me/work/middle",
+        ])
+    }
+
+    func testSelectableSectionsPreserveCodexOrderAndHidePinned() {
+        let sections = SidebarThreadGrouping.selectableSections([
+            .init(id: "mobility", name: "Mobility Private Seller Journey"),
+            .init(id: "pinned", name: "Pinned"),
+            .init(id: "private", name: "Private"),
+            .init(id: "duplicate", name: "Private"),
+        ])
+
+        XCTAssertEqual(sections.map(\.id), ["mobility", "private", "duplicate"])
+    }
+
+    func testSectionProjectGroupActionsStayScopedToTheSection() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let privateThread = makeThread(
+            id: "private-thread",
+            updatedAt: now,
+            cwd: "/Users/me/work/app",
+            section: .init(id: "private", name: "Private")
+        )
+        let mobilityThread = makeThread(
+            id: "mobility-thread",
+            updatedAt: now.addingTimeInterval(-60),
+            cwd: "/Users/me/work/app",
+            section: .init(id: "mobility", name: "Mobility Private Seller Journey")
+        )
+        let group = SidebarThreadGroup(
+            id: "section:private/project:/Users/me/work/app",
+            label: "app",
+            kind: .project,
+            sortDate: now,
+            projectPath: "/Users/me/work/app",
+            threads: [privateThread],
+            parentSectionID: "private"
+        )
+
+        XCTAssertEqual(
+            SidebarThreadGrouping.liveThreadIDsForProjectGroup(group, in: [privateThread, mobilityThread]),
+            ["private-thread"]
+        )
+    }
+
     func testMakeGroupsShowsEveryCodexSectionWithoutHidingProjects() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let threads = [
@@ -26,14 +224,40 @@ final class SidebarThreadGroupingTests: XCTestCase {
 
         XCTAssertEqual(groups.map(\.id), [
             "section:planning",
+            "section:planning/project:/Users/me/work/app",
             "section:later",
-            "project:/Users/me/work/app",
             "project:/Users/me/work/site",
         ])
         XCTAssertEqual(groups[0].kind, .section)
         XCTAssertEqual(groups[0].threads.map(\.id), ["sectioned"])
-        XCTAssertTrue(groups[1].threads.isEmpty)
-        XCTAssertEqual(groups[2].threads.map(\.id), ["sectioned"])
+        XCTAssertEqual(groups[1].parentSectionID, "planning")
+        XCTAssertEqual(groups[1].threads.map(\.id), ["sectioned"])
+        XCTAssertTrue(groups[2].threads.isEmpty)
+        XCTAssertNil(groups[3].parentSectionID)
+    }
+
+    func testSectionMembershipMapGroupsThreadsWhenRegularThreadListOmitsSectionMetadata() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "sectioned", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(id: "unsectioned", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/site"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            sections: [.init(id: "private", name: "Private")],
+            sectionThreadIDsBySection: ["private": ["sectioned"]],
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "section:private",
+            "section:private/project:/Users/me/work/app",
+            "project:/Users/me/work/site",
+        ])
+        XCTAssertEqual(groups[1].threads.map(\.id), ["sectioned"])
+        XCTAssertEqual(groups[1].parentSectionID, "private")
+        XCTAssertNil(groups[2].parentSectionID)
     }
 
     func testMakeGroupsPartitionsLiveThreadsByProjectPath() {

@@ -13,6 +13,7 @@ const {
   handleProjectRequest,
   handleProjectMethod,
   projectConfiguredProjects,
+  projectSidebarSections,
   projectCreateDirectory,
   projectCreateRootlessChatRoot,
   projectListDirectory,
@@ -169,6 +170,99 @@ test("project/configuredProjects resolves Codex desktop project ids through loca
       fs.realpathSync(alphaProject),
     ]
   );
+});
+
+test("project/sidebarSections preserves Codex desktop itemKeys project order", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const alphaProject = path.join(homeDir, "projects", "alpha");
+  const betaProject = path.join(homeDir, "projects", "beta");
+  const gammaProject = path.join(homeDir, "projects", "gamma");
+  fs.mkdirSync(alphaProject, { recursive: true });
+  fs.mkdirSync(betaProject, { recursive: true });
+  fs.mkdirSync(gammaProject, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": {
+      "local-alpha": { id: "local-alpha", name: "Alpha", rootPaths: [alphaProject] },
+      "local-beta": { id: "local-beta", name: "Beta", rootPaths: [betaProject] },
+      "local-gamma": { id: "local-gamma", name: "Gamma", rootPaths: [gammaProject] },
+    },
+    "electron-persisted-atom-state": {
+      "sidebar-custom-sections-v3": {
+        "account": {
+          sectionOrder: ["custom:section-private"],
+          sections: [{
+            id: "section-private",
+            name: "Private",
+            hostSectionIds: { local: "host-private" },
+            itemKeys: [
+              "codex:project:local-gamma",
+              "codex:project:local-alpha",
+              "codex:project:local-beta",
+            ],
+          }],
+        },
+      },
+    },
+  }));
+
+  const result = await projectSidebarSections({ codexHome, homeDir });
+
+  assert.deepEqual(result.sections, [{
+    id: "host-private",
+    name: "Private",
+    projects: [
+      {
+        id: `project:${fs.realpathSync(gammaProject)}`,
+        label: "Gamma",
+        path: fs.realpathSync(gammaProject),
+      },
+      {
+        id: `project:${fs.realpathSync(alphaProject)}`,
+        label: "Alpha",
+        path: fs.realpathSync(alphaProject),
+      },
+      {
+        id: `project:${fs.realpathSync(betaProject)}`,
+        label: "Beta",
+        path: fs.realpathSync(betaProject),
+      },
+    ],
+  }]);
+});
+
+test("project/sidebarSections resolves app-server project ids through desktop mappings", async () => {
+  const homeDir = makeTempHome();
+  const codexHome = path.join(homeDir, ".codex");
+  const projectPath = path.join(homeDir, "projects", "mapped");
+  fs.mkdirSync(projectPath, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": {
+      "local-mapped": { id: "local-mapped", name: "Mapped", rootPaths: [projectPath] },
+    },
+    "app-server-project-id-by-legacy-project-id-by-host": {
+      "local:/codex": { "local-mapped": "app-server-mapped" },
+    },
+    "electron-persisted-atom-state": {
+      "sidebar-custom-sections-v3": {
+        "account": {
+          sections: [{
+            id: "section-private",
+            name: "Private",
+            hostSectionIds: { local: "host-private" },
+            itemKeys: ["codex:project:app-server-mapped"],
+          }],
+        },
+      },
+    },
+  }));
+
+  const result = await projectSidebarSections({ codexHome, homeDir });
+
+  assert.equal(result.sections[0].projects[0].path, fs.realpathSync(projectPath));
+  assert.equal(result.sections[0].projects[0].label, "Mapped");
 });
 
 test("project/configuredProjects falls back to saved workspace roots when project order is missing", async () => {

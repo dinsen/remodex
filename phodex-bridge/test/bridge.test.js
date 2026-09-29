@@ -13,6 +13,7 @@ const { invalidateRolloutLookupCache } = require("../src/rollout-watch");
 const { handleHostPinsRequest } = require("../src/host-pins-handler");
 const {
   annotateTurnStateProbeWithMirrorActiveTurn,
+  buildBridgePackageUpdateInvocation,
   buildThreadTurnsListRelaySanitizeContext,
   buildHeartbeatBridgeStatus,
   canonicalThreadTurnsListRequest,
@@ -36,6 +37,20 @@ const {
   sanitizeThreadHistoryImagesForRelay,
   shouldSuppressRolloutMirrorForThread,
 } = require("../src/bridge");
+
+test("bridge package updates invoke npm directly without sourcing shell startup files or forwarding API keys", () => {
+  const invocation = buildBridgePackageUpdateInvocation({
+    PATH: "/opt/homebrew/bin:/usr/bin",
+    REMODEX_OPENAI_REALTIME_API_KEY: "must-not-reach-package-scripts",
+    OPENAI_API_KEY: "must-not-reach-package-scripts-either",
+  });
+
+  assert.deepEqual(invocation.command, "npm");
+  assert.deepEqual(invocation.args, ["install", "-g", "remodex@latest"]);
+  assert.equal(invocation.options.env.PATH, "/opt/homebrew/bin:/usr/bin");
+  assert.equal(invocation.options.env.REMODEX_OPENAI_REALTIME_API_KEY, undefined);
+  assert.equal(invocation.options.env.OPENAI_API_KEY, undefined);
+});
 
 test("handleHostPinsRequest returns only ordered pinned IDs and never writes", async (t) => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-host-pins-"));

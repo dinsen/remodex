@@ -5,6 +5,7 @@
 // Depends on: Foundation, XCTest, CodexMobile
 
 import Foundation
+import Security
 import XCTest
 @testable import CodexMobile
 
@@ -82,6 +83,77 @@ final class CodexSecurePairingStateTests: XCTestCase {
 
         XCTAssertEqual(service.secureConnectionState, .rePairRequired)
         XCTAssertEqual(service.secureMacFingerprint, "ABC123")
+    }
+
+    func testPhoneIdentityUsesAfterFirstUnlockAccessibilityForReconnects() {
+        XCTAssertEqual(
+            codexPhoneIdentityKeychainAccessibility as String,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
+        )
+    }
+
+    func testSecureStoreDoesNotRewriteIdentityWhenAccessibilityAlreadyMatches() {
+        let storedData = Data("existing-phone-identity".utf8)
+        let keychain = SecureStoreKeychainOperationsRecorder(
+            stableData: storedData,
+            stableAccessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
+        )
+
+        XCTAssertTrue(
+            SecureStore.updateAccessibilityIfNeeded(
+                for: CodexSecureKeys.phoneIdentityState,
+                accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                operations: keychain.operations
+            )
+        )
+
+        XCTAssertEqual(keychain.updateCallCount, 0)
+        XCTAssertEqual(keychain.stableData, storedData)
+    }
+
+    func testSecureStorePreservesExistingIdentityWhenStableItemUpdateFails() {
+        let oldIdentity = Data("old-phone-identity".utf8)
+        let legacyIdentity = Data("legacy-phone-identity".utf8)
+        let keychain = SecureStoreKeychainOperationsRecorder(
+            stableData: oldIdentity,
+            stableAccessibility: kSecAttrAccessibleWhenUnlocked as String,
+            legacyData: legacyIdentity,
+            updateStatus: errSecInteractionNotAllowed
+        )
+
+        XCTAssertFalse(
+            SecureStore.writeData(
+                Data("replacement-phone-identity".utf8),
+                for: CodexSecureKeys.phoneIdentityState,
+                accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                operations: keychain.operations
+            )
+        )
+
+        XCTAssertEqual(keychain.stableData, oldIdentity)
+        XCTAssertEqual(keychain.legacyData, legacyIdentity)
+        XCTAssertEqual(keychain.legacyDeleteCallCount, 0)
+    }
+
+    func testSecureStorePreservesLegacyIdentityWhenStableItemAddFails() {
+        let legacyIdentity = Data("legacy-phone-identity".utf8)
+        let keychain = SecureStoreKeychainOperationsRecorder(
+            legacyData: legacyIdentity,
+            addStatus: errSecInteractionNotAllowed
+        )
+
+        XCTAssertFalse(
+            SecureStore.writeData(
+                Data("replacement-phone-identity".utf8),
+                for: CodexSecureKeys.phoneIdentityState,
+                accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                operations: keychain.operations
+            )
+        )
+
+        XCTAssertNil(keychain.stableData)
+        XCTAssertEqual(keychain.legacyData, legacyIdentity)
+        XCTAssertEqual(keychain.legacyDeleteCallCount, 0)
     }
 
     func testApplyingResolvedTrustedSessionResetsReplayCursorWhenLiveSessionChanges() {
@@ -338,5 +410,111 @@ final class CodexSecurePairingStateTests: XCTestCase {
         let service = CodexService(defaults: resolvedDefaults)
         Self.retainedServices.append(service)
         return service
+    }
+}
+
+private final class SecureStoreKeychainOperationsRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedStableData: Data?
+    private var storedStableAccessibility: String?
+    private var storedLegacyData: Data?
+    private let configuredUpdateStatus: OSStatus
+    private let configuredAddStatus: OSStatus
+    private var storedUpdateCallCount = 0
+    private var storedLegacyDeleteCallCount = 0
+
+    init(
+        stableData: Data? = nil,
+        stableAccessibility: String? = nil,
+        legacyData: Data? = nil,
+        updateStatus: OSStatus = errSecSuccess,
+        addStatus: OSStatus = errSecSuccess
+    ) {
+        storedStableData = stableData
+        storedStableAccessibility = stableAccessibility
+        storedLegacyData = legacyData
+        configuredUpdateStatus = updateStatus
+        configuredAddStatus = addStatus
+    }
+
+    var operations: SecureStoreKeychainOperations {
+        SecureStoreKeychainOperations(
+            copyMatching: { [self] query in
+                lock.lock()
+                defer { lock.unlock() }
+                guard query[kSecAttrService as String] as? String == "com.remodex.secure-store",
+                      let storedStableData else {
+                    return (errSecItemNotFound, nil)
+                }
+                return (
+                    errSecSuccess,
+                    [
+                        kSecValueData as String: storedStableData,
+                        kSecAttrAccessible as String: storedStableAccessibility as Any? ?? NSNull(),
+                    ]
+                )
+            },
+            update: { [self] _, attributes in
+                lock.lock()
+                defer { lock.unlock() }
+                storedUpdateCallCount += 1
+                guard configuredUpdateStatus == errSecSuccess else {
+                    return configuredUpdateStatus
+                }
+                guard storedStableData != nil else {
+                    return errSecItemNotFound
+                }
+                if let data = attributes[kSecValueData as String] as? Data {
+                    storedStableData = data
+                }
+                if let accessibility = attributes[kSecAttrAccessible as String] as? String {
+                    storedStableAccessibility = accessibility
+                }
+                return errSecSuccess
+            },
+            add: { [self] query in
+                lock.lock()
+                defer { lock.unlock() }
+                guard configuredAddStatus == errSecSuccess else {
+                    return configuredAddStatus
+                }
+                storedStableData = query[kSecValueData as String] as? Data
+                storedStableAccessibility = query[kSecAttrAccessible as String] as? String
+                return errSecSuccess
+            },
+            delete: { [self] query in
+                lock.lock()
+                defer { lock.unlock() }
+                if query[kSecAttrService as String] as? String != "com.remodex.secure-store" {
+                    storedLegacyDeleteCallCount += 1
+                    storedLegacyData = nil
+                }
+                return errSecSuccess
+            }
+        )
+    }
+
+    var stableData: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedStableData
+    }
+
+    var legacyData: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedLegacyData
+    }
+
+    var updateCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedUpdateCallCount
+    }
+
+    var legacyDeleteCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedLegacyDeleteCallCount
     }
 }

@@ -21,7 +21,7 @@ struct AllModelsSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if isLoadingModels {
+                if models.isEmpty, isLoadingModels {
                     ProgressView("Loading models…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if models.isEmpty {

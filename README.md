@@ -126,6 +126,28 @@ remodex restart
 
 Do not put live OpenAI API keys into the Remodex launchd plist or relay configuration.
 
+## GPT-Live Voice
+
+Remodex's live voice route uses OpenAI's `gpt-live-1` session on the Mac bridge.
+The iOS client receives only an opaque bridge session handle; the long-lived API
+key remains in the Mac Keychain and is never sent to the phone. The bridge still
+uses the existing push-to-talk transcription route unchanged.
+
+Set up the bridge credential once on macOS. The final `-w` intentionally prompts
+for the value instead of placing it in shell history:
+
+```sh
+security add-generic-password -U -s com.remodex.bridge.openai -a api-key -w
+remodex restart
+```
+
+The bridge reads Keychain service `com.remodex.bridge.openai`, account `api-key`
+first. For a foreground developer run only, it falls back to
+`REMODEX_OPENAI_REALTIME_API_KEY`, then `OPENAI_API_KEY`. A macOS LaunchAgent
+does not source `.zshrc`, so do not rely on shell startup files for the
+background service; use the Keychain item and restart the bridge after changing
+it. Never place a live key in the LaunchAgent plist or relay messages.
+
 ## Install the Bridge
 
 <sub>Install from npm with `@latest` so you get the newest bridge fixes.</sub>

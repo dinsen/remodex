@@ -177,10 +177,10 @@ struct ContentView: View {
                 }
                 selectedThread = matchingThread
             }
-            .onChange(of: codex.threads) { _, threads in
-                debugSidebarLog("threads changed count=\(threads.count) sidebarOpen=\(isSidebarOpen) prewarmed=\(isSidebarPrewarmed)")
-                RemodexQuickActionCenter.updateShortcutItems(for: threads)
-                syncSelectedThread(with: threads)
+            .onChange(of: SidebarThreadGrouping.threadsFingerprint(codex.threads)) { _, _ in
+                debugSidebarLog("threads changed count=\(codex.threads.count) sidebarOpen=\(isSidebarOpen) prewarmed=\(isSidebarPrewarmed)")
+                RemodexQuickActionCenter.updateShortcutItems(for: codex.threads)
+                syncSelectedThread(with: codex.threads)
                 routeExternalThreadOpenIfNeeded()
                 routePendingQuickActionIfNeeded()
                 scheduleSidebarPrewarmIfNeeded()

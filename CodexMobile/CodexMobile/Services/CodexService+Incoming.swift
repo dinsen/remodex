@@ -274,6 +274,9 @@ extension CodexService {
         }
 
         switch method {
+        case "voice/realtime/event":
+            handleRealtimeVoiceEvent(paramsObject)
+
         case "thread/started":
             handleThreadStarted(paramsObject)
 

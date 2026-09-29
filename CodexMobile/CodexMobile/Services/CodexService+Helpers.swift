@@ -149,6 +149,11 @@ extension CodexService {
         if merged.preview == nil { merged.preview = existing.preview }
         if merged.createdAt == nil { merged.createdAt = existing.createdAt }
         if merged.updatedAt == nil { merged.updatedAt = existing.updatedAt }
+        // The regular thread/list response may omit section metadata even after
+        // section-specific hydration has established it. Keep it until the next
+        // authoritative section snapshot clears or replaces it.
+        if merged.section == nil { merged.section = existing.section }
+        if merged.sectionEnteredAt == nil { merged.sectionEnteredAt = existing.sectionEnteredAt }
         if merged.cwd == nil { merged.cwd = existing.normalizedProjectPath }
         merged.metadata = mergedThreadMetadata(
             serverMetadata: merged.metadata,
