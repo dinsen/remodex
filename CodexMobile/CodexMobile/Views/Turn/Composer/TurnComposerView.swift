@@ -52,6 +52,9 @@ struct TurnComposerView: View, Equatable {
     let orderedModelOptions: [CodexModelOption]
     let selectedModelID: String?
     let selectedModelTitle: String
+    var fixedRuntimeLabelParts: TurnComposerRuntimeLabelParts? = nil
+    var allowsRuntimeSelection: Bool = true
+    var allowsEffortSelection: Bool = false
     let isLoadingModels: Bool
     let isRuntimeSelectionLoading: Bool
 
@@ -286,6 +289,8 @@ struct TurnComposerView: View, Equatable {
                             isPlanModeArmed: isPlanModeArmed,
                             runtimeState: runtimeState,
                             runtimeActions: runtimeActions,
+                            allowsPlanMode: allowsRuntimeSelection,
+                            allowsFastMode: allowsRuntimeSelection,
                             remainingAttachmentSlots: remainingAttachmentSlots,
                             isInteractionLocked: isComposerInteractionLocked,
                             onSetPlanModeArmed: onSetPlanModeArmed,
@@ -321,7 +326,7 @@ struct TurnComposerView: View, Equatable {
                             isEditable: !isComposerInteractionLocked,
                             dynamicHeight: $composerInputHeight,
                             mentionedSkillNames: accessoryState.composerMentionedSkills.map(\.name),
-                            runtimeState: runtimeState,
+                            runtimeState: allowsRuntimeSelection ? runtimeState : nil,
                             runtimeActions: runtimeActions,
                             isCollapsed: showsCollapsedComposer,
                             maxVisibleLines: expandedInputMaxVisibleLines,
@@ -457,6 +462,8 @@ struct TurnComposerView: View, Equatable {
             runtimeLabelParts: runtimeLabelParts,
             runtimeState: runtimeState,
             runtimeActions: runtimeActions,
+            allowsRuntimeSelection: allowsRuntimeSelection,
+            allowsEffortSelection: allowsEffortSelection,
             remainingAttachmentSlots: remainingAttachmentSlots,
             isComposerInteractionLocked: isComposerInteractionLocked,
             isSendDisabled: isSendDisabled,
@@ -486,9 +493,10 @@ struct TurnComposerView: View, Equatable {
             onResumeQueue: onResumeQueue,
             onStopTurn: onStopTurn,
             onTapRuntimePill: {
+                guard allowsRuntimeSelection || allowsEffortSelection else { return }
                 // A failed bootstrap fetch would otherwise leave the picker
                 // with no fast-mode toggle and no effort slider forever.
-                onRefreshModelsIfNeeded()
+                if allowsRuntimeSelection { onRefreshModelsIfNeeded() }
                 showsRuntimeOverlay = true
             },
             onSend: onSend
@@ -535,7 +543,10 @@ struct TurnComposerView: View, Equatable {
 
     // Shared by the pill and the slider overlay so both render identical text.
     private var runtimeLabelParts: TurnComposerRuntimeLabelParts {
-        TurnComposerMetaMapper.runtimeLabelParts(
+        if let fixedRuntimeLabelParts {
+            return fixedRuntimeLabelParts
+        }
+        return TurnComposerMetaMapper.runtimeLabelParts(
             selectedModelID: selectedModelID,
             selectedModelTitle: selectedModelTitle,
             isRuntimeSelectionLoading: isRuntimeSelectionLoading,
@@ -554,6 +565,7 @@ struct TurnComposerView: View, Equatable {
             orderedModelOptions: orderedModelOptions,
             selectedModelID: selectedModelID,
             isLoadingModels: isLoadingModels,
+            allowsModelSelection: allowsRuntimeSelection,
             onDismiss: { showsRuntimeOverlay = false }
         )
     }

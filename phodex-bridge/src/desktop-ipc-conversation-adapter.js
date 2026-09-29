@@ -5,6 +5,7 @@
 // Depends on: crypto, ./desktop-ipc-shared
 
 const { randomUUID } = require("crypto");
+const { applyRuntimeSettingsToConversation } = require("./codex-runtime-settings");
 
 const {
   cloneJSON,
@@ -190,11 +191,15 @@ function applyAppServerMessageToConversationState({
         return null;
       }
       const conversation = ensureConversationInMap(conversations, threadId, { hostId, now });
-      conversation.title = readString(message.params?.threadName)
+      const title = readString(message.params?.threadName)
         || readString(message.params?.thread_name)
         || readString(message.params?.name)
         || readString(message.params?.title)
         || conversation.title;
+      if (title === conversation.title) {
+        return { threadId, changed: false };
+      }
+      conversation.title = title;
       conversation.updatedAt = now();
       return { threadId, changed: true };
     }
@@ -446,7 +451,8 @@ function buildConversationStateFromThread(thread, {
   const createdAtMs = timestampSecondsToMs(thread?.createdAt) || previous?.createdAt || now();
   const updatedAtMs = timestampSecondsToMs(thread?.updatedAt) || now();
   const cwd = readString(thread?.cwd) || previous?.cwd || "";
-  const latestModel = readString(thread?.model) || readString(thread?.modelProvider) || previous?.latestModel || "";
+  const latestModel = readString(previous?.latestThreadSettings?.model)
+    || readString(thread?.model) || previous?.latestModel || "";
   const turns = mergeConversationTurnsFromThread(thread?.turns, {
     previousTurns: previous?.turns,
     threadId,
@@ -473,8 +479,9 @@ function buildConversationStateFromThread(thread, {
     threadStartKind: previous?.threadStartKind || "default",
     modelProvider: readString(thread?.modelProvider) || previous?.modelProvider || "openai",
     latestModel,
-    latestReasoningEffort: previous?.latestReasoningEffort || null,
-    latestServiceTier: previous?.latestServiceTier || null,
+    latestReasoningEffort: previous?.latestReasoningEffort ?? null,
+    latestServiceTier: previous?.latestServiceTier ?? null,
+    latestThreadSettings: cloneJSON(previous?.latestThreadSettings || null),
     previousTurnModel: previous?.previousTurnModel || null,
     latestCollaborationMode: previous?.latestCollaborationMode || {
       mode: "default",
@@ -625,7 +632,7 @@ function synchronizeDesktopConversationCompatibility(state) {
     turn.params = normalizeTurnParamsCompatibility(turn.params, {
       cwd: readString(turn.params?.cwd) || readString(state.cwd),
     });
-    turn.items = Array.isArray(turn.items) ? turn.items : [];
+    turn.items = Array.isArray(turn.items) ? turn.items.map(normalizeDesktopItemCompatibility) : [];
     turn.hookRuns = Array.isArray(turn.hookRuns) ? turn.hookRuns : [];
     const key = `turn:${turnId}`;
     entries.push({ key, value: key });
@@ -716,14 +723,12 @@ function synchronizeDesktopConversationCompatibility(state) {
     modelProvider: readString(state.latestThreadSettings?.modelProvider)
       || readString(state.modelProvider)
       || "openai",
-    serviceTier: readString(state.latestThreadSettings?.serviceTier)
-      || readString(latestParams?.serviceTier)
-      || readString(state.latestServiceTier)
-      || null,
-    effort: state.latestThreadSettings?.effort
-      ?? latestParams?.effort
-      ?? state.latestReasoningEffort
-      ?? null,
+    serviceTier: Object.prototype.hasOwnProperty.call(state.latestThreadSettings || {}, "serviceTier")
+      ? state.latestThreadSettings.serviceTier
+      : latestParams?.serviceTier ?? state.latestServiceTier ?? null,
+    effort: Object.prototype.hasOwnProperty.call(state.latestThreadSettings || {}, "effort")
+      ? state.latestThreadSettings.effort
+      : latestParams?.effort ?? state.latestReasoningEffort ?? null,
     summary: latestParams?.summary ?? state.latestThreadSettings?.summary ?? "none",
     collaborationMode: cloneJSON(
       state.latestThreadSettings?.collaborationMode
@@ -745,7 +750,7 @@ function normalizeTurnParamsCompatibility(params, { cwd = "" } = {}) {
   const normalized = params && typeof params === "object" && !Array.isArray(params)
     ? params
     : {};
-  normalized.input = Array.isArray(normalized.input) ? normalized.input : [];
+  normalized.input = normalizeDesktopInputEntries(normalized.input);
   normalized.attachments = Array.isArray(normalized.attachments) ? normalized.attachments : [];
   normalized.cwd = readString(normalized.cwd) || readString(cwd) || null;
   normalized.summary ??= "none";
@@ -894,35 +899,8 @@ function applyTurnRuntimeMetadata(conversation, turnParams) {
   if (!conversation || !turnParams) {
     return;
   }
-  const model = readString(turnParams.model);
-  const effort = readString(turnParams.effort);
-  const serviceTier = readString(turnParams.serviceTier) || null;
-  if (model) {
-    conversation.previousTurnModel = conversation.latestModel || null;
-    conversation.latestModel = model;
-  }
-  if (effort) {
-    conversation.latestReasoningEffort = effort;
-  }
-  conversation.latestServiceTier = serviceTier;
-  if (turnParams.collaborationMode && typeof turnParams.collaborationMode === "object") {
-    conversation.latestCollaborationMode = cloneJSON(turnParams.collaborationMode);
-    return;
-  }
-  if (!model && !effort) {
-    return;
-  }
-  const settings = conversation.latestCollaborationMode?.settings;
-  conversation.latestCollaborationMode = {
-    mode: conversation.latestCollaborationMode?.mode || "default",
-    settings: {
-      ...(settings && typeof settings === "object" ? settings : {
-        developer_instructions: null,
-      }),
-      model: model || settings?.model || "",
-      reasoning_effort: effort || settings?.reasoning_effort || null,
-    },
-  };
+  if (readString(turnParams.model)) conversation.previousTurnModel = conversation.latestModel || null;
+  applyRuntimeSettingsToConversation(conversation, turnParams);
 }
 
 function turnHasUserMessageItem(turn) {
@@ -962,7 +940,22 @@ function extractUserText(entries) {
 }
 
 function sanitizeUserInputEntries(entries) {
-  return sanitizeSharedUserInputEntries(entries).map(cloneJSON);
+  return normalizeDesktopInputEntries(sanitizeSharedUserInputEntries(entries)).map(cloneJSON);
+}
+
+// App-server defaults text_elements, but Desktop 26.903 reads its length
+// directly in IPC snapshots. Preserve existing spans and their byte offsets.
+function normalizeDesktopInputEntries(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries.map((entry) => {
+    if (!entry || typeof entry !== "object" || entry.type !== "text"
+      || Array.isArray(entry.text_elements)) {
+      return entry;
+    }
+    return { ...entry, text_elements: [] };
+  });
 }
 
 function sanitizeUserMessageItem(item) {
@@ -983,15 +976,22 @@ function sanitizeUserMessageItem(item) {
   };
 }
 
-// Codex CLI 0.144.1 can omit receiverThreads from persisted collab tool calls,
-// while the matching Desktop renderer reads that collection without a fallback.
-// Keep the richer snapshots unchanged and synthesize lightweight references from
-// receiverThreadIds for older/CLI-owned rollouts so opening them cannot crash.
+// Normalize optional app-server fields required by Desktop's snapshot renderer.
 function normalizeDesktopItemCompatibility(item) {
-  if (!item || typeof item !== "object" || normalizeToken(item.type) !== "collabagenttoolcall") {
+  if (!item || typeof item !== "object") {
     return item;
   }
 
+  if (item.type === "userMessage" || item.type === "steeringUserMessage") {
+    const inputKey = item.type === "userMessage" ? "content" : "input";
+    return { ...item, [inputKey]: normalizeDesktopInputEntries(item[inputKey]) };
+  }
+  if (normalizeToken(item.type) !== "collabagenttoolcall") {
+    return item;
+  }
+
+  // Codex CLI 0.144.1 can omit receiverThreads from persisted collab tool calls.
+  // Keep richer snapshots and synthesize references for older/CLI-owned rollouts.
   const receiverThreads = Array.isArray(item.receiverThreads)
     ? item.receiverThreads
     : [];
@@ -1085,14 +1085,19 @@ function normalizeTurnInitialPrompt(turn) {
 function userMessageContentFromTurnInput(entry) {
   if (typeof entry === "string") {
     const text = readString(entry);
-    return text ? { type: "text", text } : null;
+    return text ? { type: "text", text, text_elements: [] } : null;
   }
   if (!entry || typeof entry !== "object") {
     return null;
   }
   const type = normalizeToken(entry.type);
   if (type === "inputtext" || type === "text") {
-    return { type: "text", text: readString(entry.text) };
+    return {
+      ...cloneJSON(entry),
+      type: "text",
+      text: typeof entry.text === "string" ? entry.text : "",
+      text_elements: Array.isArray(entry.text_elements) ? cloneJSON(entry.text_elements) : [],
+    };
   }
   return cloneJSON(entry);
 }
@@ -1457,6 +1462,7 @@ module.exports = {
   createEmptyConversationState,
   ensureConversationInMap,
   mergeConversationTurnsFromThread,
+  normalizeSandboxPolicyCompatibility,
   normalizeThreadGoal,
   readThreadIdFromParams,
   readTurnIdFromParams,

@@ -283,6 +283,9 @@ final class ScrollGeometryCoalescer {
                 return
             }
             followBottomTask = nil
+            // Native size-change anchoring may have repaired the drift while
+            // this request waited. Do not start a second, stale scroll animation.
+            guard latestObservedIsAtBottom != true else { return }
             isFollowBottomCorrectionAnimating = true
             action { [weak self] in
                 self?.completeFollowBottom(generation: expectedGeneration)

@@ -654,7 +654,7 @@ final class SidebarThreadGroupingTests: XCTestCase {
         )
     }
 
-    func testConfiguredProjectSourceExcludesRecentThreadProjectsOutsideConfig() {
+    func testConfiguredProjectSourcePreservesRecentThreadProjectsOutsideConfig() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let threads = [
             makeThread(id: "configured-thread", updatedAt: now, cwd: "/Users/me/work/helper"),
@@ -679,12 +679,38 @@ final class SidebarThreadGroupingTests: XCTestCase {
             now: now
         )
 
-        XCTAssertEqual(configuredGroups.map(\.id), ["project:/Users/me/work/helper"])
+        XCTAssertEqual(configuredGroups.map(\.id), [
+            "project:/Users/me/work/helper",
+            "project:/Users/me/work/recent-only",
+        ])
         XCTAssertEqual(configuredGroups[0].threads.map(\.id), ["configured-thread"])
+        XCTAssertEqual(configuredGroups[1].threads.map(\.id), ["recent-only-thread"])
         XCTAssertEqual(recentGroups.map(\.id), [
             "project:/Users/me/work/recent-only",
             "project:/Users/me/work/helper",
         ])
+    }
+
+    func testConfiguredProjectSourceFallsBackWhenBridgeReturnsNoConfiguredProjects() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "app-thread", updatedAt: now, cwd: "/Users/me/work/app"),
+            makeThread(id: "site-thread", updatedAt: now.addingTimeInterval(-60), cwd: "/Users/me/work/site"),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(
+            from: threads,
+            scope: .projects,
+            projectSource: .configuredProjects,
+            configuredProjectChoices: [],
+            now: now
+        )
+
+        XCTAssertEqual(groups.map(\.id), [
+            "project:/Users/me/work/app",
+            "project:/Users/me/work/site",
+        ])
+        XCTAssertEqual(groups.flatMap(\.threads).map(\.id), ["app-thread", "site-thread"])
     }
 
     func testLiveThreadIDsForConfiguredProjectGroupIncludesDescendantThreads() {
@@ -705,11 +731,12 @@ final class SidebarThreadGroupingTests: XCTestCase {
             now: now
         )
 
-        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.count, 2)
         XCTAssertEqual(
             SidebarThreadGrouping.liveThreadIDsForProjectGroup(groups[0], in: threads),
             ["root-thread", "child-thread"]
         )
+        XCTAssertEqual(groups[1].threads.map(\.id), ["sibling-thread"])
     }
 
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {

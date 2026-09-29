@@ -22,6 +22,8 @@ const {
   hasRelayConnectionGoneStale,
 } = require("./bridge-status");
 const { createCodexTransport } = require("./codex-transport");
+const { createOpenCodeRuntime } = require("./opencode-runtime");
+const { createRelayWatchdog } = require("./relay-watchdog");
 const {
   createThreadRolloutActivityWatcher,
   collectRecentRolloutFiles,
@@ -80,6 +82,13 @@ const {
 } = require("./desktop-ipc-action-follower");
 const { createDesktopIpcLiveOwner } = require("./desktop-ipc-live-owner");
 const { createThreadRuntimeSettingsStore } = require("./thread-runtime-settings-store");
+const { normalizeServiceTier, hasOwn } = require("./codex-runtime-settings");
+const {
+  APP_SERVER_SOURCE,
+  DESKTOP_IPC_SOURCE,
+  createThreadActivityProjector,
+} = require("./thread-activity-projector");
+const { createThreadActivityStore } = require("./thread-activity-store");
 const { createThreadListProvenanceEnricher } = require("./thread-list-provenance");
 const { createWorktreeOriginEnricher } = require("./worktree-origin");
 const { forEachThreadRowInResponse } = require("./thread-row-enrichment");
@@ -104,9 +113,10 @@ const {
 const { buildApplyPatchFileChangeItem } = require("./apply-patch-changes");
 
 const execFileAsync = promisify(execFile);
-const RELAY_WATCHDOG_PING_INTERVAL_MS = 10_000;
 const RELAY_HISTORY_IMAGE_REFERENCE_URL = "remodex://history-image-elided";
 const RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES = 4 * 1024 * 1024;
+const OPEN_CODE_THREAD_LIST_CURSOR_PREFIX = "remodex-opencode-list-v1:";
+const THREAD_LIST_DEFAULT_LIMIT = 100;
 const RELAY_HISTORY_TEXT_TAIL_LIMIT_CHARS = 24_000;
 // Recent-turn window used only when a thread/read payload already exceeds the
 // relay soft budget: heavy threads first paint with this many newest turns and
@@ -593,6 +603,7 @@ function annotateTurnStateProbeWithMirrorActiveTurn(request, response, getMirror
 
 function canonicalThreadTurnsListRequest(request) {
   const params = { ...(request?.params || {}) };
+  params.itemsView ??= params.remodexTurnStateOnly === true ? "summary" : "full";
   delete params.remodexRequireCanonical;
   delete params.remodexTurnStateOnly;
   if (params.cursor === JSONL_OLDER_HANDOFF_CURSOR || threadTurnsListHandoffDescriptor(params.cursor)) {
@@ -754,9 +765,8 @@ function startBridge({
   const relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
   const notificationSecret = randomBytes(24).toString("hex");
   const desktopRefresher = new CodexDesktopRefresher({
-    // IPC snapshots are accepted only after Codex mounts the route and
-    // announces itself as a follower. Auto-follow performs that one-time
-    // activation; refreshEnabled still controls the legacy reload workaround.
+    // Opening a thread manually establishes its IPC subscription. Automatic
+    // navigation and the legacy refresh workaround both require an opt-in.
     enabled: config.refreshEnabled || config.desktopAutoFollowEnabled === true,
     // With IPC live sync streaming content, deep-link refreshes are only needed
     // to navigate Desktop onto the phone-driven thread, not to reload content.
@@ -786,7 +796,7 @@ function startBridge({
   let isShuttingDown = false;
   let reconnectAttempt = 0;
   let reconnectTimer = null;
-  let relayWatchdogTimer = null;
+  let relayWatchdog = null;
   let lastRelayActivityAt = 0;
   let lastConnectionStatus = null;
   let codexLaunchState = config.codexEndpoint ? "connected" : "starting";
@@ -794,14 +804,33 @@ function startBridge({
   const forwardedInitializeRequestIds = new Set();
   const bridgeManagedCodexRequestWaiters = new Map();
   const forwardedRequestMethodsById = new Map();
+  const pendingLocalThreadCreationRequestsById = new Map();
   const relaySanitizedResponseMethodsById = new Map();
+  const pendingOpenCodeThreadListRequests = new Map();
+  const openCodeThreadCatalog = new Map();
+  const archivedOpenCodeThreadCatalog = new Map();
+  let openCodeCatalogRefresh = null;
   const desktopIpcLiveOwnerObservedInboundKeys = new Set();
   const jsonlTurnsListRolloutCacheByThread = new Map();
   const jsonlTurnsListRolloutMissCacheByThread = new Map();
   const threadTurnsListFastPageCoordinator = createThreadTurnsListFastPageCoordinator();
-  const threadRuntimeSettingsStore = createThreadRuntimeSettingsStore();
+  const threadRuntimeSettingsStore = createThreadRuntimeSettingsStore({
+    onChange(threadId, runtimeSettings) {
+      sendApplicationResponse(JSON.stringify({
+        method: "remodex/runtimeSettings/updated",
+        params: { threadId, runtimeSettings },
+      }));
+    },
+  });
   const threadListProvenanceEnricher = createThreadListProvenanceEnricher();
   const worktreeOriginEnricher = createWorktreeOriginEnricher();
+  const activityProjector = createThreadActivityProjector();
+  const activityStore = createThreadActivityStore({
+    sendApplicationResponse,
+    onEvict(threadId, source) {
+      activityProjector.forget(threadId, source);
+    },
+  });
   const trackedForwardedRequestMethods = new Set([
     "account/login/start",
     "account/login/cancel",
@@ -831,6 +860,7 @@ function startBridge({
       sendRelayRegistrationUpdate(nextDeviceState);
     },
     onSecureSessionReady(session) {
+      activityStore.resetSubscriber();
       activePhoneSummary = buildActivePhoneSummary(session, deviceState);
       const lastPublishedBridgeStatus = bridgeStatusPublisher.latest();
       if (lastPublishedBridgeStatus) {
@@ -857,9 +887,10 @@ function startBridge({
       // authoritative, but yields an active cache that stopped broadcasting;
       // a later Desktop snapshot is announced as a new source epoch so the
       // phone performs canonical repair instead of mixing both mirrors.
-      shouldSuppressThread: (threadId) => shouldSuppressRolloutMirrorForThread(
+      shouldSuppressThread: (threadId, context) => shouldSuppressRolloutMirrorForThread(
         threadId,
-        { desktopIpcActionFollower, desktopIpcLiveOwner }
+        { desktopIpcActionFollower, desktopIpcLiveOwner },
+        context
       ),
     })
     : null;
@@ -869,7 +900,24 @@ function startBridge({
       readConversationState: async (threadId) => seedConversationStateFromThreadRead(
         await sendCodexRequest("thread/read", buildCompleteThreadReadParams(threadId))
       ),
+      readThreadMetadata: async (threadId) => sendCodexRequest("thread/read", {
+        threadId,
+        includeTurns: false,
+      }),
+      async resumeThreadLocally(message) {
+        const result = await sendCodexRequest("thread/resume", message.params);
+        if (isShuttingDown || result?.thread?.id !== message.params?.threadId) return result;
+        // The private request uses a bridge-managed RPC id. Reuse the live
+        // owner's normal matching-response path with the phone's original id,
+        // so only this successful acquisition can claim the local stream.
+        const response = { id: message.id, result };
+        observeDesktopIpcLiveOwnerInbound(JSON.stringify(message), message);
+        desktopIpcLiveOwner?.observeOutbound(JSON.stringify(response), response);
+        rememberThreadFromMessage("codex", JSON.stringify(response), response);
+        return result;
+      },
       forwardToLocalCodex: (rawMessage) => {
+        if (handleLocalRuntimeSettingsRequest(parseBridgeMessage(rawMessage))) return;
         observeDesktopIpcLiveOwnerInbound(rawMessage);
         forwardInboundRequestToCodex(rawMessage);
       },
@@ -883,6 +931,7 @@ function startBridge({
       onFollowerStateChanged(threadId, following) {
         desktopRefresher.handleFollowerStateChanged(threadId, following);
       },
+      onActivityObservation: handleDesktopActivityObservation,
     })
     : null;
   const desktopIpcLiveOwner = !config.codexEndpoint
@@ -908,6 +957,21 @@ function startBridge({
     env: process.env,
     appPath: config.codexAppPath,
     logPrefix: "[remodex]",
+  });
+  const openCodeRuntime = createOpenCodeRuntime({
+    onNotification(message) {
+      if (message.method === "thread/started" && message.params?.thread?.id) {
+        openCodeThreadCatalog.set(message.params.thread.id, message.params.thread);
+      } else if (message.method === "thread/archived" && message.params?.threadId) {
+        const thread = openCodeThreadCatalog.get(message.params.threadId);
+        openCodeThreadCatalog.delete(message.params.threadId);
+        if (thread) archivedOpenCodeThreadCatalog.set(thread.id, { ...thread, syncState: "archivedLocal" });
+      } else if (message.method === "thread/unarchived") {
+        refreshOpenCodeThreadCatalog();
+      }
+      pushNotificationTracker.handleOutbound(JSON.stringify(message), message);
+      sendApplicationResponse(JSON.stringify(message));
+    },
   });
   const voiceHandler = createVoiceHandler({
     sendCodexRequest,
@@ -976,12 +1040,8 @@ function startBridge({
   }
 
   function clearRelayWatchdog() {
-    if (!relayWatchdogTimer) {
-      return;
-    }
-
-    clearInterval(relayWatchdogTimer);
-    relayWatchdogTimer = null;
+    relayWatchdog?.stop();
+    relayWatchdog = null;
   }
 
   function prepareBridgeShutdown() {
@@ -991,9 +1051,17 @@ function startBridge({
     clearRelayWatchdog();
     bridgeStatusPublisher.stopHeartbeat();
     stopContextUsageWatcher();
+    activityStore.dispose();
     rolloutLiveMirror?.stopAll();
     desktopIpcActionFollower?.stopAll();
     desktopIpcLiveOwner?.stopAll();
+    pendingOpenCodeThreadListRequests.clear();
+    archivedOpenCodeThreadCatalog.clear();
+    pendingLocalThreadCreationRequestsById.clear();
+    openCodeThreadCatalog.clear();
+    Promise.resolve().then(() => openCodeRuntime.shutdown()).catch((error) => {
+      console.warn(`[remodex] OpenCode shutdown failed: ${error?.message || "unknown error"}`);
+    });
   }
 
   function stopBridge() {
@@ -1016,30 +1084,15 @@ function startBridge({
     clearRelayWatchdog();
     markRelayActivity();
 
-    relayWatchdogTimer = setInterval(() => {
-      if (isShuttingDown || socket !== trackedSocket) {
-        clearRelayWatchdog();
-        return;
-      }
-
-      if (trackedSocket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-
-      if (hasRelayConnectionGoneStale(lastRelayActivityAt)) {
+    relayWatchdog = createRelayWatchdog({
+      socket: trackedSocket,
+      getLastActivityAt: () => lastRelayActivityAt,
+      shouldRun: () => !isShuttingDown && socket === trackedSocket,
+      onStale() {
         console.warn("[remodex] relay heartbeat stalled; forcing reconnect");
         logConnectionStatus("disconnected");
-        trackedSocket.terminate();
-        return;
-      }
-
-      try {
-        trackedSocket.ping();
-      } catch {
-        trackedSocket.terminate();
-      }
-    }, RELAY_WATCHDOG_PING_INTERVAL_MS);
-    relayWatchdogTimer.unref?.();
+      },
+    });
   }
 
   // Keeps npm start output compact by emitting only high-signal connection states.
@@ -1182,6 +1235,25 @@ function startBridge({
     // Streaming deltas make this the hottest path in the bridge: parse the
     // envelope once and share the read-only object with every observer.
     const parsedMessage = parseBridgeMessage(message);
+    if (parsedMessage?.result && forwardedInitializeRequestIds.has(String(parsedMessage.id))) {
+      parsedMessage.result.remodexRuntimeSettingsVersion = 2;
+      message = JSON.stringify(parsedMessage);
+    }
+    if (parsedMessage?.method === "thread/settings/updated"
+      && parsedMessage.params?.threadSettings) {
+      threadRuntimeSettingsStore.observe(parsedMessage.params.threadId, parsedMessage.params.threadSettings);
+    }
+    if (parsedMessage?.method === "thread/closed" || parsedMessage?.method === "thread/archived") {
+      desktopIpcActionFollower?.releaseLocallyAcquiredThread(parsedMessage.params?.threadId);
+    }
+    if (parsedMessage?.id != null) {
+      const requestId = String(parsedMessage.id);
+      if (pendingLocalThreadCreationRequestsById.delete(requestId)
+        && !parsedMessage.error
+        && config.desktopIpcLiveSyncEnabled === false) {
+        desktopIpcActionFollower?.claimNewLocalThread(parsedMessage.result?.thread?.id);
+      }
+    }
     if (handleBridgeManagedCodexResponse(message, parsedMessage)) {
       return;
     }
@@ -1189,15 +1261,14 @@ function startBridge({
     trackCodexHandshakeState(message, parsedMessage);
     desktopRefresher.handleOutbound(message, parsedMessage);
     desktopIpcLiveOwner?.observeOutbound(message, parsedMessage);
+    observeAppServerActivity(parsedMessage);
     pushNotificationTracker.handleOutbound(message, parsedMessage);
     rememberThreadFromMessage("codex", message, parsedMessage);
-    secureTransport.queueOutboundApplicationMessage(
-      sanitizeRelayBoundCodexMessage(message, parsedMessage),
-      sendRelayWireMessage
-    );
+    queueApplicationMessageWithOpenCodeList(message, parsedMessage);
   });
 
   codex.onClose(() => {
+    activityStore.markSourceStale(APP_SERVER_SOURCE);
     const wasShuttingDown = isShuttingDown;
     clearRelayWatchdog();
     bridgeStatusPublisher.stopHeartbeat();
@@ -1229,7 +1300,57 @@ function startBridge({
 
   // Routes decrypted app payloads through the same bridge handlers as before.
   function handleApplicationMessage(rawMessage) {
+    rawMessage = normalizePhoneRuntimeRequest(rawMessage);
     const parsedMessage = parseBridgeMessage(rawMessage);
+    // Register history/list response shaping before either runtime can reply.
+    rememberForwardedRequestMethod(rawMessage);
+    if (parsedMessage?.method === "thread/list"
+      && typeof parsedMessage.params?.cursor === "string"
+      && parsedMessage.params.cursor.startsWith(OPEN_CODE_THREAD_LIST_CURSOR_PREFIX)) {
+      const mixedCursor = decodeOpenCodeThreadListCursor(parsedMessage.params.cursor);
+      if (!mixedCursor || mixedCursor.archived !== (parsedMessage.params?.archived === true)) {
+        sendApplicationResponse(createJsonRpcErrorResponse(
+          parsedMessage.id, new Error("Invalid mixed thread list cursor"), "invalid_thread_list_cursor"
+        ));
+        return;
+      }
+      if (mixedCursor.codexCursor == null) {
+        sendApplicationResponse(JSON.stringify({
+          id: parsedMessage.id,
+          result: { data: [], nextCursor: null },
+        }));
+        return;
+      }
+      // The app-server only understands its own opaque cursor. Our cursor also
+      // carries the OpenCode offset, which stays private to the bridge.
+      codex.send(JSON.stringify({
+        ...parsedMessage,
+        params: { ...parsedMessage.params, cursor: mixedCursor.codexCursor },
+      }));
+      return;
+    }
+    if (parsedMessage?.id != null && !parsedMessage.method
+      && openCodeRuntime.ownsClientResponse(parsedMessage)) {
+      Promise.resolve().then(() => openCodeRuntime.handleClientResponse(parsedMessage)).catch((error) => {
+        console.warn(`[remodex] OpenCode response failed: ${error?.message || "unknown error"}`);
+      });
+      return;
+    }
+    if (isOpenCodeRequest(parsedMessage, openCodeRuntime)) {
+      Promise.resolve().then(() => openCodeRuntime.handleRequest(parsedMessage)).then((result) => {
+        if (parsedMessage.id != null) {
+          sendApplicationResponse(JSON.stringify({ id: parsedMessage.id, result }));
+        }
+      }).catch((error) => {
+        if (parsedMessage.id != null) {
+          sendApplicationResponse(createJsonRpcErrorResponse(parsedMessage.id, error, "opencode_request_failed"));
+        }
+      });
+      return;
+    }
+    if (activityStore.handleRequest(parsedMessage)) {
+      return;
+    }
     if (handleBridgeManagedHandshakeMessage(rawMessage, sendApplicationResponse, parsedMessage)) {
       return;
     }
@@ -1277,7 +1398,8 @@ function startBridge({
     }
     if (handleGitRequest(rawMessage, sendApplicationResponse, {
       codexAppPath: config.codexAppPath,
-      onThreadNameSet: sendThreadNameUpdatedNotification,
+      sendCodexRequest,
+      listOpenCodeSessions: () => openCodeRuntime.listAllSessions(),
     })) {
       return;
     }
@@ -1294,6 +1416,7 @@ function startBridge({
     if (desktopIpcActionFollower?.observeInbound(rawMessage, parsedMessage)) {
       return;
     }
+    if (handleLocalRuntimeSettingsRequest(parsedMessage)) return;
     observeDesktopIpcLiveOwnerInbound(rawMessage, parsedMessage);
     if (handleBridgeManagedThreadTurnsListRequest(rawMessage, sendApplicationResponse)) {
       return;
@@ -1301,8 +1424,25 @@ function startBridge({
     forwardInboundRequestToCodex(rawMessage);
   }
 
+  function handleLocalRuntimeSettingsRequest(parsedMessage) {
+    return routeLocalRuntimeSettingsRequest(parsedMessage, {
+      desktopIpcLiveOwner,
+      desktopIpcActionFollower,
+      sendCodexRequest,
+      threadRuntimeSettingsStore,
+      sendApplicationResponse,
+      createJsonRpcErrorResponse,
+    });
+  }
+
   function forwardInboundRequestToCodex(rawMessage) {
     const codexRequest = normalizeTurnStartForCodex(rawMessage);
+    const parsedRequest = parseBridgeMessage(codexRequest);
+    if (parsedRequest?.id != null
+      && (parsedRequest.method === "thread/start" || parsedRequest.method === "thread/fork")) {
+      pendingLocalThreadCreationRequestsById.set(String(parsedRequest.id), true);
+      evictOldestEntries(pendingLocalThreadCreationRequestsById, FORWARDED_REQUEST_METHODS_MAX_SIZE);
+    }
     rememberForwardedRequestMethod(rawMessage);
     rememberThreadFromMessage("phone", codexRequest);
     codex.send(codexRequest);
@@ -1351,31 +1491,131 @@ function startBridge({
     }
   }
 
-  // Encrypts bridge-generated responses instead of letting the relay see plaintext.
-  function sendApplicationResponse(rawMessage) {
-    secureTransport.queueOutboundApplicationMessage(
-      sanitizeRelayBoundCodexMessage(rawMessage),
-      sendRelayWireMessage
-    );
+  function observeAppServerActivity(message) {
+    if (isShuttingDown) {
+      return;
+    }
+    const projection = activityProjector.observeAppServer(message);
+    if (projection?.entry) {
+      const entry = projection.entry;
+      const previous = activityStore.get(entry.threadId);
+      if (previous?.source === DESKTOP_IPC_SOURCE
+          && !desktopIpcLiveOwner?.isThreadOwned(entry.threadId)) {
+        // Catalog changes do not transfer runtime ownership to this app-server.
+        if (message.method === "thread/name/updated" || message.method === "thread/started") {
+          activityStore.upsert({
+            ...previous,
+            ...(entry.title ? { title: entry.title } : {}),
+            ...(entry.cwd ? { cwd: entry.cwd } : {}),
+          });
+        }
+        return;
+      }
+      activityStore.upsert({
+        ...(previous?.title ? { title: previous.title } : {}),
+        ...(previous?.cwd ? { cwd: previous.cwd } : {}),
+        ...entry,
+      });
+    } else if (projection?.removedThreadId) {
+      activityStore.remove(projection.removedThreadId);
+    }
   }
 
-  // Mirrors accepted local renames back to the phone using the existing push-event shape.
-  function sendThreadNameUpdatedNotification(result) {
-    const threadId = readString(result?.threadId || result?.thread_id);
-    const name = readString(result?.name || result?.title);
-    if (!threadId || !name) {
+  function handleDesktopActivityObservation(observation) {
+    if (isShuttingDown) {
+      return;
+    }
+    if (observation?.type === "state") {
+      const entry = activityProjector.projectDesktopState(
+        observation.threadId,
+        observation.state,
+        observation.sourceGeneration
+      );
+      activityStore.upsert(entry);
+      return;
+    }
+    if (observation?.type === "disconnected") {
+      activityStore.markSourceStale(DESKTOP_IPC_SOURCE, observation.sourceGeneration);
+      return;
+    }
+    if (observation?.type === "removed") {
+      activityStore.remove(observation.threadId, { source: DESKTOP_IPC_SOURCE });
+    }
+  }
+
+  // Encrypts bridge-generated responses instead of letting the relay see plaintext.
+  function sendApplicationResponse(rawMessage) {
+    queueApplicationMessageWithOpenCodeList(rawMessage);
+  }
+
+  function queueApplicationMessageWithOpenCodeList(rawMessage, parsedMessage = null) {
+    const responseId = parsedMessage?.id ?? safeParseJSON(rawMessage)?.id;
+    const requestKey = responseId == null ? "" : String(responseId);
+    const listRequest = pendingOpenCodeThreadListRequests.get(requestKey);
+    const sanitizedMessage = sanitizeRelayBoundCodexMessage(rawMessage, parsedMessage);
+    if (!listRequest || !sanitizedMessage) {
+      secureTransport.queueOutboundApplicationMessage(sanitizedMessage, sendRelayWireMessage);
       return;
     }
 
-    sendApplicationResponse(JSON.stringify({
-      method: "thread/name/updated",
-      params: {
-        threadId,
-        thread_id: threadId,
-        name,
-        title: name,
-      },
-    }));
+    pendingOpenCodeThreadListRequests.delete(requestKey);
+    if (safeParseJSON(sanitizedMessage)?.error) {
+      secureTransport.queueOutboundApplicationMessage(sanitizedMessage, sendRelayWireMessage);
+      return;
+    }
+    const sendMerged = () => secureTransport.queueOutboundApplicationMessage(
+      mergeOpenCodeThreadsIntoListResponse(
+        sanitizedMessage,
+        [...(listRequest.archived ? archivedOpenCodeThreadCatalog : openCodeThreadCatalog).values()],
+        listRequest
+      ),
+      sendRelayWireMessage
+    );
+    if (listRequest.cursor) {
+      sendMerged();
+      return;
+    }
+    const refresh = refreshOpenCodeThreadCatalog();
+    const timeoutMs = listRequest.archived ? 2_500 : 750;
+    Promise.race([
+      refresh,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]).then(sendMerged);
+  }
+
+  function refreshOpenCodeThreadCatalog() {
+    if (openCodeCatalogRefresh) return openCodeCatalogRefresh;
+    openCodeCatalogRefresh = Promise.resolve().then(() => openCodeRuntime.listThreadCatalog()).then(({ active, archived }) => {
+      const previousIds = new Set(openCodeThreadCatalog.keys());
+      openCodeThreadCatalog.clear();
+      archivedOpenCodeThreadCatalog.clear();
+      for (const thread of archived) archivedOpenCodeThreadCatalog.set(thread.id, thread);
+      for (const thread of active) {
+        openCodeThreadCatalog.set(thread.id, thread);
+        if (!previousIds.has(thread.id)) {
+          sendApplicationResponse(JSON.stringify({
+            method: "thread/started",
+            params: { thread, remodexDesktopMirror: true },
+          }));
+        }
+      }
+      // A Mac-side archive can happen while SSE or the phone is disconnected.
+      // Reconcile removed active rows explicitly because iOS preserves local
+      // rows missing from a paginated thread/list response.
+      for (const threadId of previousIds) {
+        if (!openCodeThreadCatalog.has(threadId) && archivedOpenCodeThreadCatalog.has(threadId)) {
+          sendApplicationResponse(JSON.stringify({
+            method: "thread/archived",
+            params: { threadId },
+          }));
+        }
+      }
+    }).catch(() => {
+      // An unavailable optional runtime must not stall Codex's thread catalog.
+    }).finally(() => {
+      openCodeCatalogRefresh = null;
+    });
+    return openCodeCatalogRefresh;
   }
 
   function handleBridgeManagedThreadTurnsListRequest(rawMessage, sendResponse = sendApplicationResponse) {
@@ -1768,6 +2008,11 @@ function startBridge({
     if (relaySanitizedRequestMethods.has(method)) {
       const trackedRequest = {
         method,
+        isActiveThreadCatalog: method === "thread/list"
+          && parsed.params?.archived !== true
+          && !parsed.params?.cursor,
+        threadListLimit: method === "thread/list" ? parsed.params?.limit : undefined,
+        archived: method === "thread/list" && parsed.params?.archived === true,
         threadId: method === "thread/turns/list" || method === "thread/read" || method === "thread/resume"
           ? threadIdFromRequestParams(parsed.params)
           : "",
@@ -1783,6 +2028,17 @@ function startBridge({
         trackedRequest.skipJsonlArtifactAugmentation = false;
       }
       relaySanitizedResponseMethodsById.set(String(requestId), trackedRequest);
+    }
+    if (method === "thread/list") {
+      const mixedCursor = decodeOpenCodeThreadListCursor(parsed.params?.cursor);
+      pendingOpenCodeThreadListRequests.set(String(requestId), {
+        cursor: Boolean(parsed.params?.cursor),
+        archived: parsed.params?.archived === true,
+        limit: parsed.params?.limit,
+        openCodeOffset: mixedCursor?.openCodeOffset
+          ?? (parsed.params?.cursor ? Number.MAX_SAFE_INTEGER : 0),
+      });
+      evictOldestEntries(pendingOpenCodeThreadListRequests, FORWARDED_REQUEST_METHODS_MAX_SIZE);
     }
   }
 
@@ -1827,11 +2083,20 @@ function startBridge({
       || trackedRequest.method === "thread/resume") {
       // One walk over the rows for both enrichers instead of one traversal each.
       forEachThreadRowInResponse(trackedRequest.method, parsed, (thread) => {
+        if (thread.runtimeProvider === "opencode") {
+          return;
+        }
         threadRuntimeSettingsStore.attachToThread(thread);
         threadListProvenanceEnricher.attachToThread(thread);
         worktreeOriginEnricher.attachToThread(thread);
+        if (trackedRequest.method !== "thread/list") {
+          desktopIpcActionFollower?.observeThreadMetadata(thread);
+        }
       });
       normalizedMessage = JSON.stringify(parsed);
+      if (trackedRequest.isActiveThreadCatalog) {
+        desktopIpcActionFollower?.observeThreadListResponse(parsed.result, { limit: trackedRequest.threadListLimit });
+      }
     }
 
     const sanitizeStartedAt = Date.now();
@@ -2041,6 +2306,7 @@ function startBridge({
         id: parsed.id,
         result: {
           bridgeManaged: true,
+          remodexRuntimeSettingsVersion: 2,
         },
       }));
       return true;
@@ -2552,6 +2818,25 @@ function disableUnsupportedReasoningSummaryForTurnStart(rawMessage) {
       summary: "none",
     },
   });
+}
+
+// Upgrade the old phone wire convention once at ingress. Internally an omitted
+// speed always inherits; modern clients distinguish that from explicit Standard.
+function normalizePhoneRuntimeRequest(rawMessage) {
+  const parsed = parseBridgeJSON(rawMessage);
+  if (!parsed || !["turn/start", "thread/start", "thread/settings/update"].includes(parsed.method)
+    || !parsed.params || typeof parsed.params !== "object") return rawMessage;
+  const params = { ...parsed.params };
+  if (parsed.method === "turn/start" && params.remodexRuntimeSettingsVersion !== 2
+    && !hasOwn(params, "serviceTier") && !hasOwn(params, "service_tier")) {
+    params.serviceTier = "default";
+  }
+  delete params.remodexRuntimeSettingsVersion;
+  if (hasOwn(params, "serviceTier") && params.serviceTier != null) {
+    params.serviceTier = normalizeServiceTier(params.serviceTier)
+      ?? (parsed.method === "thread/settings/update" ? null : "default");
+  }
+  return JSON.stringify({ ...parsed, params });
 }
 
 function normalizeTurnStartParamsForCodex(params) {
@@ -3554,7 +3839,8 @@ function sanitizeThreadListForRelay(rawMessage, requestContext = {}) {
   }
 
   const isSectionFiltered = Boolean(normalizeNonEmptyString(requestContext?.sectionId));
-  const { threads, didAugment } = isSectionFiltered
+  const isArchivedList = requestContext?.archived === true;
+  const { threads, didAugment } = isSectionFiltered || isArchivedList
     ? { threads: result[threadsKey], didAugment: false }
     : augmentRelayThreadListWithJsonlThreads(result[threadsKey], requestContext);
   const { threads: compactedThreads, didCompact } = compactRelayThreadListItems(threads);
@@ -5759,17 +6045,190 @@ function persistBridgePreferences(
 function shouldSuppressRolloutMirrorForThread(
   threadId,
   { desktopIpcActionFollower = null, desktopIpcLiveOwner = null } = {},
-  { fallbackActivityAt = 0 } = {}
+  context = {}
 ) {
   // Desktop ownership is an expiring live lease, not a permanent boolean. A
   // stale IPC snapshot used to mute an actively growing rollout forever.
   const followerIsFresh = typeof desktopIpcActionFollower?.hasFreshLiveThreadState === "function"
-    ? desktopIpcActionFollower.hasFreshLiveThreadState(threadId, { fallbackActivityAt })
+    ? desktopIpcActionFollower.hasFreshLiveThreadState(threadId, context)
     : desktopIpcActionFollower?.hasLiveThreadState(threadId);
   const ownerIsFresh = typeof desktopIpcLiveOwner?.isFreshThreadOwned === "function"
     ? desktopIpcLiveOwner.isFreshThreadOwned(threadId)
     : false;
   return Boolean(followerIsFresh) || Boolean(ownerIsFresh);
+}
+
+function isOpenCodeRequest(message, runtime) {
+  const method = readString(message?.method);
+  if (!method) {
+    return false;
+  }
+  if (method === "remodex/opencode/models") {
+    return true;
+  }
+  if (method === "thread/start" && message?.params?.runtimeProvider === "opencode") {
+    return true;
+  }
+  const threadId = threadIdFromRequestParams(message?.params)
+    || readString(message?.params?.conversationId);
+  return Boolean(threadId && runtime.handlesThreadId(threadId));
+}
+
+function routeLocalRuntimeSettingsRequest(message, {
+  desktopIpcLiveOwner,
+  desktopIpcActionFollower,
+  sendCodexRequest,
+  threadRuntimeSettingsStore,
+  sendApplicationResponse,
+  createJsonRpcErrorResponse,
+}) {
+  if (message?.method !== "thread/settings/update" || message.id == null) {
+    return false;
+  }
+  const { threadId, ...settings } = message.params || {};
+  // A missing Desktop snapshot after bridge restart is not proof the local
+  // app-server owns this task. The follower handles known Desktop tasks before
+  // this branch; unknown ownership must not create a competing local writer.
+  const liveOwnerHasThread = Boolean(desktopIpcLiveOwner?.isThreadOwned(threadId));
+  const acquiredByLocalResume = Boolean(desktopIpcActionFollower?.isLocallyAcquiredThread(threadId));
+  if (desktopIpcLiveOwner && !liveOwnerHasThread && !acquiredByLocalResume) {
+    sendApplicationResponse(JSON.stringify({
+      id: message.id,
+      error: {
+        code: -32000,
+        message: "Could not confirm this task's owner yet. Reopen the task and retry.",
+      },
+    }));
+    return true;
+  }
+  const update = liveOwnerHasThread && desktopIpcLiveOwner?.updateThreadSettings
+    ? desktopIpcLiveOwner.updateThreadSettings(threadId, settings)
+    : sendCodexRequest("thread/settings/update", { threadId, ...settings }).then(() => ({
+      runtimeSettings: threadRuntimeSettingsStore.commit(threadId, settings, { source: "phone" }),
+    }));
+  Promise.resolve(update).then((result) => {
+    sendApplicationResponse(JSON.stringify({ id: message.id, result }));
+  }).catch((error) => {
+    sendApplicationResponse(createJsonRpcErrorResponse(message.id, error, "runtime_settings_update_failed"));
+  });
+  return true;
+}
+
+// Keep Codex's page intact. Fill only its free slots with OpenCode rows, then
+// carry the OpenCode offset alongside Codex's opaque cursor. This bounds each
+// relay frame without losing either provider's older pages.
+function mergeOpenCodeThreadsIntoListResponse(rawMessage, openCodeThreads, options = {}) {
+  const response = safeParseBridgeResponse(rawMessage);
+  if (!response?.result || !Array.isArray(openCodeThreads)) {
+    return rawMessage;
+  }
+  const result = response.result;
+  const key = Array.isArray(result.data) ? "data"
+    : Array.isArray(result.items) ? "items"
+      : Array.isArray(result.threads) ? "threads"
+        : null;
+  if (!key) {
+    return rawMessage;
+  }
+  const limit = Number.isSafeInteger(options.limit) && options.limit > 0
+    ? options.limit : THREAD_LIST_DEFAULT_LIMIT;
+  const codexRows = result[key];
+  if (codexRows.length > limit) {
+    return oversizedThreadListError(response.id, "Codex returned more thread rows than the requested limit");
+  }
+  const openCodeRows = openCodeThreads
+    .filter((row) => row && typeof row.id === "string")
+    .sort((a, b) => threadListTimestamp(b.updatedAt ?? b.createdAt)
+      - threadListTimestamp(a.updatedAt ?? a.createdAt) || a.id.localeCompare(b.id));
+  const seen = new Set(codexRows.map((row) => row?.id));
+  const rows = codexRows.slice();
+  let offset = Math.min(Math.max(0, options.openCodeOffset || 0), openCodeRows.length);
+  const codexCursor = result.nextCursor ?? result.next_cursor ?? null;
+  const setPage = () => {
+    const merged = rows.slice().sort((a, b) =>
+      threadListTimestamp(b.updatedAt ?? b.createdAt) - threadListTimestamp(a.updatedAt ?? a.createdAt)
+    );
+    result[key] = merged;
+    if (result.payload && Array.isArray(result.payload[key])) result.payload[key] = merged;
+    result.nextCursor = offset < openCodeRows.length
+      ? encodeOpenCodeThreadListCursor({ codexCursor, openCodeOffset: offset, archived: options.archived === true })
+      : codexCursor;
+    if (Object.hasOwn(result, "next_cursor")) result.next_cursor = result.nextCursor;
+    return JSON.stringify(response);
+  };
+  let encoded = setPage();
+  if (Buffer.byteLength(encoded, "utf8") > RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+    return oversizedThreadListError(response.id, "Codex thread list exceeds the relay payload budget");
+  }
+  while (rows.length < limit && offset < openCodeRows.length) {
+    const row = openCodeRows[offset];
+    offset += 1;
+    if (seen.has(row.id)) continue;
+    rows.push(row);
+    seen.add(row.id);
+    const candidate = setPage();
+    if (Buffer.byteLength(candidate, "utf8") > RELAY_THREAD_PAYLOAD_SOFT_LIMIT_BYTES) {
+      rows.pop();
+      seen.delete(row.id);
+      offset -= 1;
+      break;
+    }
+    encoded = candidate;
+  }
+  if (offset < openCodeRows.length) {
+    encoded = setPage();
+    if (rows.length === 0 && codexCursor == null) {
+      return oversizedThreadListError(response.id, "OpenCode thread row exceeds the relay payload budget");
+    }
+  }
+  return encoded;
+}
+
+function encodeOpenCodeThreadListCursor({ codexCursor, openCodeOffset, archived }) {
+  return OPEN_CODE_THREAD_LIST_CURSOR_PREFIX + Buffer.from(JSON.stringify({
+    c: codexCursor,
+    o: openCodeOffset,
+    a: archived,
+  })).toString("base64url");
+}
+
+function decodeOpenCodeThreadListCursor(value) {
+  if (typeof value !== "string" || !value.startsWith(OPEN_CODE_THREAD_LIST_CURSOR_PREFIX)) return null;
+  try {
+    const cursor = JSON.parse(Buffer.from(value.slice(OPEN_CODE_THREAD_LIST_CURSOR_PREFIX.length), "base64url").toString("utf8"));
+    if (!cursor || !Number.isSafeInteger(cursor.o) || cursor.o < 0 || typeof cursor.a !== "boolean") return null;
+    if (cursor.c != null && typeof cursor.c !== "string"
+      && (typeof cursor.c !== "object" || Array.isArray(cursor.c))) return null;
+    return { codexCursor: cursor.c, openCodeOffset: cursor.o, archived: cursor.a };
+  } catch {
+    return null;
+  }
+}
+
+function oversizedThreadListError(id, message) {
+  return JSON.stringify({ id, error: { code: -32000, message } });
+}
+
+function safeParseBridgeResponse(rawMessage) {
+  try {
+    return JSON.parse(rawMessage);
+  } catch {
+    return null;
+  }
+}
+
+function threadListTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.abs(value) < 10_000_000_000 ? value * 1_000 : value;
+  }
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && value.trim()) {
+      return threadListTimestamp(numeric);
+    }
+    return Date.parse(value) || 0;
+  }
+  return 0;
 }
 
 module.exports = {
@@ -5779,15 +6238,20 @@ module.exports = {
   canonicalThreadTurnsListRequest,
   createMacOSBridgeWakeAssertion,
   createThreadTurnsListFastPageCoordinator,
+  decodeOpenCodeThreadListCursor,
   disableUnsupportedReasoningSummaryForTurnStart,
   fetchAdaptiveThreadTurnsListForRelay,
   hasRelayConnectionGoneStale,
   isContextualUserItemNotification,
+  isOpenCodeRequest,
+  mergeOpenCodeThreadsIntoListResponse,
   maybeMergeLatestJsonlTurnIntoTurnsListResponse,
   normalizeTurnStartForCodex,
+  normalizePhoneRuntimeRequest,
   normalizeRelayBoundJsonRpcMessage,
   persistBridgePreferences,
   resolveJsonlTurnsListRolloutPathForFallback,
+  routeLocalRuntimeSettingsRequest,
   sanitizeLiveGeneratedImageMessageForRelay,
   sanitizeLiveUserNotification,
   sanitizeThreadHistoryImagesForRelay,

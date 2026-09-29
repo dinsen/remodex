@@ -96,6 +96,8 @@ struct TurnView: View {
     @State private var worktreeOverlayRoute: TurnWorktreeOverlayRoute?
     @State private var macHandoffErrorMessage: String?
     @State private var isHandingOffToMac = false
+    @State private var retiredWorktreeCleanupPath: String?
+    @State private var isRetiredWorktreeCleanupPresented = false
     @State private var isStartingSiblingChat = false
     @State private var isForkingThread = false
     @State private var checkedOutElsewhereAlert: CheckedOutElsewhereAlert?
@@ -159,7 +161,7 @@ struct TurnView: View {
             isThreadRunning: isThreadRunning,
             gitWorkingDirectory: gitWorkingDirectory
         )
-        let canHandOffToWorktree = canHandOffToWorktree(
+        let canHandOffToWorktree = resolvedThread.runtimeProvider != .opencode && canHandOffToWorktree(
             isThreadRunning: isThreadRunning,
             gitWorkingDirectory: gitWorkingDirectory
         )
@@ -171,10 +173,11 @@ struct TurnView: View {
             requiresIdleThread: false
         )
         let disabledGitActions: Set<TurnGitActionKind> = viewModel.disabledGitActions
-        let onTapMacHandoff: (() -> Void)? = codex.isConnected && codex.supportsDesktopAppHandoff ? {
+        let onTapMacHandoff: (() -> Void)? = codex.isConnected && codex.supportsDesktopAppHandoff
+            && resolvedThread.runtimeProvider != .opencode ? {
             isShowingMacHandoffConfirm = true
         } : nil
-        let onTapWorktreeHandoff: (() -> Void)? = showsGitControls ? {
+        let onTapWorktreeHandoff: (() -> Void)? = showsGitControls && resolvedThread.runtimeProvider != .opencode ? {
             handleWorktreeHandoffTap(currentThread: resolvedThread)
         } : nil
         let onTapNewChat: (() -> Void)? = codex.isConnected && !isWorktreeProject ? {
@@ -211,7 +214,7 @@ struct TurnView: View {
                     ))
                 },
                 onDismissError: {
-                    codex.lastErrorMessage = nil
+                    codex.dismissVisibleError(threadId: thread.id)
                 },
                 hasRemoteEarlierMessages: renderSnapshot.hasRemoteOlderHistory,
                 hasLocallyProjectedEarlierMessages: renderSnapshot.hasLocallyProjectedOlderHistory,
@@ -623,6 +626,15 @@ struct TurnView: View {
                     }
                 }
             },
+            onApproveForSession: thread.runtimeProvider == .opencode ? { request in
+                viewModel.approve(request, codex: codex, forSession: true) { didSucceed in
+                    if didSucceed {
+                        syncApprovalAlertPresentation()
+                    } else {
+                        restoreApprovalAlert(afterFailureOf: request)
+                    }
+                }
+            } : nil,
             onConfirmGitSyncAction: { alertAction in
                 viewModel.confirmGitSyncAlertAction(
                     alertAction,
@@ -657,9 +669,39 @@ struct TurnView: View {
         } message: { alert in
             Text(alert.message)
         }
+        .confirmationDialog(
+            "Remove the old worktree?",
+            isPresented: $isRetiredWorktreeCleanupPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Remove Worktree", role: .destructive) {
+                guard let path = retiredWorktreeCleanupPath else { return }
+                retiredWorktreeCleanupPath = nil
+                Task { @MainActor in
+                    do {
+                        try await WorktreeFlowCoordinator.removeManagedWorktree(
+                            at: path,
+                            codex: codex
+                        )
+                        codex.rememberAssociatedManagedWorktreePath(nil, for: thread.id)
+                    } catch {
+                        viewModel.gitSyncAlert = TurnGitSyncAlert(
+                            title: "Worktree Cleanup Failed",
+                            message: error.localizedDescription,
+                            action: .dismissOnly
+                        )
+                    }
+                }
+            }
+            Button("Keep Worktree", role: .cancel) {
+                retiredWorktreeCleanupPath = nil
+            }
+        } message: {
+            Text("The old checkout will be removed only if no chats use it and it contains no local files.")
+        }
     }
 
-    // Reuses the shared recovery-card slot for both transport reconnects and voice-specific guidance.
+    // Recovery takes precedence over the generic error footer.
     private var composerRecoveryAccessory: AnyView? {
         if let voiceRecoveryPresentation {
             return AnyView(
@@ -675,14 +717,32 @@ struct TurnView: View {
             )
         }
 
-        guard let snapshot = connectionRecoverySnapshot else {
-            return nil
+        if let snapshot = connectionRecoverySnapshot {
+            return AnyView(
+                ConnectionRecoveryCard(snapshot: snapshot) {
+                    handleConnectionRecoveryAction()
+                }
+            )
         }
 
+        guard let failure = codex.recoverableStreamFailure(for: thread.id) else { return nil }
         return AnyView(
-            ConnectionRecoveryCard(snapshot: snapshot) {
-                handleConnectionRecoveryAction()
-            }
+            TurnErrorReportCard(
+                message: CodexStreamFailure.explanation,
+                onReport: {
+                    openURL(AppEnvironment.feedbackMailtoURL(
+                        errorMessage: failure.message, threadId: thread.id,
+                        isConnected: codex.isConnected, cliVersion: codex.bridgeInstalledVersion
+                    ))
+                },
+                onDismiss: { codex.dismissStreamFailure(threadId: thread.id, failureID: failure.id) },
+                onContinue: {
+                    viewModel.continueAfterStreamFailure(
+                        failure, codex: codex, subscriptions: subscriptions, threadID: thread.id
+                    )
+                },
+                isContinuing: viewModel.isSending
+            )
         )
     }
 
@@ -797,6 +857,7 @@ struct TurnView: View {
 
     // Opens the thread goal sheet, optionally prefilled with leftover composer draft text.
     private func presentGoalSheet(objectivePrefill: String?) {
+        guard thread.runtimeProvider == .codex else { return }
         goalSheetObjectivePrefill = objectivePrefill
         // Remember the composer text backing the prefill so submission can consume it.
         // Cancelling the sheet leaves the draft untouched.
@@ -830,6 +891,7 @@ struct TurnView: View {
     // Keeps the goal chip accurate on open/resume even when the live
     // `thread/goal/updated` snapshot was missed (reconnect, mirrored threads).
     private func refreshThreadGoalSnapshot() async {
+        guard thread.runtimeProvider == .codex else { return }
         await codex.refreshThreadGoalMirror(threadId: thread.id)
     }
 
@@ -1080,6 +1142,7 @@ struct TurnView: View {
     }
 
     private func handleWorktreeHandoffTap(currentThread: CodexThread) {
+        guard currentThread.runtimeProvider != .opencode else { return }
         if currentThread.isManagedWorktreeProject {
             Task { @MainActor in
                 do {
@@ -1092,6 +1155,8 @@ struct TurnView: View {
                         workingDirectory: move.projectPath,
                         threadID: thread.id
                     )
+                    retiredWorktreeCleanupPath = move.retiredManagedWorktreePath
+                    isRetiredWorktreeCleanupPresented = retiredWorktreeCleanupPath != nil
                 } catch {
                     viewModel.gitSyncAlert = TurnGitSyncAlert(
                         title: "Local Handoff Failed",
@@ -1494,6 +1559,13 @@ struct TurnView: View {
     }
 
     private var selectedModelTitle: String {
+        if currentResolvedThread.runtimeProvider == .opencode {
+            let modelID = currentResolvedThread.model
+            return TurnComposerMetaMapper.openCodeRuntimeLabelParts(
+                modelID: modelID,
+                option: codex.openCodeModel(id: modelID)
+            ).modelPart
+        }
         if let selectedModel = codex.selectedModelOption(threadId: thread.id) {
             return TurnComposerMetaMapper.modelTitle(for: selectedModel)
         }
@@ -1588,8 +1660,8 @@ struct TurnView: View {
                 isEmptyThread: isEmptyThread,
                 isWorktreeProject: isWorktreeProject,
                 activeFileChangeStatus: activeFileChangeStatus,
-                threadGoal: codex.goalByThreadID[thread.id],
-                canForkLocally: showsGitControls && gitWorkingDirectory != nil && WorktreeFlowCoordinator.localForkProjectPath(
+                threadGoal: currentThread.runtimeProvider == .codex ? codex.goalByThreadID[thread.id] : nil,
+                canForkLocally: currentThread.runtimeProvider == .codex && showsGitControls && gitWorkingDirectory != nil && WorktreeFlowCoordinator.localForkProjectPath(
                     for: currentThread,
                     localCheckoutPath: viewModel.gitLocalCheckoutPath
                 ) != nil,
@@ -1662,9 +1734,11 @@ struct TurnView: View {
                 onStartCodeReviewThread: startCodeReviewThread,
                 onStartForkThreadLocally: startLocalFork,
                 onOpenForkWorktree: {
+                    guard currentThread.runtimeProvider == .codex else { return }
                     worktreeOverlayRoute = .fork
                 },
                 onOpenWorktreeHandoff: {
+                    guard currentThread.runtimeProvider == .codex else { return }
                     handleWorktreeHandoffTap(currentThread: currentThread)
                 },
                 onOpenFeedbackMail: {

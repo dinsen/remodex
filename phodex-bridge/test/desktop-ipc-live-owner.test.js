@@ -18,6 +18,8 @@ const {
 const {
   applyAppServerMessageToConversationState,
 } = require("../src/desktop-ipc-conversation-adapter");
+const { createThreadRuntimeSettingsStore } = require("../src/thread-runtime-settings-store");
+const { buildThreadReadStateContext } = require("../src/desktop-ipc-shared");
 
 test("conversation adapter ignores empty plan updates but keeps explanation-only updates", () => {
   const threadId = "thread-plan-visibility";
@@ -456,7 +458,79 @@ test("live owner broadcasts patches after the first owned thread snapshot", asyn
   assert.ok(itemPatchBroadcast.params.change.patches.length > 0);
 });
 
-test("live owner starts a local IPC router when no Codex IPC socket exists", async (t) => {
+test("live owner waits for Desktop's router and preserves it across bridge restarts", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-desktop-bus-");
+  const sockets = new Set();
+  const frames = [];
+  let attempts = 0;
+  let fallbackStarts = 0;
+  let connections = 0;
+  const makeOwner = () => createDesktopIpcLiveOwner({
+    socketPath,
+    reconnectMs: 10,
+    snapshotDebounceMs: 1,
+    netModule: {
+      createConnection(...args) { attempts += 1; return net.createConnection(...args); },
+      createServer(...args) { fallbackStarts += 1; return net.createServer(...args); },
+    },
+    sendCodexRequest: async () => ({ thread: { id: "waiting-for-desktop", turns: [] } }),
+    sendRawCodexMessage() {},
+  });
+  let owner = makeOwner();
+  const startPhoneTurn = () => owner.observeInbound(JSON.stringify({
+    id: "phone-start", method: "turn/start",
+    params: { threadId: "waiting-for-desktop", input: [{ type: "text", text: "hi" }] },
+  }));
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    attachFrameReader(socket, (frame) => {
+      frames.push(frame);
+      if (frame.method !== "initialize") return;
+      connections += 1;
+      writeFrame(socket, {
+        type: "response", requestId: frame.requestId, resultType: "success",
+        method: "initialize", result: { clientId: `owner-${connections}` },
+      });
+      writeFrame(socket, {
+        type: "broadcast", method: "thread-stream-following-changed", version: 1,
+        sourceClientId: "desktop", params: {
+          conversationId: "waiting-for-desktop", hostId: "local", following: true,
+        },
+      });
+    });
+  });
+  t.after(() => {
+    owner.stopAll();
+    for (const socket of sockets) socket.destroy();
+    server.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  startPhoneTurn();
+  await waitFor(() => attempts >= 3);
+  assert.equal(fallbackStarts, 0, "phone activity must not create a shared router");
+  assert.equal(fs.existsSync(socketPath), false);
+  assert.equal(owner.isThreadOwned("waiting-for-desktop"), true);
+
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  const inode = fs.statSync(socketPath).ino;
+  await waitForMessage(frames, (frame) => frame.method === "thread-stream-state-changed"
+    && frame.params?.change?.type === "snapshot");
+  owner.stopAll();
+  assert.equal(fs.statSync(socketPath).ino, inode, "stopping Remodex must preserve Desktop's socket");
+
+  frames.length = 0;
+  owner = makeOwner();
+  startPhoneTurn();
+  await waitForMessage(frames, (frame) => frame.method === "thread-stream-state-changed"
+    && frame.params?.change?.type === "snapshot");
+  assert.equal(connections, 2);
+  assert.equal(fs.statSync(socketPath).ino, inode);
+  assert.equal(fallbackStarts, 0);
+});
+
+test("live owner can explicitly start a local IPC router when no Codex IPC socket exists", async (t) => {
   const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-router-");
   const codexRequests = [];
   const desktopFrames = [];
@@ -464,6 +538,7 @@ test("live owner starts a local IPC router when no Codex IPC socket exists", asy
 
   const owner = createDesktopIpcLiveOwner({
     socketPath,
+    startRouterWhenMissing: true,
     snapshotDebounceMs: 1,
     reconnectMs: 10,
     requestTimeoutMs: 500,
@@ -574,6 +649,7 @@ test("live owner replays a pending sidebar announcement when Desktop joins its f
 
   const owner = createDesktopIpcLiveOwner({
     socketPath,
+    startRouterWhenMissing: true,
     sidebarRefreshDelayMs: 5,
     snapshotDebounceMs: 1,
     reconnectMs: 10,
@@ -1014,7 +1090,7 @@ test("live owner broadcasts phone image turns before turn/started arrives", asyn
   assert.match(pendingTurn.turnId, /^remodex-pending-turn:/);
   assert.equal(pendingTurn.remodexOptimisticPendingTurn, true);
   assert.deepEqual(pendingTurn.params.input, [
-    { type: "text", text: "look at this" },
+    { type: "text", text: "look at this", text_elements: [] },
     { type: "image", url: imageDataURL },
   ]);
   assert.deepEqual(pendingTurn.items, []);
@@ -1285,6 +1361,7 @@ test("live owner router keeps same-id requests from different clients separate",
 
   const owner = createDesktopIpcLiveOwner({
     socketPath,
+    startRouterWhenMissing: true,
     snapshotDebounceMs: 1,
     reconnectMs: 10,
     requestTimeoutMs: 500,
@@ -1416,6 +1493,7 @@ test("live owner router prefers Remodex handler when multiple clients can handle
 
   const owner = createDesktopIpcLiveOwner({
     socketPath,
+    startRouterWhenMissing: true,
     snapshotDebounceMs: 1,
     reconnectMs: 10,
     requestTimeoutMs: 500,
@@ -2156,6 +2234,52 @@ test("live owner handles current start-turn and interrupt follower contracts", a
     (frame) => frame.type === "client-discovery-response" && frame.requestId === "discovery-unsupported"
   );
   assert.deepEqual(unsupportedDiscoveryResponse.response, { canHandle: false });
+
+  for (const [requestedHostId, conversationId, canHandle] of [
+    ["local", "thread-owned", true],
+    ["remote", "thread-owned", false],
+    ["local", "thread-other", false],
+  ]) {
+    const requestId = `owner-discovery-${requestedHostId}-${conversationId}`;
+    writeFrame(serverSocket, {
+      type: "client-discovery-request",
+      requestId,
+      request: {
+        method: "thread-owner-discovery",
+        params: { hostId: requestedHostId, conversationId },
+      },
+    });
+    const discovery = await waitForFrame(serverSocket,
+      (frame) => frame.type === "client-discovery-response" && frame.requestId === requestId);
+    assert.deepEqual(discovery.response, { canHandle });
+  }
+  writeFrame(serverSocket, {
+    type: "request", requestId: "discover-owner", sourceClientId: "desktop", version: 1,
+    method: "thread-owner-discovery",
+    params: { hostId: "local", conversationId: "thread-owned" },
+  });
+  const ownerDiscovery = await waitForFrame(serverSocket,
+    (frame) => frame.type === "response" && frame.requestId === "discover-owner");
+  assert.equal(ownerDiscovery.resultType, "success");
+  assert.deepEqual(ownerDiscovery.result, { supportsUntrustedAppInput: false });
+
+  const requestsBeforeUnsupportedInput = codexRequests.length;
+  writeFrame(serverSocket, {
+    type: "request", requestId: "unsupported-app-input", sourceClientId: "desktop", version: 2,
+    method: "thread-follower-start-turn",
+    params: {
+      conversationId: "thread-owned",
+      turnStart: {
+        request: { input: [{ type: "text", text: "app input" }] },
+        context: { responseItems: [{ type: "function_call_output", output: "app result" }] },
+      },
+    },
+  });
+  const unsupportedInput = await waitForFrame(serverSocket,
+    (frame) => frame.type === "response" && frame.requestId === "unsupported-app-input");
+  assert.equal(unsupportedInput.resultType, "error");
+  assert.match(unsupportedInput.error, /untrusted app input/);
+  assert.equal(codexRequests.length, requestsBeforeUnsupportedInput);
 
   writeFrame(serverSocket, {
     type: "request",
@@ -3110,7 +3234,7 @@ test("live owner applies Desktop runtime overrides to later follower turn starts
       input: [{ type: "text", text: "use my desktop model" }],
       model: "gpt-desktop-pick",
       effort: "high",
-      serviceTier: "fast",
+      serviceTier: "priority",
     },
   }]);
 });
@@ -3222,6 +3346,9 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
   const frames = [];
   const codexRequests = [];
   let serverSocket = null;
+  const store = createThreadRuntimeSettingsStore({ storeFile: path.join(tempDir, "settings.json") });
+  let acknowledgeSettings;
+  const settingsAcknowledgement = new Promise((resolve) => { acknowledgeSettings = resolve; });
 
   const server = net.createServer((socket) => {
     serverSocket = socket;
@@ -3249,11 +3376,16 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
 
   const owner = createDesktopIpcLiveOwner({
     socketPath,
+    runtimeSettingsStore: store,
     snapshotDebounceMs: 1,
     async sendCodexRequest(method, params) {
       codexRequests.push({ method, params });
+      if (method === "thread/settings/update") await settingsAcknowledgement;
       if (method === "thread/read") {
         return { thread: { id: "thread-settings", turns: [] } };
+      }
+      if (method === "getAuthStatus") {
+        return { authMethod: "apikey" };
       }
       return { ok: true };
     },
@@ -3272,7 +3404,7 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
     type: "request",
     requestId: "update-settings-1",
     sourceClientId: "desktop",
-    version: 1,
+    version: 2,
     method: "thread-follower-update-thread-settings",
     params: {
       conversationId: "thread-settings",
@@ -3283,6 +3415,10 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
       },
     },
   });
+  await waitFor(() => codexRequests.some((request) => request.method === "thread/settings/update"));
+  assert.equal(store.get("thread-settings"), null, "no optimistic confirmation before the server acknowledgement");
+  assert.equal(frames.some((frame) => frame.requestId === "update-settings-1"), false);
+  acknowledgeSettings();
   const settingsResponse = await waitForFrame(
     serverSocket,
     (frame) => frame.type === "response" && frame.requestId === "update-settings-1"
@@ -3298,6 +3434,12 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
   );
   assert.ok(settingsSnapshot);
 
+  assert.equal(store.get("thread-settings").serviceTier, "priority");
+  // A later authoritative change must replace cached follower overrides too.
+  owner.observeOutbound(JSON.stringify({
+    method: "thread/settings/updated",
+    params: { threadId: "thread-settings", threadSettings: { model: "gpt-desktop-settings", effort: null, serviceTier: null } },
+  }));
   // The next Desktop-origin turn inherits the settings.
   writeFrame(serverSocket, {
     type: "request",
@@ -3316,8 +3458,8 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
   );
   const startedTurn = codexRequests.filter((request) => request.method === "turn/start").at(-1);
   assert.equal(startedTurn.params.model, "gpt-desktop-settings");
-  assert.equal(startedTurn.params.effort, "high");
-  assert.equal(startedTurn.params.serviceTier, "fast");
+  assert.equal(startedTurn.params.effort, null);
+  assert.equal(startedTurn.params.serviceTier, "default");
 
   // Reading the thread from the phone broadcasts the read state to Desktop.
   owner.observeInbound(JSON.stringify({
@@ -3331,9 +3473,11 @@ test("live owner applies Desktop thread settings and broadcasts phone read state
   );
   assert.deepEqual(readBroadcast.params, {
     conversationId: "thread-settings",
+    hostId: "local",
     hasUnreadTurn: false,
+    context: buildThreadReadStateContext({ authMethod: "apikey" }),
   });
-  assert.equal(readBroadcast.version, 2);
+  assert.equal(readBroadcast.version, 3);
 });
 
 test("live owner runs Desktop queued follow-ups between turns", async (t) => {
@@ -3341,6 +3485,8 @@ test("live owner runs Desktop queued follow-ups between turns", async (t) => {
   const frames = [];
   const codexRequests = [];
   let serverSocket = null;
+  let acknowledgeSettings;
+  const settingsGate = new Promise((resolve) => { acknowledgeSettings = resolve; });
 
   const server = net.createServer((socket) => {
     serverSocket = socket;
@@ -3360,6 +3506,7 @@ test("live owner runs Desktop queued follow-ups between turns", async (t) => {
   });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   t.after(() => {
+    acknowledgeSettings();
     owner.stopAll();
     server.close();
     serverSocket?.destroy();
@@ -3371,6 +3518,7 @@ test("live owner runs Desktop queued follow-ups between turns", async (t) => {
     snapshotDebounceMs: 1,
     async sendCodexRequest(method, params) {
       codexRequests.push({ method, params });
+      if (method === "thread/settings/update") await settingsGate;
       return { ok: true };
     },
     sendRawCodexMessage() {},
@@ -3427,7 +3575,10 @@ test("live owner runs Desktop queued follow-ups between turns", async (t) => {
     0
   );
 
-  // The current turn completes: the owner must start the queued follow-up.
+  const update = owner.updateThreadSettings("thread-queue", { model: "new-model", effort: "ultra", serviceTier: null });
+  await waitFor(() => codexRequests.some((request) => request.method === "thread/settings/update"));
+
+  // Completion must wait for the settings acknowledgement before starting the follow-up.
   owner.observeOutbound(JSON.stringify({
     method: "turn/completed",
     params: {
@@ -3436,10 +3587,25 @@ test("live owner runs Desktop queued follow-ups between turns", async (t) => {
     },
   }));
 
+  await wait(25);
+  assert.equal(codexRequests.filter((request) => request.method === "turn/start").length, 0);
+  writeFrame(serverSocket, {
+    type: "request", requestId: "queue-refresh", sourceClientId: "desktop", version: 1,
+    method: "thread-follower-set-queued-follow-ups-state",
+    params: { conversationId: "thread-queue", state: { "thread-queue": [
+      { id: "queued-1", context: { text: "updated queued follow-up" } },
+    ] } },
+  });
+  await waitForFrame(serverSocket, (frame) => frame.requestId === "queue-refresh");
+  acknowledgeSettings();
+  await update;
   await waitFor(() => codexRequests.some((request) => request.method === "turn/start"));
   const queuedStart = codexRequests.find((request) => request.method === "turn/start");
-  assert.deepEqual(queuedStart.params.input, [{ type: "text", text: "queued follow-up from desktop" }]);
+  assert.deepEqual(queuedStart.params.input, [{ type: "text", text: "updated queued follow-up" }]);
   assert.equal(queuedStart.params.threadId, "thread-queue");
+  assert.equal(queuedStart.params.model, "new-model");
+  assert.equal(queuedStart.params.effort, "ultra");
+  assert.equal(queuedStart.params.serviceTier, "default");
 
   // The drained queue is rebroadcast as empty.
   await waitForMessage(
@@ -3576,6 +3742,7 @@ test("live owner dedupes read-state broadcasts for already-clean threads", async
   const { tempDir, socketPath } = createIpcTestSocket("remodex-live-owner-read-dedupe-");
   const frames = [];
   let serverSocket = null;
+  let readAuthStatus = async () => ({ authMethod: "apikey" });
 
   const server = net.createServer((socket) => {
     serverSocket = socket;
@@ -3604,7 +3771,7 @@ test("live owner dedupes read-state broadcasts for already-clean threads", async
   const owner = createDesktopIpcLiveOwner({
     socketPath,
     snapshotDebounceMs: 1,
-    sendCodexRequest: async () => ({ ok: true }),
+    sendCodexRequest: async (method) => method === "getAuthStatus" ? readAuthStatus() : { ok: true },
     sendRawCodexMessage() {},
   });
 
@@ -3634,6 +3801,44 @@ test("live owner dedupes read-state broadcasts for already-clean threads", async
   }));
   await wait(40);
   assert.equal(readCount(), 1);
+
+  let resolveOldIdentity;
+  readAuthStatus = () => new Promise((resolve) => { resolveOldIdentity = resolve; });
+  owner.observeOutbound(JSON.stringify({ method: "account/updated", params: { authMode: "chatgpt" } }));
+  owner.observeInbound(JSON.stringify({
+    id: "read-old-account", method: "thread/read", params: { threadId: "thread-read-dedupe" },
+  }));
+  await waitFor(() => resolveOldIdentity);
+  owner.observeOutbound(JSON.stringify({ method: "account/updated", params: { authMode: null } }));
+  resolveOldIdentity({ authMethod: "apikey" });
+  await wait(30);
+  assert.equal(readCount(), 1, "discard a receipt captured before an account change");
+
+  readAuthStatus = async () => ({ authMethod: "apikey" });
+  owner.observeInbound(JSON.stringify({
+    id: "read-new-account", method: "thread/read", params: { threadId: "thread-read-dedupe" },
+  }));
+  await waitFor(() => readCount() === 2);
+
+  let resolvePendingIdentity;
+  readAuthStatus = () => new Promise((resolve) => { resolvePendingIdentity = resolve; });
+  owner.observeOutbound(JSON.stringify({ method: "account/updated", params: { authMode: "apikey" } }));
+  owner.observeInbound(JSON.stringify({
+    id: "read-before-new-turn", method: "thread/read", params: { threadId: "thread-read-dedupe" },
+  }));
+  await waitFor(() => resolvePendingIdentity);
+  owner.observeInbound(JSON.stringify({
+    id: "new-turn", method: "turn/start",
+    params: { threadId: "thread-read-dedupe", input: [{ type: "text", text: "next" }] },
+  }));
+  resolvePendingIdentity({ authMethod: "apikey" });
+  await wait(30);
+  assert.equal(readCount(), 2, "a pending receipt must not mark newer activity as read");
+  readAuthStatus = async () => ({ authMethod: "apikey" });
+  owner.observeInbound(JSON.stringify({
+    id: "read-new-turn", method: "thread/read", params: { threadId: "thread-read-dedupe" },
+  }));
+  await waitFor(() => readCount() === 3);
 });
 
 test("live owner normalizes image_url input entries for Desktop snapshots", async (t) => {
@@ -3705,7 +3910,7 @@ test("live owner normalizes image_url input entries for Desktop snapshots", asyn
   );
   const turn = snapshot.params.change.conversationState.turns[0];
   assert.deepEqual(turn.params.input, [
-    { type: "text", text: "look at this" },
+    { type: "text", text: "look at this", text_elements: [] },
     { type: "image", url: "https://example.com/shot.png" },
   ]);
 });
@@ -3872,6 +4077,18 @@ test("live owner replays an early sidebar announcement after rollout materializa
   }));
   await waitFor(() => announcementCount() === 3);
 
+  // Automatic naming can finish after the first turn. Desktop ignores stream
+  // updates until the chat is opened, so it needs another catalog notification.
+  const rename = {
+    method: "thread/name/updated",
+    params: { threadId: "thread-sidebar-race", threadName: "Greeting from phone" },
+  };
+  owner.observeOutbound(JSON.stringify(rename));
+  await waitFor(() => announcementCount() === 4);
+  owner.observeOutbound(JSON.stringify(rename));
+  await wait(20);
+  assert.equal(announcementCount(), 4);
+
   owner.observeInbound(JSON.stringify({
     id: "sidebar-race-turn-2",
     method: "turn/start",
@@ -3881,7 +4098,7 @@ test("live owner replays an early sidebar announcement after rollout materializa
     },
   }));
   await wait(20);
-  assert.equal(announcementCount(), 3);
+  assert.equal(announcementCount(), 4);
 });
 
 test("live owner keeps ownership when peer sends non-owner patch broadcasts", async (t) => {
@@ -4695,7 +4912,7 @@ test("hydrated turns adopt the leading userMessage item into params.input", () =
   const turn = state.turns[0];
   // The prompt moves into params.input (Desktop's bubble source) and the item
   // is dropped so it cannot render as "Steered conversation".
-  assert.deepEqual(turn.params.input, [{ type: "text", text: "prompt from disk" }]);
+  assert.deepEqual(turn.params.input, [{ type: "text", text: "prompt from disk", text_elements: [] }]);
   assert.deepEqual(turn.items.map((item) => item.id), ["disk-assistant"]);
 });
 
@@ -4753,3 +4970,175 @@ function createIpcTestSocket(prefix) {
     : path.join(tempDir, "ipc.sock");
   return { tempDir, socketPath };
 }
+
+test("local settings mutations serialize acknowledgements and retain newer runtime state", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-local-settings-order-");
+  const store = createThreadRuntimeSettingsStore({ storeFile: path.join(tempDir, "settings.json") });
+  const calls = [];
+  const responses = [];
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    runtimeSettingsStore: store,
+    async sendCodexRequest(method, params) {
+      if (method === "thread/read") return { thread: { id: "task", turns: [] } };
+      calls.push({ method, params });
+      return new Promise((resolve, reject) => responses.push({ resolve, reject }));
+    },
+    sendRawCodexMessage() {},
+  });
+  t.after(() => { owner.stopAll(); fs.rmSync(tempDir, { recursive: true, force: true }); });
+  store.commit("task", { model: "astra", effort: "medium", serviceTier: "priority" }, { source: "runtime" });
+  const rejected = owner.updateThreadSettings("task", { effort: "ultra" });
+  const rejection = assert.rejects(rejected, /unsupported effort/);
+  const accepted = owner.updateThreadSettings("task", { serviceTier: null });
+  await waitFor(() => calls.length === 1);
+  assert.equal(calls[0].params.effort, "ultra");
+  assert.equal(store.get("task").reasoningEffort, "medium");
+  assert.equal(owner.isThreadOwned("task"), false);
+  responses[0].reject(new Error("unsupported effort"));
+  await waitFor(() => calls.length === 2);
+  assert.equal(calls[1].params.serviceTier, null);
+  // Represents a runtime notification received before its request acknowledgement.
+  store.commit("task", { model: "sol", effort: "high", serviceTier: "future-speed" }, { source: "runtime" });
+  responses[1].resolve({});
+  const result = await accepted;
+  await rejection;
+  assert.equal(owner.isThreadOwned("task"), true);
+  assert.equal(result.runtimeSettings.model, "sol");
+  assert.equal(result.runtimeSettings.serviceTier, "future-speed");
+  assert.equal(store.get("task").reasoningEffort, "high");
+});
+
+test("a forwarded local resume claims ownership only after its matching successful response", (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-local-resume-owner-");
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    sendCodexRequest: async () => ({ ok: true }),
+    sendRawCodexMessage() {},
+  });
+  t.after(() => { owner.stopAll(); fs.rmSync(tempDir, { recursive: true, force: true }); });
+
+  // A phone read can cache history, but it does not acquire a local writer.
+  owner.observeInbound(JSON.stringify({
+    id: "read-existing",
+    method: "thread/read",
+    params: { threadId: "existing-cli" },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "read-existing",
+    result: { thread: {
+      id: "existing-cli", cwd: "/tmp/project", turns: [{ id: "old-turn", items: [] }],
+    } },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+
+  owner.observeInbound(JSON.stringify({
+    id: "resume-existing",
+    method: "thread/resume",
+    params: { threadId: "existing-cli", excludeTurns: true },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+  owner.observeOutbound(JSON.stringify({
+    id: "unrelated",
+    result: { thread: { id: "existing-cli", turns: [] } },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+
+  owner.observeOutbound(JSON.stringify({
+    id: "resume-existing",
+    result: { thread: { id: "existing-cli", cwd: "/tmp/project", turns: [] } },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), true);
+  assert.equal(owner._debugSnapshot("existing-cli").turns[0].turnId, "old-turn");
+});
+
+test("a successful local resume hydrates excluded history before its first snapshot", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-local-resume-hydrate-");
+  const reads = [];
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    async sendCodexRequest(method, params) {
+      reads.push({ method, params });
+      return { thread: {
+        id: "uncached-cli", cwd: "/tmp/project", turns: [{ id: "full-turn", items: [] }],
+      } };
+    },
+    sendRawCodexMessage() {},
+  });
+  t.after(() => { owner.stopAll(); fs.rmSync(tempDir, { recursive: true, force: true }); });
+
+  owner.observeInbound(JSON.stringify({
+    id: "resume-uncached",
+    method: "thread/resume",
+    params: { threadId: "uncached-cli", excludeTurns: true },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "resume-uncached",
+    result: { thread: { id: "uncached-cli", cwd: "/tmp/project", turns: [] } },
+  }));
+  assert.equal(owner.isThreadOwned("uncached-cli"), true);
+  await waitFor(() => owner._debugSnapshot("uncached-cli")?.turns?.length === 1);
+  assert.equal(owner._debugSnapshot("uncached-cli").turns[0].turnId, "full-turn");
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].method, "thread/read");
+  assert.equal(reads[0].params.threadId, "uncached-cli");
+});
+
+test("failed, mismatched, or unobserved resumes never claim local ownership", (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-local-resume-failure-");
+  const owner = createDesktopIpcLiveOwner({
+    socketPath,
+    sendCodexRequest: async () => ({ ok: true }),
+    sendRawCodexMessage() {},
+  });
+  t.after(() => { owner.stopAll(); fs.rmSync(tempDir, { recursive: true, force: true }); });
+
+  const successfulResponse = (id, threadId = "existing-cli") => JSON.stringify({
+    id, result: { thread: { id: threadId, turns: [] } },
+  });
+  // Private bridge preflights and follower-served Desktop responses have no
+  // matching forwarded phone resume in this observer.
+  owner.observeOutbound(successfulResponse("private-preflight"));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+
+  owner.observeInbound(JSON.stringify({
+    id: "failed-resume", method: "thread/resume", params: { threadId: "existing-cli" },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "failed-resume", error: { code: -32600, message: "already has an active writer" },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+  owner.observeOutbound(successfulResponse("failed-resume"));
+  assert.equal(owner.isThreadOwned("existing-cli"), false, "a failed request must clear its pending claim");
+
+  owner.observeInbound(JSON.stringify({
+    id: "synthetic-resume", method: "thread/resume", params: { threadId: "existing-cli" },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "synthetic-resume",
+    result: { thread: { id: "existing-cli", turns: [] }, remodexDesktopIpcMirror: true },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+
+  owner.observeInbound(JSON.stringify({
+    id: "malformed-resume", method: "thread/resume", params: { threadId: "existing-cli" },
+  }));
+  owner.observeOutbound(JSON.stringify({
+    id: "malformed-resume", result: { id: "existing-cli" },
+  }));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+
+  owner.observeInbound(JSON.stringify({
+    id: "mismatched-resume", method: "thread/resume", params: { threadId: "existing-cli" },
+  }));
+  owner.observeOutbound(successfulResponse("mismatched-resume", "other-cli"));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+  assert.equal(owner.isThreadOwned("other-cli"), false);
+
+  owner.observeInbound(JSON.stringify({
+    id: "stopped-resume", method: "thread/resume", params: { threadId: "existing-cli" },
+  }));
+  owner.stopAll();
+  owner.observeOutbound(successfulResponse("stopped-resume"));
+  assert.equal(owner.isThreadOwned("existing-cli"), false);
+});

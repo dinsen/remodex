@@ -39,7 +39,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     let onOpenSettings: () -> Void
     let onOpenDevicesSettings: () -> Void
     let onOpenTerminal: () -> Void
-    let onOpenNewChatDraft: (NewChatDraftSource, String?) -> Void
+    let onOpenNewChatDraft: (NewChatDraftSource, String?, CodexRuntimeProvider?) -> Void
     let onNewChatCreationStateChange: (Bool) -> Void
     let onOpenThread: (CodexThread) -> Void
     // Centered connect/reconnect card shown when the relay is offline and the
@@ -56,7 +56,10 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     @State private var pendingTopAction: SidebarTopAction? = nil
     @State private var cachedScopedSidebarThreads: [CodexThread] = []
     @State private var groupedThreads: [SidebarThreadGroup] = []
+    @State private var activityRefreshGeneration = 0
+    @AppStorage("sidebar.taskViewMode") private var taskViewMode: SidebarTaskViewMode = .projects
     @State private var activeSidebarSheet: SidebarPresentedSheet?
+    @State private var managedWorktreeCleanupRequest: ManagedWorktreeCleanupRequest?
     @State private var projectGroupPendingArchive: SidebarThreadGroup? = nil
     @State private var projectGroupPendingDeletion: SidebarThreadGroup? = nil
     @State private var threadPendingDeletion: CodexThread? = nil
@@ -88,6 +91,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             .background(Color(.systemBackground))
             .adaptiveTopBar {
                 SidebarHeaderView(
+                    taskViewMode: $taskViewMode,
                     showsCloseButton: showsInlineCloseButton,
                     onClose: onClose,
                     overflowActions: overflowMenuActions,
@@ -166,6 +170,9 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             .sheet(item: $activeSidebarSheet) { sheet in
                 sidebarSheetContent(sheet)
             }
+            .sheet(item: $managedWorktreeCleanupRequest) { request in
+                ManagedWorktreeCleanupSheet(localCheckoutPath: request.path)
+            }
             .modifier(sidebarPromptsModifier)
     }
 
@@ -232,6 +239,11 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
 
     private func refreshThreads() async {
         guard codex.isConnected else { return }
+        defer {
+            rebuildGroupedThreads()
+            rebuildCachedRunBadges()
+            activityRefreshGeneration += 1
+        }
         let startedAt = Date()
         debugSidebarLog("refreshThreads start threadCount=\(codex.threads.count)")
         do {
@@ -303,19 +315,23 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     // this path to preserve "What should we work on?" + folder picker.
     private func handleNewChatButtonTap() {
         prepareSidebarForChatNavigation()
-        onOpenNewChatDraft(.generalChat, defaultNewChatProjectPath)
+        onOpenNewChatDraft(.generalChat, defaultNewChatProjectPath, nil)
     }
 
     // Opens the global Chats scope as a plain rootless draft: no folder picker,
     // no preselected project, just the prompt and composer.
     private func handleRootlessChatDraftTap() {
         prepareSidebarForChatNavigation()
-        onOpenNewChatDraft(.generalChat, nil)
+        onOpenNewChatDraft(.generalChat, nil, nil)
     }
 
     // Routes the shared bottom Chat button by the active sidebar scope without
     // putting a closure ternary inside the SwiftUI view builder.
     private func handleBottomChatTap() {
+        guard taskViewMode == .projects else {
+            handleNewChatButtonTap()
+            return
+        }
         switch selectedContentScope {
         case .projects:
             handleNewChatButtonTap()
@@ -456,6 +472,18 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         projectGroupPendingDeletion = nil
     }
 
+    private var searchMatchingThreads: [CodexThread] {
+        let liveThreads = codex.threads.filter { $0.syncState != .archivedLocal }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return liveThreads }
+        return liveThreads.filter {
+            $0.displayTitle.localizedCaseInsensitiveContains(query)
+                || ($0.preview?.localizedCaseInsensitiveContains(query) ?? false)
+                || $0.projectDisplayName.localizedCaseInsensitiveContains(query)
+                || ($0.normalizedProjectPath?.localizedCaseInsensitiveContains(query) ?? false)
+        }
+    }
+
     // Rebuilds sidebar sections only when the source thread array changes.
     private func scheduleSidebarDataRebuild(
         needsGroups: Bool = false,
@@ -488,17 +516,14 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         let startedAt = Date()
         rebuildScopedSidebarThreads()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let source: [CodexThread]
-        if query.isEmpty {
-            source = codex.threads
-        } else {
-            source = codex.threads.filter {
+        let source = query.isEmpty
+            ? cachedScopedSidebarThreads
+            : cachedScopedSidebarThreads.filter {
                 $0.displayTitle.localizedCaseInsensitiveContains(query)
                 || ($0.preview?.localizedCaseInsensitiveContains(query) ?? false)
                 || $0.projectDisplayName.localizedCaseInsensitiveContains(query)
                 || ($0.normalizedProjectPath?.localizedCaseInsensitiveContains(query) ?? false)
             }
-        }
         let configuredChoices = configuredProjectChoicesForGrouping(query: query)
         // Run badges participate in ordering, so grouping reads the same state the
         // badge column shows; the shared fingerprint keeps the two from diverging.
@@ -617,7 +642,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
         cachedRunBadges = byThreadID
         debugSidebarLog(
             "rebuildCachedRunBadges durationMs=\(Int(Date().timeIntervalSince(startedAt) * 1000)) "
-                + "threadCount=\(codex.threads.count) cached=\(cachedRunBadges.count)"
+                + "threadCount=\(codex.threads.count) cached=\(cachedRunBadges.count) "
+                + "running=\(cachedRunBadges.values.filter { $0 == .running }.count)"
         )
     }
 
@@ -686,6 +712,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     }
 
     private var emptySidebarTitle: String {
+        if taskViewMode == .activity { return "No tasks" }
         switch selectedContentScope {
         case .projects:
             return selectedProjectSource == .configuredProjects ? "No configured projects" : "No project chats"
@@ -697,6 +724,7 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     }
 
     private var emptySidebarFilterTitle: String {
+        if taskViewMode == .activity { return "No matching tasks" }
         switch selectedContentScope {
         case .projects:
             return "No matching projects"
@@ -763,6 +791,10 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
                 }
             }
             .scrollDismissesKeyboard(.interactively)
+            .scrollBounceBehavior(.always, axes: .vertical)
+            .refreshable {
+                await refreshThreads()
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 bottomActionBar
             }
@@ -804,6 +836,10 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
 
     private var threadList: some View {
         SidebarThreadListView(
+            taskViewMode: taskViewMode,
+            activityThreads: taskViewMode == .activity ? searchMatchingThreads : [],
+            isActivityVisible: isVisible,
+            activityRefreshGeneration: activityRefreshGeneration,
             isFiltering: !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             isConnected: codex.isConnected,
             isCreatingThread: isCreatingThread,
@@ -821,13 +857,23 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
             onCreateThreadInProjectGroup: { group in
                 prepareSidebarForChatNavigation()
                 let source: NewChatDraftSource = group.kind == .chat ? .generalChat : .folderChat
-                onOpenNewChatDraft(source, group.projectPath)
+                let preferredProvider = group.kind == .project
+                    ? group.threads.max(by: { lhs, rhs in
+                        (lhs.updatedAt ?? lhs.createdAt ?? .distantPast)
+                            < (rhs.updatedAt ?? rhs.createdAt ?? .distantPast)
+                    })?.runtimeProvider
+                    : nil
+                onOpenNewChatDraft(source, group.projectPath, preferredProvider)
             },
             onArchiveProjectGroup: { group in
                 projectGroupPendingArchive = group
             },
             onDeleteProjectGroup: { group in
                 projectGroupPendingDeletion = group
+            },
+            onManageProjectWorktrees: { group in
+                guard let path = group.projectPath else { return }
+                managedWorktreeCleanupRequest = ManagedWorktreeCleanupRequest(path: path)
             },
             onRenameThread: { thread, newName in
                 codex.renameThread(thread.id, name: newName)
@@ -867,7 +913,8 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
     // add a separate row and shift the chat list vertically.
     private var sidebarScopeRow: some View {
         let projectGroupIDs = visibleProjectGroupIDs
-        let shouldShowToggle = selectedContentScope == .projects && !projectGroupIDs.isEmpty
+        let shouldShowToggle = taskViewMode == .projects
+            && selectedContentScope == .projects && !projectGroupIDs.isEmpty
         let areAllCollapsed = areAllProjectFoldersCollapsed(projectGroupIDs)
         let shouldShowSyncStatus = SidebarThreadsLoadingPresentation.shouldShowInlineStatus(
             isLoadingThreads: codex.isLoadingThreads,
@@ -881,9 +928,11 @@ struct SidebarView<ConnectionEmptyStatePanel: View, ConnectionEmptyStateFooter: 
 
                 Spacer(minLength: 0)
             } else {
-                SidebarContentScopePicker(selection: $selectedContentScope)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                if taskViewMode == .projects {
+                    SidebarContentScopePicker(selection: $selectedContentScope)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
 
                 Spacer(minLength: 0)
 
@@ -971,7 +1020,7 @@ private final class SidebarDataRebuildCoalescer {
 }
 
 private extension SidebarView {
-    static var isSidebarDebugLoggingEnabled: Bool { false }
+    static var isSidebarDebugLoggingEnabled: Bool { AppEnvironment.verboseDiagnosticsEnabled }
 }
 
 private enum SidebarPresentedSheet: String, Identifiable {
@@ -979,6 +1028,11 @@ private enum SidebarPresentedSheet: String, Identifiable {
     case localFolderBrowser
 
     var id: String { rawValue }
+}
+
+private struct ManagedWorktreeCleanupRequest: Identifiable {
+    let path: String
+    var id: String { path }
 }
 
 private extension SidebarView {

@@ -54,6 +54,11 @@ extension CodexService {
                 messages.map { message in
                     var value = message
                     value.isStreaming = false
+                    // A persisted submission has no live delivery task after
+                    // relaunch, even if it was saved only a moment ago.
+                    if value.asyncUserInput?.status == .submitting {
+                        value.asyncUserInput?.status = .uncertain
+                    }
                     return value
                 }
             }
@@ -306,6 +311,7 @@ extension CodexService {
 
     // Clears in-memory state that is tied to the active Mac before another Mac is loaded.
     func clearInMemoryMacScopedState() {
+        resetRuntimeSettingsSyncState()
         withApplyingMacScopedState {
             threads = []
             restoredThreadSnapshotIDs.removeAll()

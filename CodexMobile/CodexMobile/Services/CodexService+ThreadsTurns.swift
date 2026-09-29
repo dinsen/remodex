@@ -329,12 +329,18 @@ extension CodexService {
     // Preserves the older startThread symbol used by most call sites and incremental builds.
     func startThread(
         preferredProjectPath: String? = nil,
-        runtimeOverride: CodexThreadRuntimeOverride? = nil
+        runtimeOverride: CodexThreadRuntimeOverride? = nil,
+        runtimeProvider: CodexRuntimeProvider = .codex,
+        openCodeModelID: String? = nil,
+        openCodeVariantID: String? = nil
     ) async throws -> CodexThread {
         try await startThreadImpl(
             preferredProjectPath: preferredProjectPath,
             pendingComposerAction: nil,
-            runtimeOverride: runtimeOverride
+            runtimeOverride: runtimeOverride,
+            runtimeProvider: runtimeProvider,
+            openCodeModelID: openCodeModelID,
+            openCodeVariantID: openCodeVariantID
         )
     }
 
@@ -342,12 +348,18 @@ extension CodexService {
     func startThread(
         preferredProjectPath: String? = nil,
         pendingComposerAction: CodexPendingThreadComposerAction,
-        runtimeOverride: CodexThreadRuntimeOverride? = nil
+        runtimeOverride: CodexThreadRuntimeOverride? = nil,
+        runtimeProvider: CodexRuntimeProvider = .codex,
+        openCodeModelID: String? = nil,
+        openCodeVariantID: String? = nil
     ) async throws -> CodexThread {
         try await startThreadImpl(
             preferredProjectPath: preferredProjectPath,
             pendingComposerAction: pendingComposerAction,
-            runtimeOverride: runtimeOverride
+            runtimeOverride: runtimeOverride,
+            runtimeProvider: runtimeProvider,
+            openCodeModelID: openCodeModelID,
+            openCodeVariantID: openCodeVariantID
         )
     }
 
@@ -355,11 +367,24 @@ extension CodexService {
     private func startThreadImpl(
         preferredProjectPath: String? = nil,
         pendingComposerAction: CodexPendingThreadComposerAction? = nil,
-        runtimeOverride: CodexThreadRuntimeOverride? = nil
+        runtimeOverride: CodexThreadRuntimeOverride? = nil,
+        runtimeProvider: CodexRuntimeProvider = .codex,
+        openCodeModelID: String? = nil,
+        openCodeVariantID: String? = nil
     ) async throws -> CodexThread {
-        guard let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath) else {
-            throw CodexServiceError.invalidInput("thread/start requires a project path or rootless chat path")
+        if runtimeProvider == .opencode,
+           openCodeModelID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            throw CodexServiceError.invalidInput("Select an OpenCode model before starting the chat.")
         }
+        if runtimeProvider == .opencode, openCodeVariantID != nil,
+           openCodeModel(id: openCodeModelID) == nil {
+            _ = try await listOpenCodeModels()
+        }
+        if runtimeProvider == .opencode, let openCodeVariantID,
+           openCodeModel(id: openCodeModelID)?.supportsVariant(openCodeVariantID) != true {
+            throw CodexServiceError.invalidInput("The selected OpenCode variant is unavailable for this model.")
+        }
+        let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath)
         let runtimeOverrideModel = runtimeOverride?.modelId.flatMap { modelId in
             availableModels.first { $0.id == modelId || $0.model == modelId }
         }
@@ -371,33 +396,43 @@ extension CodexService {
             guard runtimeOverride?.overridesServiceTier == true else {
                 return runtimeServiceTierForTurn()
             }
+            guard supportsServiceTier else { return nil }
             guard let requestedTier = runtimeOverride?.serviceTier else {
-                return nil
+                return "default"
             }
             let model = runtimeOverrideModel ?? selectedModelOption()
-            return model?.supportsServiceTier(requestedTier) == false ? nil : requestedTier.rawValue
+            return model?.supportsServiceTier(requestedTier) == false ? "default" : requestedTier.rawValue
         }()
         var includesServiceTier = explicitServiceTier != nil
         let accessConfiguration = runtimeAccessConfiguration()
 
         while true {
-            let params = CodexThreadStartProjectBinding.makeThreadStartParams(
-                modelIdentifier: explicitModelIdentifier,
+            var params = CodexThreadStartProjectBinding.makeThreadStartParams(
+                modelIdentifier: runtimeProvider == .opencode ? openCodeModelID : explicitModelIdentifier,
                 preferredProjectPath: normalizedPreferredProjectPath,
-                serviceTier: includesServiceTier ? explicitServiceTier : nil
+                serviceTier: runtimeProvider == .codex && includesServiceTier ? explicitServiceTier : nil
             )
+            if runtimeProvider == .opencode {
+                params["runtimeProvider"] = .string(CodexRuntimeProvider.opencode.rawValue)
+                if let openCodeVariantID { params["effort"] = .string(openCodeVariantID) }
+            }
 
             do {
-                let response = try await sendRequestWithSandboxFallback(
-                    method: "thread/start",
-                    baseParams: params,
-                    accessConfiguration: accessConfiguration
-                )
-                try validateAppliedAccessConfiguration(
-                    in: response,
-                    expected: accessConfiguration,
-                    context: "thread/start"
-                )
+                let response: RPCMessage
+                if runtimeProvider == .opencode {
+                    response = try await sendRequest(method: "thread/start", params: .object(params))
+                } else {
+                    response = try await sendRequestWithSandboxFallback(
+                        method: "thread/start",
+                        baseParams: params,
+                        accessConfiguration: accessConfiguration
+                    )
+                    try validateAppliedAccessConfiguration(
+                        in: response,
+                        expected: accessConfiguration,
+                        context: "thread/start"
+                    )
+                }
 
                 guard let result = response.result,
                       let resultObject = result.objectValue,
@@ -406,10 +441,15 @@ extension CodexService {
                     throw CodexServiceError.invalidResponse("thread/start response missing thread")
                 }
 
-                let thread = CodexThreadStartProjectBinding.applyPreferredProjectBinding(
+                var thread = CodexThreadStartProjectBinding.applyPreferredProjectBinding(
                     to: decodedThread,
                     preferredProjectPath: normalizedPreferredProjectPath
                 )
+                if runtimeProvider == .opencode {
+                    thread.runtimeProvider = .opencode
+                    thread.model = openCodeModelID
+                    thread.reasoningEffort = openCodeVariantID
+                }
                 if let pendingComposerAction {
                     queuePendingComposerAction(pendingComposerAction, for: thread.id)
                 }
@@ -423,7 +463,8 @@ extension CodexService {
                 hydratedThreadIDs.insert(thread.id)
                 initialTurnsLoadedByThreadID.insert(thread.id)
                 upsertThread(thread, treatAsServerState: true)
-                if decodedThread.normalizedProjectPath != normalizedPreferredProjectPath {
+                if let normalizedPreferredProjectPath,
+                   decodedThread.normalizedProjectPath != normalizedPreferredProjectPath {
                     beginAuthoritativeProjectPathTransition(
                         threadId: thread.id,
                         projectPath: normalizedPreferredProjectPath
@@ -436,6 +477,7 @@ extension CodexService {
                 activeThreadId = thread.id
                 return thread
             } catch {
+                if runtimeProvider == .opencode { throw error }
                 guard consumeUnsupportedServiceTier(error, includesServiceTier: &includesServiceTier) else {
                     throw error
                 }
@@ -530,7 +572,8 @@ extension CodexService {
         preAppendedUserMessageID: String? = nil,
         automaticTitleSeedOverride: String? = nil,
         collaborationMode: CodexCollaborationModeKind? = nil,
-        preservePlanSessionState: Bool = false
+        preservePlanSessionState: Bool = false,
+        onTurnStartDispatch: (@MainActor () -> Void)? = nil
     ) async throws {
         let trimmedInput = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedInput.isEmpty
@@ -542,11 +585,13 @@ extension CodexService {
 
         let initialThreadId = try await resolveThreadID(threadId)
         let initialThreadProjectPath = thread(for: initialThreadId)?.gitWorkingDirectory
-        let effectiveCollaborationMode = collaborationModeForOutgoingTurn(
-            threadId: initialThreadId,
-            requestedMode: collaborationMode,
-            preserveExisting: preservePlanSessionState
-        )
+        let effectiveCollaborationMode = thread(for: initialThreadId)?.runtimeProvider == .opencode
+            ? nil
+            : collaborationModeForOutgoingTurn(
+                threadId: initialThreadId,
+                requestedMode: collaborationMode,
+                preserveExisting: preservePlanSessionState
+            )
         preparePlanSessionForStart(
             threadId: initialThreadId,
             collaborationMode: effectiveCollaborationMode,
@@ -596,6 +641,36 @@ extension CodexService {
         } catch {
             if shouldTreatAsThreadNotFound(error) {
                 debugSyncLog("thread/resume reported missing thread=\(initialThreadId); trying turn/start before continuation")
+                if shouldAppendUserMessage || !preResumePendingMessageId.isEmpty {
+                    removePreResumePendingUserMessage(
+                        threadId: initialThreadId,
+                        messageId: preResumePendingMessageId,
+                        matchingText: trimmedInput,
+                        matchingAttachments: attachments
+                    )
+                }
+                handleMissingThread(initialThreadId)
+
+                let continuationThread = try await createContinuationThread(
+                    from: initialThreadId,
+                    preferredProjectPath: initialThreadProjectPath
+                )
+                migratePlanSessionState(from: initialThreadId, to: continuationThread.id)
+                try await ensureThreadResumed(threadId: continuationThread.id)
+                try await sendTurnStart(
+                    trimmedInput,
+                    attachments: attachments,
+                    skillMentions: skillMentions,
+                    mentionMentions: mentionMentions,
+                    fileMentions: fileMentions,
+                    to: continuationThread.id,
+                    shouldAppendUserMessage: shouldAppendOnContinuation,
+                    collaborationMode: effectiveCollaborationMode,
+                    onDispatch: onTurnStartDispatch
+                )
+                activeThreadId = continuationThread.id
+                lastErrorMessage = nil
+                return
             }
         }
 
@@ -610,7 +685,8 @@ extension CodexService {
                 shouldAppendUserMessage: false,
                 collaborationMode: effectiveCollaborationMode,
                 preAppendedUserMessageID: preResumePendingMessageId,
-                automaticTitleSeedOverride: preResumeTitleSeed
+                automaticTitleSeedOverride: preResumeTitleSeed,
+                onDispatch: onTurnStartDispatch
             )
         } catch {
             if shouldTreatAsThreadNotFound(error) {
@@ -627,7 +703,8 @@ extension CodexService {
                     mentionMentions: mentionMentions,
                     fileMentions: fileMentions,
                     shouldAppendUserMessage: shouldAppendOnContinuation,
-                    collaborationMode: effectiveCollaborationMode
+                    collaborationMode: effectiveCollaborationMode,
+                    onDispatch: onTurnStartDispatch
                 )
                 return
             }
@@ -635,6 +712,25 @@ extension CodexService {
         }
 
         activeThreadId = initialThreadId
+    }
+
+    // Removes the optimistic row by id first because structured mention-only rows may not match raw composer text.
+    private func removePreResumePendingUserMessage(
+        threadId: String,
+        messageId: String,
+        matchingText: String,
+        matchingAttachments: [CodexImageAttachment]
+    ) {
+        if removeUserMessage(threadId: threadId, messageId: messageId) {
+            return
+        }
+
+        markMessageDeliveryState(threadId: threadId, messageId: messageId, state: .failed)
+        removeLatestFailedUserMessage(
+            threadId: threadId,
+            matchingText: matchingText,
+            matchingAttachments: matchingAttachments
+        )
     }
 
     // Preserves the optimistic user row while recovering a send from an archived or missing thread.
@@ -649,7 +745,8 @@ extension CodexService {
         mentionMentions: [CodexTurnMention],
         fileMentions: [String],
         shouldAppendUserMessage: Bool,
-        collaborationMode: CodexCollaborationModeKind?
+        collaborationMode: CodexCollaborationModeKind?,
+        onDispatch: (@MainActor () -> Void)?
     ) async throws {
         var recoveryMessageThreadId = archivedThreadId
         var recoveryMessageId = pendingMessageId
@@ -686,7 +783,8 @@ extension CodexService {
                 shouldAppendUserMessage: movedMessage == nil && shouldAppendUserMessage,
                 collaborationMode: collaborationMode,
                 preAppendedUserMessageID: movedMessage?.messageID,
-                automaticTitleSeedOverride: movedMessage?.automaticTitleSeed ?? automaticTitleSeed
+                automaticTitleSeedOverride: movedMessage?.automaticTitleSeed ?? automaticTitleSeed,
+                onDispatch: onDispatch
             )
             handleMissingThread(archivedThreadId)
             activeThreadId = continuationThread.id
@@ -826,6 +924,9 @@ extension CodexService {
 
     // Requests interruption for the active turn.
     func interruptTurn(turnId: String?, threadId: String? = nil) async throws {
+        if let threadId = threadId ?? activeThreadId {
+            dismissStreamFailure(threadId: threadId)
+        }
         let normalizedThreadID = normalizedInterruptIdentifier(threadId)
             ?? normalizedInterruptIdentifier(activeThreadId)
 
@@ -1396,6 +1497,7 @@ extension CodexService {
     func fetchServerThreads(
         limit: Int? = nil,
         paginateLimitedPages: Bool = false,
+        archived: Bool = false,
         onPage: ((_ page: [CodexThread], _ accumulatedThreads: [CodexThread]) -> Void)? = nil
     ) async throws -> [CodexThread] {
         var allThreads: [CodexThread] = []
@@ -1409,7 +1511,8 @@ extension CodexService {
                 pageResult = try await fetchServerThreadsPageWithoutFallback(
                     cursor: nextCursor,
                     limit: limit,
-                    sourceKinds: activeSourceKinds
+                    sourceKinds: activeSourceKinds,
+                    archived: archived
                 )
             } catch {
                 guard activeSourceKinds == threadListSourceKinds,
@@ -1421,7 +1524,8 @@ extension CodexService {
                 pageResult = try await fetchServerThreadsPageWithoutFallback(
                     cursor: nextCursor,
                     limit: limit,
-                    sourceKinds: activeSourceKinds
+                    sourceKinds: activeSourceKinds,
+                    archived: archived
                 )
             }
             allThreads.append(contentsOf: pageResult.threads)
@@ -1444,12 +1548,17 @@ extension CodexService {
     private func fetchServerThreadsPageWithoutFallback(
         cursor: JSONValue,
         limit: Int?,
-        sourceKinds: [String]
+        sourceKinds: [String],
+        archived: Bool
     ) async throws -> (threads: [CodexThread], nextCursor: JSONValue) {
         var params: RPCObject = [
             // Avoid the server's narrower default sourceKinds so multi-project history
             // includes threads started from the app-server flow as well.
             "sourceKinds": .array(sourceKinds.map(JSONValue.string)),
+            // Desktop's catalog also contains sessions that a rollout scan
+            // can temporarily omit. Read indexed metadata across providers.
+            "useStateDbOnly": .bool(true),
+            "modelProviders": .array([]),
             // The app-server defaults to created_at, which can exclude an old thread
             // with recent activity from this capped sidebar window.
             "sortKey": .string("updated_at"),
@@ -1457,6 +1566,9 @@ extension CodexService {
         ]
         if let limit {
             params["limit"] = .integer(limit)
+        }
+        if archived {
+            params["archived"] = .bool(true)
         }
 
         let response = try await sendRequest(
@@ -1562,7 +1674,11 @@ extension CodexService {
         from archivedThreadId: String,
         preferredProjectPath: String? = nil
     ) async throws -> CodexThread {
-        let continuationRuntimeOverride = threadRuntimeOverride(for: archivedThreadId)
+        let sourceThread = thread(for: archivedThreadId)
+        let runtimeProvider = sourceThread?.runtimeProvider ?? .codex
+        let continuationRuntimeOverride = runtimeProvider == .codex
+            ? threadRuntimeOverride(for: archivedThreadId)
+            : nil
         let continuationProjectPath: String
         if let preferredProjectPath {
             continuationProjectPath = preferredProjectPath
@@ -1572,7 +1688,11 @@ extension CodexService {
         let continuationThread = try await startThreadIfReady(
             preferredProjectPath: continuationProjectPath,
             rootlessChatPromptHint: "continued from \(archivedThreadId)",
-            runtimeOverride: continuationRuntimeOverride
+            runtimeOverride: continuationRuntimeOverride,
+            runtimeProvider: runtimeProvider,
+            openCodeModelID: runtimeProvider == .opencode ? sourceThread?.model : nil,
+            openCodeVariantID: runtimeProvider == .opencode
+                ? selectedOpenCodeVariant(for: archivedThreadId) : nil
         )
         appendSystemMessage(
             threadId: continuationThread.id,
@@ -1586,7 +1706,9 @@ extension CodexService {
             return sourceProjectPath
         }
 
-        try await awaitRuntimeInitializedIfNeeded()
+        if thread(for: archivedThreadId)?.runtimeProvider != .opencode {
+            try await awaitRuntimeInitializedIfNeeded()
+        }
         return try await createRootlessChatRoot(promptHint: nil)
     }
 
@@ -1611,7 +1733,9 @@ extension CodexService {
         let requestedSignature = CodexThreadResumeRequestSignature(
             projectPath: CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath)
                 ?? thread(for: threadId)?.gitWorkingDirectory,
-            modelIdentifier: modelIdentifierOverride ?? runtimeModelIdentifierForTurn(threadId: threadId),
+            modelIdentifier: modelIdentifierOverride ?? (thread(for: threadId)?.runtimeProvider == .opencode
+                ? thread(for: threadId)?.model
+                : runtimeModelIdentifierForTurn(threadId: threadId)),
             accessConfiguration: accessConfigurationOverride ?? runtimeAccessConfiguration()
         )
         let refreshGeneration = currentPerThreadRefreshGeneration(for: threadId)
@@ -1654,13 +1778,16 @@ extension CodexService {
                 params["excludeTurns"] = .bool(true)
             }
             var didRequestExcludedTurns = params["excludeTurns"] != nil
+            let isOpenCodeThread = thread(for: threadId)?.runtimeProvider == .opencode
             let response: RPCMessage
             do {
-                response = try await sendRequestWithSandboxFallback(
-                    method: "thread/resume",
-                    baseParams: params,
-                    accessConfiguration: requestedSignature.accessConfiguration
-                )
+                response = isOpenCodeThread
+                    ? try await sendRequest(method: "thread/resume", params: .object(params))
+                    : try await sendRequestWithSandboxFallback(
+                        method: "thread/resume",
+                        baseParams: params,
+                        accessConfiguration: requestedSignature.accessConfiguration
+                    )
             } catch {
                 guard didRequestExcludedTurns, consumeUnsupportedTurnPagination(error) else {
                     throw error
@@ -1668,17 +1795,21 @@ extension CodexService {
 
                 params.removeValue(forKey: "excludeTurns")
                 didRequestExcludedTurns = false
-                response = try await sendRequestWithSandboxFallback(
-                    method: "thread/resume",
-                    baseParams: params,
-                    accessConfiguration: requestedSignature.accessConfiguration
+                response = isOpenCodeThread
+                    ? try await sendRequest(method: "thread/resume", params: .object(params))
+                    : try await sendRequestWithSandboxFallback(
+                        method: "thread/resume",
+                        baseParams: params,
+                        accessConfiguration: requestedSignature.accessConfiguration
+                    )
+            }
+            if !isOpenCodeThread {
+                try validateAppliedAccessConfiguration(
+                    in: response,
+                    expected: requestedSignature.accessConfiguration,
+                    context: "thread/resume"
                 )
             }
-            try validateAppliedAccessConfiguration(
-                in: response,
-                expected: requestedSignature.accessConfiguration,
-                context: "thread/resume"
-            )
             guard !Task.isCancelled,
                   isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
                 throw CancellationError()
@@ -1907,6 +2038,33 @@ extension CodexService {
                         }
                         return true
                     }
+                    // A missed live terminal event can be recovered from this
+                    // authoritative turn snapshot. Only notify when the closed
+                    // turn is the one we were tracking, not an older sibling.
+                    if let existingTurnID,
+                       snapshot.latestTurnID == existingTurnID,
+                       let status = snapshot.latestTurnStatus {
+                        let result: CodexRunCompletionResult?
+                        if status.contains("fail") || status.contains("error") {
+                            result = .failed
+                        } else if status.contains("complet") || status == "done" || status == "finished" {
+                            result = .completed
+                        } else {
+                            result = nil
+                        }
+                        if let result {
+                            recordTurnTerminalState(
+                                threadId: normalizedThreadID,
+                                turnId: existingTurnID,
+                                state: result == .failed ? .failed : .completed
+                            )
+                            notifyRunCompletionIfNeeded(
+                                threadId: normalizedThreadID,
+                                turnId: existingTurnID,
+                                result: result
+                            )
+                        }
+                    }
                     clearRunningState(for: normalizedThreadID)
                 }
 
@@ -1940,7 +2098,8 @@ extension CodexService {
         shouldAppendUserMessage: Bool = true,
         collaborationMode: CodexCollaborationModeKind? = nil,
         preAppendedUserMessageID: String? = nil,
-        automaticTitleSeedOverride: String? = nil
+        automaticTitleSeedOverride: String? = nil,
+        onDispatch: (@MainActor () -> Void)? = nil
     ) async throws {
         cancelThreadListHydrationForInteractiveRequest()
         let outgoingDisplayText = displayTextForOutgoingTurn(
@@ -1989,9 +2148,10 @@ extension CodexService {
         var includeStructuredSkillItems = supportsStructuredSkillInput && !skillMentions.isEmpty
         var includeStructuredMentionItems = supportsStructuredMentionInput && !mentionMentions.isEmpty
         var imageURLKey = "url"
-        var effectiveCollaborationMode = supportsTurnCollaborationMode ? collaborationMode : nil
+        let isOpenCodeThread = thread(for: threadId)?.runtimeProvider == .opencode
+        var effectiveCollaborationMode = !isOpenCodeThread && supportsTurnCollaborationMode ? collaborationMode : nil
         var didDowngradePlanModeForRuntime = false
-        var includesServiceTier = runtimeServiceTierForTurn(threadId: threadId) != nil
+        var includesServiceTier = !isOpenCodeThread && supportsServiceTier
         let accessConfiguration = runtimeAccessConfiguration()
         let turnStartProjectPath = thread(for: threadId)?.gitWorkingDirectory
         var includesTurnStartProjectPath = turnStartProjectPath != nil
@@ -2004,6 +2164,12 @@ extension CodexService {
 
         while true {
             do {
+                if !isOpenCodeThread {
+                    try await waitForRuntimeSettingsUpdate(threadId: threadId)
+                } else if selectedOpenCodeVariant(for: threadId) != nil,
+                          openCodeModel(id: thread(for: threadId)?.model) == nil {
+                    _ = try await listOpenCodeModels()
+                }
                 let requestParams = try buildTurnStartRequestParams(
                     threadId: threadId,
                     userInput: userInput,
@@ -2022,11 +2188,14 @@ extension CodexService {
                 if let messageStartCheckpointTask {
                     await messageStartCheckpointTask.value
                 }
-                let response = try await sendRequestWithSandboxFallback(
-                    method: "turn/start",
-                    baseParams: requestParams,
-                    accessConfiguration: accessConfiguration
-                )
+                let response = isOpenCodeThread
+                    ? try await sendRequest(method: "turn/start", params: .object(requestParams), onDispatch: onDispatch)
+                    : try await sendRequestWithSandboxFallback(
+                        method: "turn/start",
+                        baseParams: requestParams,
+                        accessConfiguration: accessConfiguration,
+                        onDispatch: onDispatch
+                    )
                 let resolvedTurnID = handleSuccessfulTurnStartResponse(
                     response,
                     pendingMessageId: pendingMessageId,
@@ -2170,6 +2339,8 @@ extension CodexService {
         threadId: String,
         attachmentCount: Int
     ) async -> String? {
+        // OpenCode names its own session and the bridge mirrors that update.
+        guard thread(for: threadId)?.runtimeProvider != .opencode else { return nil }
         var params: [String: JSONValue] = [
             "message": .string(seed),
             "attachmentCount": .integer(attachmentCount),
@@ -2896,15 +3067,30 @@ extension CodexService {
                 )
             ),
         ]
+        let isOpenCodeThread = thread(for: threadId)?.runtimeProvider == .opencode
+        if supportsRuntimeSettingsSync && !isOpenCodeThread {
+            params["remodexRuntimeSettingsVersion"] = .integer(2)
+        }
         // Keep the legacy top-level fields populated so plan-mode turns still honor
         // the user's selected model on runtimes that do not read collaboration settings.
-        if let modelIdentifier = runtimeModelIdentifierForTurn(threadId: threadId) {
+        if let modelIdentifier = isOpenCodeThread
+            ? thread(for: threadId)?.model
+            : runtimeModelIdentifierForTurn(threadId: threadId) {
             params["model"] = .string(modelIdentifier)
         }
-        if let effort = selectedReasoningEffortForSelectedModel(threadId: threadId) {
+        if isOpenCodeThread {
+            if let variant = selectedOpenCodeVariant(for: threadId) {
+                guard openCodeModel(id: thread(for: threadId)?.model)?.supportsVariant(variant) == true else {
+                    throw CodexServiceError.invalidInput("The selected OpenCode variant is unavailable for this model.")
+                }
+                params["effort"] = .string(variant)
+            } else if threadRuntimeOverride(for: threadId)?.overridesReasoning == true {
+                params["effort"] = .null
+            }
+        } else if let effort = selectedReasoningEffortForSelectedModel(threadId: threadId) {
             params["effort"] = .string(effort)
         }
-        if includeServiceTier,
+        if !isOpenCodeThread, includeServiceTier,
            let serviceTier = runtimeServiceTierForTurn(threadId: threadId) {
             params["serviceTier"] = .string(serviceTier)
         }
@@ -3595,7 +3781,8 @@ extension CodexService {
     func readThreadTurnStateSnapshot(threadId: String) async throws -> (
         interruptibleTurnID: String?,
         hasInterruptibleTurnWithoutID: Bool,
-        latestTurnID: String?
+        latestTurnID: String?,
+        latestTurnStatus: String?
     ) {
         if supportsTurnPagination {
             do {
@@ -3610,7 +3797,7 @@ extension CodexService {
                 )
 
                 guard let resultObject = response.result?.objectValue else {
-                    return (nil, false, nil)
+                    return (nil, false, nil, nil)
                 }
 
                 let turnObjects = (
@@ -3635,7 +3822,7 @@ extension CodexService {
                    ),
                    !Self.isSyntheticPlaceholderTurnID(mirrorActiveTurnID),
                    turnTerminalState(for: mirrorActiveTurnID, threadId: threadId) == nil {
-                    return (mirrorActiveTurnID, false, snapshot.latestTurnID)
+                    return (mirrorActiveTurnID, false, snapshot.latestTurnID, snapshot.latestTurnStatus)
                 }
                 return snapshot
             } catch {
@@ -3702,10 +3889,11 @@ extension CodexService {
     ) -> (
         interruptibleTurnID: String?,
         hasInterruptibleTurnWithoutID: Bool,
-        latestTurnID: String?
+        latestTurnID: String?,
+        latestTurnStatus: String?
     ) {
         guard !turnObjects.isEmpty else {
-            return (nil, false, nil)
+            return (nil, false, nil, nil)
         }
 
         let newestTurnObjects = newestFirst ? turnObjects : Array(turnObjects.reversed())
@@ -3719,6 +3907,10 @@ extension CodexService {
             }
             return turnID
         }.first
+        let latestTurnStatus = newestTurnObjects.first { turn in
+            normalizedInterruptIdentifier(turn["id"]?.stringValue
+                ?? turn["turnId"]?.stringValue ?? turn["turn_id"]?.stringValue) == latestTurnID
+        }.flatMap { normalizedInterruptTurnStatus(from: $0) }
 
         // Parallel turns can finish out of order. A newer terminal turn does not
         // prove that an older in-progress sibling is no longer interruptible.
@@ -3751,7 +3943,7 @@ extension CodexService {
                    !knownParallelTurnIDs.contains(interruptibleTurnID) {
                     continue
                 }
-                return (interruptibleTurnID, false, latestTurnID)
+                return (interruptibleTurnID, false, latestTurnID, latestTurnStatus)
             }
 
             if encounteredTerminalBoundary {
@@ -3761,7 +3953,7 @@ extension CodexService {
             break
         }
 
-        return (nil, hasInterruptibleTurnWithoutID, latestTurnID)
+        return (nil, hasInterruptibleTurnWithoutID, latestTurnID, latestTurnStatus)
     }
 
     private func knownParallelTurnIDs(for threadId: String) -> Set<String> {

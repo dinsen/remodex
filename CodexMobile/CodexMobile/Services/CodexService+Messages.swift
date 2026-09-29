@@ -277,6 +277,7 @@ extension CodexService {
         supersededTurnIDsByIDLessRunByThread.removeValue(forKey: threadId)
         provisionalIDLessTurnIDByThread.removeValue(forKey: threadId)
         runStartGenerationByThread.removeValue(forKey: threadId)
+        recoverableStreamFailuresByThread.removeValue(forKey: threadId)
         lastRunStartTurnIDByThread.removeValue(forKey: threadId)
         provisionalPaginatedHistoryThreadIDs.remove(threadId)
         threadsWithSatisfiedDeferredHistoryHydration.remove(threadId)
@@ -319,6 +320,7 @@ extension CodexService {
             supersededTurnIDsByIDLessRunByThread.removeAll()
             provisionalIDLessTurnIDByThread.removeAll()
             runStartGenerationByThread.removeAll()
+            recoverableStreamFailuresByThread.removeAll()
             lastRunStartTurnIDByThread.removeAll()
         }
         provisionalPaginatedHistoryThreadIDs.removeAll()
@@ -1011,6 +1013,7 @@ extension CodexService {
 
     private func performPrepareThreadForDisplay(threadId: String) async -> Bool {
         activeThreadId = threadId
+        presentRuntimeSettingsError(for: threadId)
         markThreadAsViewed(threadId)
         // Opening a thread mid-mirror-batch must render immediately: settle any
         // open catch-up burst so the initial updateCurrentOutput below is not
@@ -1416,8 +1419,11 @@ extension CodexService {
                     }
                     loadedViaPagination = true
                     loadedProvisionalJsonlFallback = turnsPage.isProvisionalJsonlFallback
+                    let hasLegacyOpenCodeCursor = thread(for: threadId)?.runtimeProvider == .opencode
+                        && olderThreadHistoryCursorByThreadID[threadId]?.stringValue?.hasPrefix("opencode-offset:") == true
                     let shouldSeedInitialCursor = !hadInitialTurnsLoadedBeforeRefresh
                         || hadProvisionalPaginatedHistoryBeforeRefresh
+                        || hasLegacyOpenCodeCursor
                         || (
                             !hasRemoteOlderThreadHistoryCursor(threadId: threadId)
                                 && !hadAuthoritativeLocalStartBeforeRefresh
@@ -1677,6 +1683,22 @@ extension CodexService {
 
                 // Litter keeps any already-hydrated local transcript and merges pages into it.
                 // Do not shrink a legacy/full local cache down to only the first 5-turn page.
+                if !loadedProvisionalJsonlFallback && !threadHasActiveOrRunningTurn(threadId) {
+                    if loadedViaPagination {
+                        if CodexAsyncUserInputProjection.hasMissingAnswerCandidate(
+                            in: merged,
+                            canonical: historyMessages
+                        ) {
+                            scheduleAsyncAnswerVerification(threadId: threadId, delay: 3)
+                        }
+                    } else if canVerifyAsyncAnswerAbsence(threadId: threadId, threadObject: threadObject),
+                        let followUpDelay = CodexAsyncUserInputProjection.reopenRepliesMissingFromCanonicalHistory(
+                        &merged,
+                        canonical: historyMessages
+                    ) {
+                        scheduleAsyncAnswerVerification(threadId: threadId, delay: followUpDelay)
+                    }
+                }
                 let nextMessages = merged
                 if nextMessages != cachedMessages {
                     messagesByThread[threadId] = nextMessages
@@ -1709,6 +1731,12 @@ extension CodexService {
             clearDeferredThreadHistoryErrorIfNeeded(threadId: threadId)
             initialTurnsLoadedByThreadID.insert(threadId)
             hydratedThreadIDs.insert(threadId)
+            if !threadHasActiveOrRunningTurn(threadId),
+               messagesByThread[threadId]?.contains(where: { $0.asyncUserInput?.status == .queued }) == true {
+                Task { @MainActor in
+                    await self.flushQueuedAsyncUserInput(threadId: threadId)
+                }
+            }
             refreshThreadTimelineState(for: threadId)
             return outcome
         }
@@ -1772,6 +1800,20 @@ extension CodexService {
         let trimmedText = Self.normalizedMessageText(text)
         guard Self.hasMeaningfulHistoryText(trimmedText) else {
             return
+        }
+
+        // `opencode run` can leave its server title at the generated timestamp.
+        // Use the first mirrored prompt as a lightweight sidebar preview; a
+        // later real session title still takes precedence over this fallback.
+        if let threadIndex = threadIndex(for: threadId),
+           threads[threadIndex].runtimeProvider == .opencode,
+           threads[threadIndex].displayTitle == CodexThread.defaultDisplayTitle,
+           threads[threadIndex].preview?.isEmpty != false {
+            let firstLine = trimmedText.components(separatedBy: .newlines).first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !firstLine.isEmpty {
+                threads[threadIndex].preview = String(firstLine.prefix(100))
+            }
         }
 
         let normalizedItemId = Self.normalizedHistoryIdentifier(itemId)
@@ -6926,7 +6968,7 @@ extension CodexService {
             return "Waiting for input..."
         case .autoApprovalReview:
             return "Reviewing approval..."
-        case .chat:
+        case .chat, .asyncUserInputAnswer:
             return "Updating..."
         }
     }

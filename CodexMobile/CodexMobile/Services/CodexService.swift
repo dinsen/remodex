@@ -165,6 +165,8 @@ struct CodexThreadRuntimeOverride: Codable, Equatable, Sendable {
     var overridesServiceTier: Bool
     var runtimeSettingsRevision: Int
     var runtimeSettingsUpdatedAt: Double
+    var runtimeSettingsEpoch: String? = nil
+    var pendingRuntimeSettings: RPCObject = [:]
 
     init(
         modelId: String? = nil,
@@ -195,6 +197,8 @@ struct CodexThreadRuntimeOverride: Codable, Equatable, Sendable {
         case overridesServiceTier
         case runtimeSettingsRevision
         case runtimeSettingsUpdatedAt
+        case runtimeSettingsEpoch
+        case pendingRuntimeSettings
     }
 
     init(from decoder: Decoder) throws {
@@ -207,6 +211,8 @@ struct CodexThreadRuntimeOverride: Codable, Equatable, Sendable {
         overridesServiceTier = try container.decodeIfPresent(Bool.self, forKey: .overridesServiceTier) ?? false
         runtimeSettingsRevision = try container.decodeIfPresent(Int.self, forKey: .runtimeSettingsRevision) ?? 0
         runtimeSettingsUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .runtimeSettingsUpdatedAt) ?? 0
+        runtimeSettingsEpoch = try container.decodeIfPresent(String.self, forKey: .runtimeSettingsEpoch)
+        pendingRuntimeSettings = try container.decodeIfPresent(RPCObject.self, forKey: .pendingRuntimeSettings) ?? [:]
     }
 
     var serviceTier: CodexServiceTier? {
@@ -217,7 +223,7 @@ struct CodexThreadRuntimeOverride: Codable, Equatable, Sendable {
     }
 
     var isEmpty: Bool {
-        !overridesModel && !overridesReasoning && !overridesServiceTier
+        !overridesModel && !overridesReasoning && !overridesServiceTier && pendingRuntimeSettings.isEmpty
     }
 }
 
@@ -260,6 +266,7 @@ enum CodexNotificationPayloadKeys {
     static let turnId = "turnId"
     static let result = "result"
     static let requestId = "requestId"
+    static let presentWhenActive = "presentWhenActive"
 }
 
 // Tracks the real terminal outcome of a run, including user interruption.
@@ -432,7 +439,15 @@ final class CodexService {
     // Tracks the non-blocking bootstrap that hydrates chats/models after the socket is ready.
     var isBootstrappingConnectionSync = false
     var currentOutput = ""
-    var activeThreadId: String?
+    var activeThreadId: String? {
+        didSet {
+            // Footer errors belong to the chat where they occurred. Do not
+            // carry a previous runtime's error into another conversation.
+            if oldValue != activeThreadId {
+                lastErrorMessage = activeThreadId.flatMap { asyncUserInputErrorsByThread[$0] }
+            }
+        }
+    }
     var activeTurnId: String?
     var activeTurnIdByThread: [String: String] = [:]
     // Monotonic live turn-start token. Unlike running/id snapshots, this cannot
@@ -475,6 +490,10 @@ final class CodexService {
     @ObservationIgnored var autoApprovalRetryTokensByReviewKey: [String: CodexAutoApprovalRetryToken] = [:]
     var lastRawMessage: String?
     var lastErrorMessage: String?
+    @ObservationIgnored var asyncUserInputErrorsByThread: [String: String] = [:]
+    var recoverableStreamFailuresByThread: [String: CodexStreamFailure] = [:]
+    @ObservationIgnored var streamFailureContinuationsInFlight: Set<UUID> = []
+    @ObservationIgnored var streamRecoveryConnectionGeneration = 0
     var keepMacAwakeWhileBridgeRuns = false
     var runtimeDebugLogEntries: [String] = []
     @ObservationIgnored var compactRuntimeItemCompletedCount = 0
@@ -500,6 +519,9 @@ final class CodexService {
     @ObservationIgnored var messageRevisionByThread: [String: Int] = [:]
     var syncRealtimeEnabled = true
     var availableModels: [CodexModelOption] = []
+    // Last OpenCode catalog from the bridge; shared by the draft picker and thread composer labels.
+    var openCodeModels: [OpenCodeModelOption] = []
+    var isLoadingOpenCodeModels = false
     var selectedModelId: String?
     var hasPersistedSelectedModelId = false
     var selectedGitWriterModelId: String?
@@ -531,6 +553,12 @@ final class CodexService {
     var supportsTurnCollaborationMode = false
     // Runtime compatibility flag for `thread/start|turn/start.serviceTier` speed controls.
     var supportsServiceTier = true
+    var supportsRuntimeSettingsSync = false
+    @ObservationIgnored var runtimeSettingsUpdateTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored var runtimeSettingsUpdateIDs: [String: UUID] = [:]
+    @ObservationIgnored var retiredRuntimeSettingsEpochs: [String: Set<String>] = [:]
+    var runtimeSettingsUpdateErrors: [String: String] = [:]
+    var confirmedRuntimeSettings: [String: CodexRuntimeSettings] = [:]
     // Runtime compatibility flag for the bridge-owned voice transcription flow.
     var supportsBridgeVoiceTranscription = true
     var supportedBridgeVoiceTranscriptionFormats: Set<String> = ["wav"]
@@ -557,6 +585,7 @@ final class CodexService {
     // A Desktop/rollout source handoff needs replace semantics for the mirrored
     // tail, not an append-only merge that leaves stale synthetic rows behind.
     @ObservationIgnored var pendingCanonicalSourceReplacementThreadIDs: Set<String> = []
+    @ObservationIgnored var asyncAnswerVerificationThreadIDs: Set<String> = []
     // A bounded JSONL first paint is useful immediately but remains provisional
     // until the app-server returns its exact cursor-backed page.
     @ObservationIgnored var provisionalPaginatedHistoryThreadIDs: Set<String> = []
@@ -951,9 +980,7 @@ final class CodexService {
 
         let savedServiceTier = defaults.string(forKey: Self.selectedServiceTierDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if savedServiceTier == "flex" {
-            self.selectedServiceTier = nil
-        } else if let savedServiceTier,
+        if let savedServiceTier,
            let parsedServiceTier = CodexServiceTier(rawValue: savedServiceTier) {
             self.selectedServiceTier = parsedServiceTier
         } else {

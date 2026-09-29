@@ -1,11 +1,32 @@
 // FILE: SidebarThreadGrouping.swift
-// Purpose: Produces sidebar thread groups by project path (`cwd`) or rootless
-//          chat scope while excluding archived chats.
+// Purpose: Produces a global Activity list or sidebar groups by project path
+//          (`cwd`) and rootless chat scope while excluding archived chats.
 // Layer: View Helper
-// Exports: SidebarThreadGroupKind, SidebarContentScope, SidebarThreadGroup,
+// Exports: SidebarTaskViewMode, SidebarThreadGroupKind, SidebarContentScope, SidebarThreadGroup,
 //          SidebarThreadGrouping
 
 import Foundation
+
+enum SidebarTaskViewMode: String, CaseIterable, Identifiable {
+    case activity
+    case projects
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .activity: return "Activity"
+        case .projects: return "Projects"
+        }
+    }
+
+    var iconSystemName: String {
+        switch self {
+        case .activity: return "bell.badge"
+        case .projects: return "folder"
+        }
+    }
+}
 
 enum SidebarThreadGroupKind: Equatable {
     case pinned
@@ -94,6 +115,19 @@ struct SidebarThreadGroup: Identifiable {
 }
 
 enum SidebarThreadGrouping {
+    // Activity spans all projects and rootless chats, independently of the
+    // Projects/Chats scope used by the grouped presentation.
+    static func activityThreads(
+        from threads: [CodexThread],
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+    ) -> [CodexThread] {
+        sortThreadsByRecentActivity(
+            threads.filter { $0.syncState != .archivedLocal },
+            runBadgeStateByThreadID: runBadgeStateByThreadID,
+            viewMode: .activity
+        )
+    }
+
     static func makeGroups(
         from threads: [CodexThread],
         pinnedThreadIDs: [String] = [],
@@ -504,6 +538,8 @@ enum SidebarThreadGrouping {
     ) -> [SidebarThreadGroup] {
         var liveThreadsByProject: [String: [CodexThread]] = [:]
         var projectPathByGroupKey: [String: String] = [:]
+        var recentThreadsByProject: [String: [CodexThread]] = [:]
+        var recentProjectPathByGroupKey: [String: String] = [:]
         let configuredProjectScopes = normalizedConfiguredProjectScopes(configuredProjectChoices)
 
         for thread in threads where thread.syncState != .archivedLocal {
@@ -512,13 +548,20 @@ enum SidebarThreadGrouping {
             }
 
             if projectSource == .configuredProjects {
-                guard let configuredProjectScope = configuredProjectScope(
+                if let configuredProjectScope = configuredProjectScope(
                     containing: thread.projectGroupKey,
                     scopes: configuredProjectScopes
-                ) else {
-                    continue
+                ) {
+                    liveThreadsByProject[configuredProjectScope.projectPath, default: []].append(thread)
+                } else {
+                    // Configured roots can be unavailable on older bridges or
+                    // simply omit a repository. Keep those chats in their
+                    // normal project groups instead of hiding them.
+                    recentThreadsByProject[thread.projectGroupKey, default: []].append(thread)
+                    if let projectGroupPath = thread.projectGroupPath {
+                        recentProjectPathByGroupKey[thread.projectGroupKey] = projectGroupPath
+                    }
                 }
-                liveThreadsByProject[configuredProjectScope.projectPath, default: []].append(thread)
             } else {
                 liveThreadsByProject[thread.projectGroupKey, default: []].append(thread)
                 if let projectGroupPath = thread.projectGroupPath {
@@ -555,6 +598,16 @@ enum SidebarThreadGrouping {
         }
 
         if projectSource == .configuredProjects {
+            for (projectKey, projectThreads) in recentThreadsByProject {
+                let group = makeProjectGroup(
+                    projectKey: projectKey,
+                    projectPath: recentProjectPathByGroupKey[projectKey],
+                    threads: projectThreads,
+                    runBadgeStateByThreadID: runBadgeStateByThreadID
+                )
+                groupsByID[group.id] = group
+            }
+
             for choice in configuredProjectChoices {
                 guard let projectPath = CodexThread.normalizedFilesystemProjectPath(choice.projectPath) else {
                     continue
@@ -825,14 +878,15 @@ enum SidebarThreadGrouping {
 
     private static func sortThreadsByRecentActivity(
         _ threads: [CodexThread],
-        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:]
+        runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] = [:],
+        viewMode: SidebarTaskViewMode = .projects
     ) -> [CodexThread] {
         threads.sorted { lhs, rhs in
             // Recency alone buries the chats the user cares about most: an orchestrating
             // run can sit idle for an hour while the worktree runs it spawned keep
             // writing, so the still-running chat would sink below its own children.
-            let lhsTier = sidebarActivityTier(of: lhs, in: runBadgeStateByThreadID)
-            let rhsTier = sidebarActivityTier(of: rhs, in: runBadgeStateByThreadID)
+            let lhsTier = sidebarActivityTier(of: lhs, in: runBadgeStateByThreadID, viewMode: viewMode)
+            let rhsTier = sidebarActivityTier(of: rhs, in: runBadgeStateByThreadID, viewMode: viewMode)
             if lhsTier != rhsTier {
                 return lhsTier < rhsTier
             }
@@ -845,12 +899,21 @@ enum SidebarThreadGrouping {
         }
     }
 
-    // Ordering tier for a sidebar row: active work first, unread outcomes next,
-    // everything else (including ambient goal states) by recency alone.
+    // Activity puts waiting and unread work first; Projects keeps its existing
+    // active-first ordering. Recency breaks ties within each tier.
     private static func sidebarActivityTier(
         of thread: CodexThread?,
-        in runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+        in runBadgeStateByThreadID: [String: CodexThreadRunBadgeState],
+        viewMode: SidebarTaskViewMode = .projects
     ) -> Int {
+        if viewMode == .activity {
+            switch thread.flatMap({ runBadgeStateByThreadID[$0.id] }) {
+            case .waitingOnUser: return 0
+            case .ready, .failed: return 1
+            case .running: return 2
+            default: return 3
+            }
+        }
         guard let thread, let badgeState = runBadgeStateByThreadID[thread.id] else {
             return 2
         }

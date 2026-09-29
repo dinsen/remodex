@@ -72,6 +72,11 @@ struct CodexThreadSection: Identifiable, Codable, Hashable, Sendable {
     let name: String
 }
 
+enum CodexRuntimeProvider: String, Codable, Hashable, Sendable {
+    case codex
+    case opencode
+}
+
 // Who created the session, when it was not the user. Scheduled runs are the common case
 // and carry no extra meaning worth a word in a sidebar row, so they render as the clock
 // glyph Synara already uses for automations; named kinds keep their short text.
@@ -123,8 +128,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var model: String?
     var modelProvider: String?
     var goalStatus: CodexThreadGoalStatus?
+    var runtimeProvider: CodexRuntimeProvider
     var reasoningEffort: String?
     var serviceTier: String?
+    var runtimeSettings: CodexRuntimeSettings?
     var runtimeSettingsRevision: Int?
     var runtimeSettingsUpdatedAt: Double?
     var runtimeSettingsSource: String?
@@ -153,8 +160,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         model: String? = nil,
         modelProvider: String? = nil,
         goalStatus: CodexThreadGoalStatus? = nil,
+        runtimeProvider: CodexRuntimeProvider = .codex,
         reasoningEffort: String? = nil,
         serviceTier: String? = nil,
+        runtimeSettings: CodexRuntimeSettings? = nil,
         runtimeSettingsRevision: Int? = nil,
         runtimeSettingsUpdatedAt: Double? = nil,
         runtimeSettingsSource: String? = nil,
@@ -180,8 +189,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.model = Self.normalizeIdentifier(model)
         self.modelProvider = Self.normalizeIdentifier(modelProvider)
         self.goalStatus = goalStatus
+        self.runtimeProvider = runtimeProvider
         self.reasoningEffort = Self.normalizeIdentifier(reasoningEffort)
         self.serviceTier = Self.normalizeIdentifier(serviceTier)
+        self.runtimeSettings = runtimeSettings
         self.runtimeSettingsRevision = runtimeSettingsRevision
         self.runtimeSettingsUpdatedAt = runtimeSettingsUpdatedAt
         self.runtimeSettingsSource = Self.normalizeIdentifier(runtimeSettingsSource)
@@ -228,10 +239,13 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case goalStatusSnake = "goal_status"
         case threadGoalStatus
         case threadGoalStatusSnake = "thread_goal_status"
+        case runtimeProvider
+        case runtimeProviderSnake = "runtime_provider"
         case reasoningEffort
         case reasoningEffortSnake = "reasoning_effort"
         case serviceTier
         case serviceTierSnake = "service_tier"
+        case runtimeSettings
         case runtimeSettingsRevision
         case runtimeSettingsRevisionSnake = "runtime_settings_revision"
         case runtimeSettingsUpdatedAt
@@ -310,11 +324,15 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
             metadataKeys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"]
         )
         goalStatus = Self.decodeGoalStatus(from: container, metadata: metadata)
+        runtimeProvider = (try? container.decodeIfPresent(CodexRuntimeProvider.self, forKey: .runtimeProvider))
+            ?? (try? container.decodeIfPresent(CodexRuntimeProvider.self, forKey: .runtimeProviderSnake))
+            ?? .codex
         reasoningEffort = Self.decodeIdentifierIfPresent(
             from: container,
             keys: [.reasoningEffort, .reasoningEffortSnake]
         )
         serviceTier = Self.decodeIdentifierIfPresent(from: container, keys: [.serviceTier, .serviceTierSnake])
+        runtimeSettings = try container.decodeIfPresent(CodexRuntimeSettings.self, forKey: .runtimeSettings)
         runtimeSettingsRevision = Self.decodeIntegerIfPresent(
             from: container,
             keys: [.runtimeSettingsRevision, .runtimeSettingsRevisionSnake]
@@ -355,8 +373,10 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(Self.normalizeIdentifier(model), forKey: .model)
         try container.encodeIfPresent(Self.normalizeIdentifier(modelProvider), forKey: .modelProvider)
         try container.encodeIfPresent(goalStatus, forKey: .threadGoalStatus)
+        try container.encode(runtimeProvider, forKey: .runtimeProvider)
         try container.encodeIfPresent(Self.normalizeIdentifier(reasoningEffort), forKey: .reasoningEffort)
         try container.encodeIfPresent(Self.normalizeIdentifier(serviceTier), forKey: .serviceTier)
+        try container.encodeIfPresent(runtimeSettings, forKey: .runtimeSettings)
         try container.encodeIfPresent(runtimeSettingsRevision, forKey: .runtimeSettingsRevision)
         try container.encodeIfPresent(runtimeSettingsUpdatedAt, forKey: .runtimeSettingsUpdatedAt)
         try container.encodeIfPresent(Self.normalizeIdentifier(runtimeSettingsSource), forKey: .runtimeSettingsSource)
@@ -382,20 +402,32 @@ extension CodexThread {
         }
     }
 
+    private func isOpenCodeTimestampPlaceholder(_ value: String?) -> Bool {
+        guard runtimeProvider == .opencode,
+              let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              value.hasPrefix("New session - ") else { return false }
+        return CodexTimestampParser.parseString(String(value.dropFirst("New session - ".count))) != nil
+    }
+
     var displayTitle: String {
         let cleanedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedAgentLabel = agentDisplayLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedPreview = preview?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveTitle = Self.isGenericPlaceholderTitle(cleanedTitle) ? nil : cleanedTitle
+        // OpenCode's generated timestamp can arrive in either title or name.
+        // A real user title with the same prefix but no timestamp stays visible.
+        let effectiveTitle = Self.isGenericPlaceholderTitle(cleanedTitle)
+            || isOpenCodeTimestampPlaceholder(cleanedTitle)
+            ? nil : cleanedTitle
 
         // Prefer explicit thread name (AI/user rename) over server title fallback.
-        if let cleanedName, !cleanedName.isEmpty {
+        if let cleanedName, !cleanedName.isEmpty,
+           !isOpenCodeTimestampPlaceholder(cleanedName) {
             return cleanedName
         }
 
         if let cleanedAgentLabel, !cleanedAgentLabel.isEmpty {
-            if cleanedTitle == nil || Self.isGenericPlaceholderTitle(cleanedTitle) {
+            if effectiveTitle == nil {
                 return cleanedAgentLabel
             }
         }

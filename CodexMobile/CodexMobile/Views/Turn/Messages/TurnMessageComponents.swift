@@ -123,6 +123,7 @@ nonisolated private struct MessageRowMessageSignature: Equatable {
     let proposedPlan: MessageRowProposedPlanSignature?
     let subagentAction: MessageRowSubagentActionSignature?
     let structuredUserInputRequest: MessageRowStructuredInputRequestSignature?
+    let asyncUserInput: CodexAsyncUserInput?
     let autoApprovalReview: MessageRowAutoApprovalReviewSignature?
     let orderIndex: Int
 
@@ -158,6 +159,7 @@ nonisolated private struct MessageRowMessageSignature: Equatable {
         self.subagentAction = message.subagentAction.map(MessageRowSubagentActionSignature.init)
         self.structuredUserInputRequest = message.structuredUserInputRequest
             .map(MessageRowStructuredInputRequestSignature.init)
+        self.asyncUserInput = message.asyncUserInput
         self.autoApprovalReview = message.autoApprovalReview.map(MessageRowAutoApprovalReviewSignature.init)
         self.orderIndex = message.orderIndex
     }
@@ -376,7 +378,7 @@ func timelineDisplayWindow(
     for message: CodexMessage,
     expansionLevel: Int = 0
 ) -> TimelineTextClippingPolicy.DisplayWindow {
-    let rawText = message.text
+    let rawText = timelineActionText(for: message)
     if message.isStreaming, isTimelineStreamingPlaceholder(rawText) {
         return TimelineTextClippingPolicy.DisplayWindow(text: "", isPartial: false, hiddenByteCount: 0)
     }
@@ -414,7 +416,11 @@ private func timelineDisplaySource(for message: CodexMessage) -> String {
     guard message.role == .assistant else {
         return message.text
     }
-    return AssistantGitActionMarkerSanitizer.visibleText(from: message.text)
+    let withoutMemoryMetadata = AssistantMemoryCitationParser.visibleText(
+        in: message.text,
+        isStreaming: message.isStreaming
+    )
+    return AssistantGitActionMarkerSanitizer.visibleText(from: withoutMemoryMetadata)
 }
 
 // Keeps user actions faithful to the visible row text even when display text is clipped.
@@ -439,6 +445,7 @@ func timelineSelectableActionText(_ text: String) -> String? {
 // ─── Message row ────────────────────────────────────────────────────
 
 struct MessageRow: View, Equatable {
+    @Environment(CodexService.self) private var codex
     let message: CodexMessage
     let isRetryAvailable: Bool
     let onRetryUserMessage: (String) -> Void
@@ -576,7 +583,7 @@ struct MessageRow: View, Equatable {
                 }
             }
 
-            if window.isPartial {
+            if window.isPartial && !hasUnresolvedNativeAsyncReply {
                 TimelineShowMoreTextButton(
                     hiddenByteCount: window.hiddenByteCount,
                     onTap: expandVisibleText
@@ -624,14 +631,20 @@ struct MessageRow: View, Equatable {
         actionText: String,
         isProgressiveTextWindow: Bool
     ) -> some View {
-        UserMessageBubble(
+        let visibleText = hasUnresolvedNativeAsyncReply ? "Answers sent from Codex" : text
+        return UserMessageBubble(
             message: message,
-            text: text,
-            actionText: actionText,
-            isProgressiveTextWindow: isProgressiveTextWindow,
-            isRetryAvailable: isRetryAvailable,
+            text: visibleText,
+            actionText: hasUnresolvedNativeAsyncReply ? visibleText : actionText,
+            isProgressiveTextWindow: isProgressiveTextWindow && !hasUnresolvedNativeAsyncReply,
+            isRetryAvailable: isRetryAvailable && message.kind != .asyncUserInputAnswer,
             onRetryUserMessage: onRetryUserMessage
         )
+    }
+
+    private var hasUnresolvedNativeAsyncReply: Bool {
+        message.role == .user
+            && message.text.hasPrefix("<send_user_message_question_reply>\n")
     }
 
     private func assistantView(text: String, actionText: String, renderModel: MessageRowRenderModel) -> some View {
@@ -818,6 +831,28 @@ struct MessageRow: View, Equatable {
                 }
             }
 
+            if let asyncInput = message.asyncUserInput {
+                AsyncUserInputCardView(
+                    input: asyncInput,
+                    onSubmit: { answers in
+                        Task { @MainActor in
+                            await codex.submitAsyncUserInput(
+                                threadId: message.threadId,
+                                messageID: message.id,
+                                answers: answers
+                            )
+                        }
+                    },
+                    onRetry: {
+                        codex.reopenUncertainAsyncUserInputForRetry(
+                            threadId: message.threadId,
+                            messageID: message.id
+                        )
+                    }
+                )
+                .padding(.top, 8)
+            }
+
             if let commentContent, commentContent.hasFindings {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(commentContent.findings) { finding in
@@ -884,36 +919,34 @@ struct MessageRow: View, Equatable {
             .accessibilityLabel(
                 streamingAssistantAccessibilityLabel(for: visibleAssistantTextWithoutImageSyntax)
             )
-            .uiKitContextMenu {
+            // Keep streaming layout in the timeline's SwiftUI tree. A nested
+            // hosting controller can measure before the reveal adopts a delta,
+            // leaving the next tool row positioned at the old text height.
+            .contextMenu {
                 streamingAssistantTextMenu(text: actionText)
             }
         }
     }
 
-    private func streamingAssistantTextMenu(text: String) -> UIMenu {
-        guard let selectableText = timelineSelectableActionText(text) else {
-            return UIMenu()
-        }
-
-        return UIMenu(children: [
-            UIAction(
-                title: "Select Text",
-                image: RemodexIcon.menuUIImage(systemName: "text.cursor")
-            ) { _ in
+    @ViewBuilder
+    private func streamingAssistantTextMenu(text: String) -> some View {
+        if let selectableText = timelineSelectableActionText(text) {
+            Button {
                 HapticFeedback.shared.triggerImpactFeedback(style: .light)
                 selectableTextSheet = SelectableMessageTextSheetState(
                     contentKind: .streamingAssistantMarkdown,
                     text: selectableText
                 )
-            },
-            UIAction(
-                title: "Copy",
-                image: RemodexIcon.menuUIImage(systemName: "doc.on.doc")
-            ) { _ in
+            } label: {
+                Label("Select Text", systemImage: "text.cursor")
+            }
+            Button {
                 HapticFeedback.shared.triggerImpactFeedback(style: .light)
                 UIPasteboard.general.string = selectableText
-            },
-        ])
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+        }
     }
 
     private func streamingAssistantAccessibilityLabel(for text: String) -> String {

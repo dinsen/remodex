@@ -7,12 +7,16 @@ import SwiftUI
 import UIKit
 
 struct SidebarThreadRowView: View {
+    var taskViewMode: SidebarTaskViewMode = .projects
+    var activityDiffTotals: GitDiffTotals? = nil
     let thread: CodexThread
     let isSelected: Bool
     let runBadgeState: CodexThreadRunBadgeState?
     let timingLabel: String?
     let showsTimestampRefreshIndicator: Bool
     let isPinned: Bool
+    var isPinnedRow: Bool = false
+    var pinnedProjectLabel: String? = nil
     let childSubagentCount: Int
     let isSubagentExpanded: Bool
     let onToggleSubagents: (() -> Void)?
@@ -28,17 +32,22 @@ struct SidebarThreadRowView: View {
     // environment values do NOT propagate through a representable-built
     // host, so without this re-injection `SidebarSubagentNameLabel` would
     // fault on `@Environment(CodexService.self)` inside the wrapped row.
-    // The row body itself never touches any property on `codex`, so the
-    // "no service observation in the parent row" invariant documented on
-    // `SidebarSubagentNameLabel` is preserved (only that nested label
-    // subscribes to `codex.subagentIdentityVersion`).
+    // The row body itself never touches any property on `codex`; nested
+    // labels subscribe to identity or runtime state inside that host.
     @Environment(CodexService.self) private var codex
 
     @State private var renamePrompt = ThreadRenamePromptState()
 
     var body: some View {
         Group {
-            if thread.isSubagent {
+            if taskViewMode == .activity {
+                SidebarActivityRowContent(
+                    thread: thread,
+                    projectLabel: pinnedProjectLabel,
+                    diffTotals: activityDiffTotals,
+                    onTap: onTap
+                )
+            } else if thread.isSubagent {
                 subagentRow
             } else {
                 parentRow
@@ -82,7 +91,8 @@ struct SidebarThreadRowView: View {
                 // Keep trailing metadata inside the main stack so long titles truncate before it.
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
-                        if isPinned && !thread.isSubagent {
+                        RuntimeProviderIcon(provider: thread.runtimeProvider)
+                        if isPinnedRow && !thread.isSubagent {
                             SidebarPinIcon(style: .rowBadge)
                         }
 
@@ -148,6 +158,7 @@ struct SidebarThreadRowView: View {
     private var subagentRow: some View {
         HapticButton(action: onTap) {
             HStack(alignment: .center, spacing: 8) {
+                RuntimeProviderIcon(provider: thread.runtimeProvider, size: 17)
                 SidebarSubagentNameLabel(thread: thread)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
