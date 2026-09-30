@@ -16,6 +16,12 @@ private struct CommandExecutionMessageContext {
     let itemId: String?
 }
 
+nonisolated enum CodexIncomingModelPayload: Sendable {
+    case none
+    case runtimeSettings(CodexRuntimeSettings?)
+    case threadStarted(CodexThread?)
+}
+
 // Off-actor wire message classification and JSON-RPC decoding so transport callbacks
 // can parse before dispatching typed results to MainActor.
 nonisolated enum WireMessagePreDecoder {
@@ -35,17 +41,23 @@ nonisolated enum WireMessagePreDecoder {
     ]
     private static let secureKindProbeCharacterLimit = 512
 
-    static func decodeRPCMessage(from text: String) -> Result {
-        guard let data = text.data(using: .utf8) else { return .invalidUTF8 }
+    static func decodeRPCMessage(
+        from text: String,
+        using codec: CodexTransferJSONCodec
+    ) async -> Result {
         do {
-            let message = try JSONDecoder().decode(RPCMessage.self, from: data)
+            let message = try await codec.decodeText(RPCMessage.self, from: text)
             return .message(message)
         } catch {
+            if let codecError = error as? CodexTransferCodecError,
+               case .invalidUTF8 = codecError {
+                return .invalidUTF8
+            }
             return .decodeFailed
         }
     }
 
-    static func classify(_ text: String) -> Classification {
+    static func classify(_ text: String, using codec: CodexTransferJSONCodec) async -> Classification {
         let secureKindProbe = text.prefix(secureKindProbeCharacterLimit)
         if secureKindProbe.contains("\"kind\":") {
             for value in secureKindValues {
@@ -54,44 +66,107 @@ nonisolated enum WireMessagePreDecoder {
                 }
             }
         }
-        return Classification(isSecure: false, rpcResult: decodeRPCMessage(from: text))
+        return Classification(isSecure: false, rpcResult: await decodeRPCMessage(from: text, using: codec))
     }
 }
 
 extension CodexService {
-    func processIncomingText(_ text: String) {
-        guard let payloadData = text.data(using: .utf8) else {
-            return
-        }
-
+    func processIncomingText(_ text: String) async {
+        let generation = transferSessionGeneration
         do {
-            let message = try decoder.decode(RPCMessage.self, from: payloadData)
-            handleIncomingRPCMessage(message)
+            let message = try await transferJSONCodec.decodeText(RPCMessage.self, from: text)
+            _ = await dispatchIncomingRPCMessageOffMain(
+                message,
+                rawText: text,
+                expectedGeneration: generation
+            )
         } catch {
+            guard !Task.isCancelled, transferSessionGeneration == generation else { return }
             lastErrorMessage = "Unable to decode server payload"
         }
     }
 
-    // Handles a pre-decoded RPC message from off-actor transport paths.
-    func handleDecodedRPCResult(_ result: WireMessagePreDecoder.Result, rawText: String) {
+    // Handles a pre-decoded RPC message while keeping model conversion off MainActor.
+    func handleDecodedRPCResult(_ result: WireMessagePreDecoder.Result, rawText: String) async {
+        let generation = transferSessionGeneration
         switch result {
         case .message(let message):
-            lastRawMessage = rawText
-            handleIncomingRPCMessage(message)
+            _ = await dispatchIncomingRPCMessageOffMain(
+                message,
+                rawText: rawText,
+                expectedGeneration: generation
+            )
         case .decodeFailed:
+            guard !Task.isCancelled, transferSessionGeneration == generation else { return }
             lastErrorMessage = "Unable to decode server payload"
         case .invalidUTF8:
             break
         }
     }
 
-    func handleIncomingRPCMessage(_ message: RPCMessage) {
+    func prepareIncomingModelPayloadOffMain(for message: RPCMessage) async -> CodexIncomingModelPayload {
+        guard let method = message.method else { return .none }
+        return await prepareIncomingModelPayloadOffMain(method: method, params: message.params)
+    }
+
+    private func prepareIncomingModelPayloadOffMain(
+        method: String,
+        params: JSONValue?
+    ) async -> CodexIncomingModelPayload {
+        let normalizedMethod = normalizedIncomingMethodName(method)
+        if normalizedMethod == "remodex/runtimeSettings/updated",
+           let value = params?.objectValue?["runtimeSettings"] {
+            return .runtimeSettings(await decodeModelOffMain(CodexRuntimeSettings.self, from: value))
+        }
+        if normalizedMethod == "thread/started",
+           let threadValue = params?.objectValue?["thread"] {
+            return .threadStarted(await decodeModelOffMain(
+                CodexThread.self,
+                from: threadValue,
+                omittingTopLevelKeys: ["turns"]
+            ))
+        }
+        return .none
+    }
+
+    func dispatchIncomingRPCMessageOffMain(
+        _ message: RPCMessage,
+        rawText: String?,
+        expectedGeneration: UUID
+    ) async -> Bool {
+        guard !Task.isCancelled, transferSessionGeneration == expectedGeneration else { return false }
+        let preparedPayload = await prepareIncomingModelPayloadOffMain(for: message)
+        guard !Task.isCancelled, transferSessionGeneration == expectedGeneration else { return false }
+        if let rawText {
+            lastRawMessage = rawText
+        }
+        handleIncomingRPCMessage(message, decodedModelPayload: preparedPayload)
+        return true
+    }
+
+    func handleNotificationOffMain(method: String, params: JSONValue?) async -> Bool {
+        let generation = transferSessionGeneration
+        guard !Task.isCancelled else { return false }
+        let preparedPayload = await prepareIncomingModelPayloadOffMain(method: method, params: params)
+        guard !Task.isCancelled, transferSessionGeneration == generation else { return false }
+        handleNotification(method: normalizedIncomingMethodName(method), params: params, decodedModelPayload: preparedPayload)
+        return true
+    }
+
+    func handleIncomingRPCMessage(
+        _ message: RPCMessage,
+        decodedModelPayload: CodexIncomingModelPayload = .none
+    ) {
         if let method = message.method {
             let normalizedMethod = normalizedIncomingMethodName(method)
             if let requestID = message.id {
                 handleServerRequest(method: normalizedMethod, requestID: requestID, params: message.params)
             } else {
-                handleNotification(method: normalizedMethod, params: message.params)
+                handleNotification(
+                    method: normalizedMethod,
+                    params: message.params,
+                    decodedModelPayload: decodedModelPayload
+                )
             }
             return
         }
@@ -176,11 +251,15 @@ extension CodexService {
     }
 
     // Handles stream notifications to keep UI state in sync.
-    func handleNotification(method: String, params: JSONValue?) {
+    func handleNotification(
+        method: String,
+        params: JSONValue?,
+        decodedModelPayload: CodexIncomingModelPayload = .none
+    ) {
         if method == "remodex/runtimeSettings/updated",
            let threadId = params?.objectValue?["threadId"]?.stringValue,
-           let value = params?.objectValue?["runtimeSettings"],
-           let settings = decodeModel(CodexRuntimeSettings.self, from: value) {
+           case .runtimeSettings(let settings) = decodedModelPayload,
+           let settings {
             applyConfirmedRuntimeSettings(settings, threadId: threadId)
             return
         }
@@ -278,7 +357,9 @@ extension CodexService {
             handleRealtimeVoiceEvent(paramsObject)
 
         case "thread/started":
-            handleThreadStarted(paramsObject)
+            if case .threadStarted(let thread) = decodedModelPayload {
+                handleThreadStarted(paramsObject, decodedThread: thread)
+            }
 
         case "thread/name/updated":
             handleThreadNameUpdated(paramsObject)
@@ -637,10 +718,11 @@ extension CodexService {
         return true
     }
 
-    private func handleThreadStarted(_ paramsObject: IncomingParamsObject?) {
-        guard let paramsObject,
-              let threadValue = paramsObject["thread"],
-              let thread = decodeModel(CodexThread.self, from: threadValue) else {
+    private func handleThreadStarted(
+        _ paramsObject: IncomingParamsObject?,
+        decodedThread thread: CodexThread?
+    ) {
+        guard let paramsObject, let thread else {
             return
         }
 
@@ -3715,7 +3797,7 @@ extension CodexService {
         return nil
     }
 
-    func normalizedIdentifier(_ candidate: String?) -> String? {
+    nonisolated func normalizedIdentifier(_ candidate: String?) -> String? {
         guard let candidate else {
             return nil
         }

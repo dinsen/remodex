@@ -6,6 +6,17 @@
 
 import Foundation
 
+@MainActor
+final class CodexTerminalOutputTransferQueue {
+    let instanceId: String
+    var pendingChunks: [Data] = []
+    var drainTask: Task<Void, Never>?
+
+    init(instanceId: String) {
+        self.instanceId = instanceId
+    }
+}
+
 extension CodexService {
     static let defaultTerminalId = "term-1"
 
@@ -47,6 +58,8 @@ extension CodexService {
         var profileForSave = normalizedProfile
         profileForSave.cwd = ""
         let instanceId = UUID().uuidString
+        terminalOutputTransferQueuesById[terminalId]?.drainTask?.cancel()
+        terminalOutputTransferQueuesById[terminalId] = CodexTerminalOutputTransferQueue(instanceId: instanceId)
         let terminal = nativeTerminal(for: terminalId)
         terminalProfile = profileForSave
         RemodexTerminalProfileStore.save(profileForSave)
@@ -88,9 +101,11 @@ extension CodexService {
                 },
                 onOutput: { [weak self] data in
                     guard self?.isCurrentTerminalInstance(instanceId, terminalId: terminalId) == true else { return }
-                    self?.updateTerminalSnapshot(for: terminalId) { snapshot in
-                        snapshot.appendOutput(data)
-                    }
+                    self?.enqueueTerminalOutput(
+                        data,
+                        terminalId: terminalId,
+                        instanceId: instanceId
+                    )
                 },
                 onFinished: { [weak self] error in
                     guard let self else { return }
@@ -130,7 +145,14 @@ extension CodexService {
     }
 
     func writeTerminalInput(_ text: String) async throws {
-        try await writeTerminalInput(Data(text.utf8))
+        try await writeTerminalInput(text, terminalId: Self.defaultTerminalId)
+    }
+
+    func writeTerminalInput(_ text: String, terminalId: String) async throws {
+        let data = try await CodexTransferWork.runMedia {
+            Data(text.utf8)
+        }
+        try await writeTerminalInput(data, terminalId: terminalId)
     }
 
     func resizeTerminal(cols: Int, rows: Int) async throws {
@@ -168,10 +190,7 @@ extension CodexService {
             snapshot.cwd = trimmedCWD
         }
         guard terminalSnapshot(for: terminalId).status == .running else { return }
-        try await writeTerminalInput(
-            Data(shellChangeDirectoryCommand(for: trimmedCWD).utf8),
-            terminalId: terminalId
-        )
+        try await writeTerminalInput(shellChangeDirectoryCommand(for: trimmedCWD), terminalId: terminalId)
     }
 
     func closeTerminal() async throws {
@@ -180,6 +199,7 @@ extension CodexService {
 
     func closeTerminal(terminalId: String) async throws {
         await nativeTerminal(for: terminalId).close()
+        terminalOutputTransferQueuesById.removeValue(forKey: terminalId)?.drainTask?.cancel()
         updateTerminalSnapshot(for: terminalId) { snapshot in
             snapshot.status = .closed
             snapshot.errorMessage = nil
@@ -197,10 +217,69 @@ extension CodexService {
     private func sendInitialTerminalDirectoryCommandIfNeeded(_ cwd: String, terminalId: String) async {
         let trimmedCWD = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedCWD.isEmpty else { return }
-        try? await writeTerminalInput(
-            Data(shellChangeDirectoryCommand(for: trimmedCWD).utf8),
-            terminalId: terminalId
-        )
+        try? await writeTerminalInput(shellChangeDirectoryCommand(for: trimmedCWD), terminalId: terminalId)
+    }
+
+    private func enqueueTerminalOutput(_ data: Data, terminalId: String, instanceId: String) {
+        guard !data.isEmpty,
+              isCurrentTerminalInstance(instanceId, terminalId: terminalId),
+              let queue = terminalOutputTransferQueuesById[terminalId],
+              queue.instanceId == instanceId else {
+            return
+        }
+        queue.pendingChunks.append(data)
+        guard queue.drainTask == nil else { return }
+        queue.drainTask = Task { @MainActor [weak self, weak queue] in
+            guard let self, let queue else { return }
+            await self.drainTerminalOutput(queue, terminalId: terminalId)
+        }
+    }
+
+    private func drainTerminalOutput(_ queue: CodexTerminalOutputTransferQueue, terminalId: String) async {
+        defer {
+            if terminalOutputTransferQueuesById[terminalId] === queue {
+                queue.drainTask = nil
+                if !queue.pendingChunks.isEmpty {
+                    queue.drainTask = Task { @MainActor [weak self, weak queue] in
+                        guard let self, let queue else { return }
+                        await self.drainTerminalOutput(queue, terminalId: terminalId)
+                    }
+                }
+            }
+        }
+
+        while !Task.isCancelled,
+              terminalOutputTransferQueuesById[terminalId] === queue,
+              isCurrentTerminalInstance(queue.instanceId, terminalId: terminalId) {
+            let chunks = queue.pendingChunks
+            queue.pendingChunks.removeAll(keepingCapacity: true)
+            guard !chunks.isEmpty else { return }
+            let currentSnapshot = terminalSnapshot(for: terminalId)
+
+            let updatedBuffer: RemodexTerminalSnapshot
+            do {
+                updatedBuffer = try await CodexTransferWork.runMedia {
+                    var updated = currentSnapshot
+                    for chunk in chunks {
+                        updated.appendOutput(chunk)
+                    }
+                    return updated
+                }
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled,
+                  terminalOutputTransferQueuesById[terminalId] === queue,
+                  isCurrentTerminalInstance(queue.instanceId, terminalId: terminalId) else {
+                return
+            }
+            var latestSnapshot = terminalSnapshot(for: terminalId)
+            latestSnapshot.buffer = updatedBuffer.buffer
+            latestSnapshot.bufferData = updatedBuffer.bufferData
+            latestSnapshot.bracketedPasteEnabled = updatedBuffer.bracketedPasteEnabled
+            setTerminalSnapshot(latestSnapshot, for: terminalId)
+        }
     }
 
     private func applyConnectedTerminalSizeAndDirectory(instanceId: String, terminalId: String, cwd: String) {

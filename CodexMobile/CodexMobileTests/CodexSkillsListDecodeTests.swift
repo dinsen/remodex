@@ -96,7 +96,7 @@ final class CodexSkillsListDecodeTests: XCTestCase {
         XCTAssertEqual(archivedParams["limit"]?.intValue, 10)
     }
 
-    func testDecodeSkillsListParsesBucketedDataShape() {
+    func testDecodeSkillsListParsesBucketedDataShape() async {
         let service = makeService()
         let result: JSONValue = .object([
             "data": .array([
@@ -115,7 +115,7 @@ final class CodexSkillsListDecodeTests: XCTestCase {
             ]),
         ])
 
-        let skills = service.decodeSkillMetadata(from: result)
+        let skills = await service.decodeSkillMetadata(from: result)
 
         XCTAssertEqual(skills?.count, 1)
         XCTAssertEqual(skills?.first?.name, "review")
@@ -124,7 +124,7 @@ final class CodexSkillsListDecodeTests: XCTestCase {
         XCTAssertEqual(skills?.first?.enabled, true)
     }
 
-    func testDecodeSkillsListParsesFlatSkillsShape() {
+    func testDecodeSkillsListParsesFlatSkillsShape() async {
         let service = makeService()
         let result: JSONValue = .object([
             "skills": .array([
@@ -138,7 +138,7 @@ final class CodexSkillsListDecodeTests: XCTestCase {
             ]),
         ])
 
-        let skills = service.decodeSkillMetadata(from: result)
+        let skills = await service.decodeSkillMetadata(from: result)
 
         XCTAssertEqual(skills?.count, 1)
         XCTAssertEqual(skills?.first?.name, "check-code")

@@ -117,7 +117,7 @@ final class CodexRealtimeVoiceConnection {
         guard state == .connected else {
             throw CodexServiceError.invalidInput("Voice connection is not active.")
         }
-        let normalized = base64PCM.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = try await CodexTransferWork.trimWhitespace(base64PCM)
         guard !normalized.isEmpty else {
             throw CodexServiceError.invalidInput("Live Voice audio was empty.")
         }
@@ -420,6 +420,10 @@ final class CodexLiveVoiceCoordinator {
     private var pendingSendTask: Task<Void, Never>?
     private var pendingAudioChunks: [Data] = []
     private var pendingAudioBytes = 0
+    private var pendingOutputAudioBase64: [String] = []
+    private var pendingOutputAudioReadIndex = 0
+    private var outputAudioDrainTask: Task<Void, Never>?
+    private var outputAudioDrainID: UUID?
     private(set) var pendingAudioChunkCount = 0
     private(set) var isRunning = false
 
@@ -478,11 +482,9 @@ final class CodexLiveVoiceCoordinator {
         guard case .object(let object) = event else { return }
         let type = object["type"]?.stringValue ?? ""
         if type == "session.output_audio.delta",
-           let encodedAudio = object["delta"]?.stringValue,
-           let data = Data(base64Encoded: encodedAudio),
-           !data.isEmpty,
-           data.count % MemoryLayout<Int16>.size == 0 {
-            playback.enqueuePCM16(data)
+           let encodedAudio = object["delta"]?.stringValue {
+            pendingOutputAudioBase64.append(encodedAudio)
+            startOutputAudioDrainIfNeeded()
         }
         if type == "session.closed" || type == "error" {
             stop(closeConnection: false)
@@ -530,11 +532,48 @@ final class CodexLiveVoiceCoordinator {
             pendingAudioBytes -= data.count
             pendingAudioChunkCount = pendingAudioChunks.count
             do {
-                try await connection.sendAudio(base64PCM: data.base64EncodedString())
+                let base64PCM = try await CodexTransferWork.encodeBase64(data)
+                try await connection.sendAudio(base64PCM: base64PCM)
             } catch {
                 stop(closeConnection: true)
                 return
             }
+        }
+    }
+
+    private func startOutputAudioDrainIfNeeded() {
+        guard outputAudioDrainTask == nil else { return }
+        let drainID = UUID()
+        outputAudioDrainID = drainID
+        outputAudioDrainTask = Task { @MainActor [weak self] in
+            await self?.drainOutputAudioQueue(drainID: drainID)
+        }
+    }
+
+    private func drainOutputAudioQueue(drainID: UUID) async {
+        defer {
+            if outputAudioDrainID == drainID {
+                outputAudioDrainTask = nil
+                outputAudioDrainID = nil
+                if pendingOutputAudioReadIndex < pendingOutputAudioBase64.count {
+                    startOutputAudioDrainIfNeeded()
+                } else {
+                    pendingOutputAudioBase64.removeAll(keepingCapacity: false)
+                    pendingOutputAudioReadIndex = 0
+                }
+            }
+        }
+
+        while !Task.isCancelled, pendingOutputAudioReadIndex < pendingOutputAudioBase64.count {
+            let encodedAudio = pendingOutputAudioBase64[pendingOutputAudioReadIndex]
+            pendingOutputAudioReadIndex += 1
+            guard let data = await CodexTransferWork.decodeBase64(encodedAudio),
+                  !data.isEmpty,
+                  data.count % MemoryLayout<Int16>.size == 0,
+                  !Task.isCancelled else {
+                continue
+            }
+            playback.enqueuePCM16(data)
         }
     }
 
@@ -560,6 +599,11 @@ final class CodexLiveVoiceCoordinator {
         pendingAudioChunks.removeAll(keepingCapacity: false)
         pendingAudioBytes = 0
         pendingAudioChunkCount = 0
+        outputAudioDrainID = nil
+        outputAudioDrainTask?.cancel()
+        outputAudioDrainTask = nil
+        pendingOutputAudioBase64.removeAll(keepingCapacity: false)
+        pendingOutputAudioReadIndex = 0
         if closeConnection {
             connection?.close()
         }

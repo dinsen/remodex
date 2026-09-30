@@ -160,11 +160,13 @@ extension CodexService {
             }
             while !Task.isCancelled, self.isConnected {
                 var sent: RPCObject = [:]
+                let transferGeneration = self.transferSessionGeneration
                 do {
                     // Reconnect clears the runtime's loaded tasks and Desktop
                     // ownership probes. Use the existing resume path before editing.
                     try await self.ensureThreadResumed(threadId: threadId)
                     guard !Task.isCancelled, self.runtimeSettingsUpdateIDs[threadId] == identifier,
+                          self.transferSessionGeneration == transferGeneration,
                           !self.usesOpenCodeRuntime(threadId: threadId),
                           let pending = self.threadRuntimeOverride(for: threadId)?.pendingRuntimeSettings,
                           !pending.isEmpty else { return }
@@ -172,10 +174,17 @@ extension CodexService {
                     var params = sent
                     params["threadId"] = .string(threadId)
                     let response = try await self.sendRequest(method: "thread/settings/update", params: .object(params))
-                    guard !Task.isCancelled, self.runtimeSettingsUpdateIDs[threadId] == identifier else { return }
-                    if let value = response.result?.objectValue?["runtimeSettings"],
-                       let settings = self.decodeModel(CodexRuntimeSettings.self, from: value) {
-                        self.applyConfirmedRuntimeSettings(settings, threadId: threadId)
+                    guard !Task.isCancelled,
+                          self.runtimeSettingsUpdateIDs[threadId] == identifier,
+                          self.transferSessionGeneration == transferGeneration else { return }
+                    if let value = response.result?.objectValue?["runtimeSettings"] {
+                        let settings = await self.decodeModelOffMain(CodexRuntimeSettings.self, from: value)
+                        guard !Task.isCancelled,
+                              self.runtimeSettingsUpdateIDs[threadId] == identifier,
+                              self.transferSessionGeneration == transferGeneration else { return }
+                        if let settings {
+                            self.applyConfirmedRuntimeSettings(settings, threadId: threadId)
+                        }
                     }
                     if var current = self.threadRuntimeOverride(for: threadId) {
                         for (key, value) in sent where current.pendingRuntimeSettings[key] == value {
@@ -189,7 +198,9 @@ extension CodexService {
                         self.applyConfirmedRuntimeSettings(confirmed, threadId: threadId)
                     }
                 } catch {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled,
+                          self.runtimeSettingsUpdateIDs[threadId] == identifier,
+                          self.transferSessionGeneration == transferGeneration else { return }
                     // A newer edit supersedes this failed request. Send that choice
                     // instead of leaving the queue stuck on an obsolete error.
                     if !sent.isEmpty,

@@ -84,6 +84,7 @@ extension CodexService {
             }
             throw CodexServiceError.invalidInput(friendlyMessage)
         }
+        invalidateTransferSocket()
         switch transport {
         case .network(let connection):
             usesManualWebSocketTransport = false
@@ -754,6 +755,7 @@ extension CodexService {
     // Removes the current socket reference before reconnect/teardown logic mutates shared state.
     private func cancelCurrentSocketConnection() {
         stopWebSocketKeepAliveLoop()
+        invalidateTransferSocket()
 
         if let connection = webSocketConnection {
             connection.stateUpdateHandler = nil

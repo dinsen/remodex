@@ -303,9 +303,9 @@ final class CodexTurnInputPayloadSkillTests: XCTestCase {
         XCTAssertEqual(mentionItem?["path"]?.stringValue, "plugin://gmail@openai-curated")
     }
 
-    func testDecodePluginMetadataFiltersMarketplaceFieldsIntoMentionPath() {
+    func testDecodePluginMetadataFiltersMarketplaceFieldsIntoMentionPath() async {
         let service = makeService()
-        let plugins = service.decodePluginMetadata(
+        let plugins = await service.decodePluginMetadata(
             from: .object([
                 "marketplaces": .array([
                     .object([
@@ -334,9 +334,9 @@ final class CodexTurnInputPayloadSkillTests: XCTestCase {
         XCTAssertEqual(plugins?.first?.displayTitle, "Gmail")
     }
 
-    func testDecodePluginMetadataMarksDefaultInstalledPluginsMentionable() {
+    func testDecodePluginMetadataMarksDefaultInstalledPluginsMentionable() async {
         let service = makeService()
-        let plugins = service.decodePluginMetadata(
+        let plugins = await service.decodePluginMetadata(
             from: .object([
                 "marketplaces": .array([
                     .object([

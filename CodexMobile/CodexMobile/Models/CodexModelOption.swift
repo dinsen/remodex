@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let model: String
     let displayName: String
@@ -198,7 +198,7 @@ struct CodexModelOption: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-private enum CodexModelCapabilityResolver {
+nonisolated private enum CodexModelCapabilityResolver {
     // Mirrors the desktop capability table only when older bridges omit explicit model speed metadata.
     private static let staticFastModeModelIdentifiers: Set<String> = [
         "gpt-5.6-sol",

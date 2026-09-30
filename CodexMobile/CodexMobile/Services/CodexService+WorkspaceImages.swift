@@ -224,11 +224,9 @@ extension CodexService {
 
 private enum WorkspaceImageBase64Decoder {
     static func decode(_ dataBase64: String) async throws -> Data {
-        try await Task.detached(priority: .userInitiated) {
-            guard let data = Data(base64Encoded: dataBase64) else {
-                throw CodexServiceError.invalidResponse("Image preview response did not include valid image data.")
-            }
-            return data
-        }.value
+        guard let data = await CodexTransferWork.decodeBase64(dataBase64) else {
+            throw CodexServiceError.invalidResponse("Image preview response did not include valid image data.")
+        }
+        return data
     }
 }

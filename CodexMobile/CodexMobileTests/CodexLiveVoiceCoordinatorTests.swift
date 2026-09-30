@@ -31,6 +31,8 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
     func testCaptureChunkIsEncodedAndSentThroughBridgeConnection() async throws {
         var sentMethods: [String] = []
         var sentParams: [JSONValue?] = []
+        let audioSentExpectation = expectation(description: "audio chunk reaches bridge sender")
+        audioSentExpectation.assertForOverFulfill = true
         let connection = CodexRealtimeVoiceConnection(
             session: CodexRealtimeVoiceSession(
                 sessionID: "live-session-test",
@@ -40,6 +42,9 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
         ) { method, params in
             sentMethods.append(method)
             sentParams.append(params)
+            if method == "voice/realtime/audio" {
+                audioSentExpectation.fulfill()
+            }
             return RPCMessage(
                 id: .string(UUID().uuidString),
                 result: .object([:]),
@@ -57,17 +62,16 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
         try await connection.connect()
         try coordinator.start()
         capture.emit(Data([0x01, 0x02, 0x03, 0x04]))
-        await Task.yield()
+        await fulfillment(of: [audioSentExpectation], timeout: 1)
 
         XCTAssertEqual(sentMethods, ["voice/realtime/audio"])
+        let sentParameters = try XCTUnwrap(sentParams.first ?? nil)
         XCTAssertEqual(
-            sentParams.first?.objectValue?[
-                "sessionId"
-            ]?.stringValue,
+            sentParameters.objectValue?["sessionId"]?.stringValue,
             "live-session-test"
         )
         XCTAssertEqual(
-            sentParams.first?.objectValue?["audio"]?.stringValue,
+            sentParameters.objectValue?["audio"]?.stringValue,
             Data([0x01, 0x02, 0x03, 0x04]).base64EncodedString()
         )
 
@@ -77,6 +81,8 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
     func testDelayedBridgeSenderKeepsCaptureQueueBounded() async throws {
         var sendCount = 0
         var releaseFirstSend: CheckedContinuation<RPCMessage, Never>?
+        let firstAudioSendEntered = expectation(description: "first audio send is held by the bridge")
+        firstAudioSendEntered.assertForOverFulfill = true
         let connection = CodexRealtimeVoiceConnection(
             session: CodexRealtimeVoiceSession(
                 sessionID: "live-session-test",
@@ -88,6 +94,7 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
             if method == "voice/realtime/audio", sendCount == 1 {
                 return await withCheckedContinuation { continuation in
                     releaseFirstSend = continuation
+                    firstAudioSendEntered.fulfill()
                 }
             }
             return RPCMessage(
@@ -109,12 +116,13 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
         for index in 0..<64 {
             capture.emit(Data([UInt8(index & 0xff), 0x00]))
         }
-        for _ in 0..<4 {
-            await Task.yield()
-        }
+        await fulfillment(of: [firstAudioSendEntered], timeout: 1)
 
+        XCTAssertEqual(sendCount, 1)
         XCTAssertLessThanOrEqual(coordinator.pendingAudioChunkCount, 8)
-        releaseFirstSend?.resume(returning: RPCMessage(
+        let firstSendContinuation = try XCTUnwrap(releaseFirstSend)
+        releaseFirstSend = nil
+        firstSendContinuation.resume(returning: RPCMessage(
             id: .string("released"),
             result: .object([:]),
             includeJSONRPC: false
@@ -147,11 +155,14 @@ final class CodexLiveVoiceCoordinatorTests: XCTestCase {
         try await connection.connect()
         try coordinator.start()
         let pcm = Data([0x10, 0x11, 0x12, 0x13])
+        let playbackExpectation = expectation(description: "decoded provider audio reaches playback")
+        playback.onEnqueue = { playbackExpectation.fulfill() }
         coordinator.handleProviderEvent(.object([
             "type": .string("session.output_audio.delta"),
             "delta": .string(pcm.base64EncodedString()),
         ]))
 
+        await fulfillment(of: [playbackExpectation], timeout: 1)
         XCTAssertEqual(playback.chunks, [pcm])
         coordinator.stop()
     }
@@ -172,9 +183,11 @@ private final class FakeLiveVoiceCapture: CodexLiveVoiceCapture {
 @MainActor
 private final class FakeLiveVoicePlayback: CodexLiveVoicePlayback {
     var chunks: [Data] = []
+    var onEnqueue: (@MainActor () -> Void)?
 
     func enqueuePCM16(_ data: Data) {
         chunks.append(data)
+        onEnqueue?()
     }
 
     func stop() {}

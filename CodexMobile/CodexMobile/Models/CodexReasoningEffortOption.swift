@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexReasoningEffortOption: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexReasoningEffortOption: Identifiable, Codable, Hashable, Sendable {
     let reasoningEffort: String
     let description: String
 

@@ -7,7 +7,7 @@
 import CryptoKit
 import Foundation
 
-fileprivate struct UserMessageSemanticKey: Equatable {
+nonisolated fileprivate struct UserMessageSemanticKey: Equatable {
     let text: String
     let skillMentions: Set<String>
     let pluginMentions: Set<String>
@@ -17,22 +17,27 @@ fileprivate struct UserMessageSemanticKey: Equatable {
     }
 }
 
-fileprivate struct CanonicalAssistantTurnKey: Hashable {
+nonisolated fileprivate struct CanonicalAssistantTurnKey: Hashable {
     let threadId: String
     let turnId: String
 }
 
-fileprivate struct CanonicalAssistantSourceKey: Hashable {
+nonisolated fileprivate struct CanonicalAssistantSourceKey: Hashable {
     let threadId: String
     let turnId: String
     let sourceItemKey: String
     let text: String
 }
 
-fileprivate struct CanonicalAssistantTurnTextKey: Hashable {
+nonisolated fileprivate struct CanonicalAssistantTurnTextKey: Hashable {
     let threadId: String
     let turnId: String
     let text: String
+}
+
+nonisolated struct CodexHistoryDecodeResult: Sendable {
+    let messages: [CodexMessage]
+    let subagentIdentityItems: [[String: JSONValue]]
 }
 
 extension CodexService {
@@ -93,14 +98,101 @@ extension CodexService {
         }
     }
 
-    // Decodes app-server turn arrays into a chronological message timeline.
+    // Keeps the synchronous parser for focused callers/tests while production rehydration
+    // uses the explicit transfer worker below. Stateful identity ingestion remains on MainActor.
     func decodeMessagesFromThreadRead(threadId: String, threadObject: [String: JSONValue]) -> [CodexMessage] {
         let baseDate = decodeHistoryBaseDate(from: threadObject, threadId: threadId)
+        let allowsAsyncUserInput = thread(for: threadId)?.runtimeProvider != .opencode
+        let decoded = decodeHistoryMessages(
+            threadId: threadId,
+            threadObject: threadObject,
+            baseDate: baseDate,
+            allowsAsyncUserInput: allowsAsyncUserInput,
+            assertOffMain: false
+        )
+        for item in decoded.subagentIdentityItems {
+            ingestSubagentIdentityMetadata(from: item)
+        }
+        return decoded.messages
+    }
+
+    func currentHistoryDecodeToken(for threadId: String) -> CodexHistoryDecodeToken {
+        CodexHistoryDecodeToken(
+            threadId: threadId,
+            threadGeneration: currentPerThreadRefreshGeneration(for: threadId),
+            contextGeneration: historyDecodeContextGeneration
+        )
+    }
+
+    func isHistoryDecodeTokenCurrent(_ token: CodexHistoryDecodeToken) -> Bool {
+        !Task.isCancelled && historyDecodeTokenMatchesCurrent(token)
+    }
+
+    // Used for owner cleanup that must still run for a cancelled task, but must not
+    // touch bookkeeping owned by a removed thread or a newer connection context.
+    func historyDecodeTokenMatchesCurrent(_ token: CodexHistoryDecodeToken) -> Bool {
+        token == currentHistoryDecodeToken(for: token.threadId)
+    }
+
+    // Applies semantic history side effects only after its owning thread and connection context
+    // still match the request captured before the worker await. An empty message list is valid;
+    // nil means the result became stale or its caller was cancelled.
+    func commitHistoryDecodeResult(
+        _ result: CodexHistoryDecodeResult,
+        token: CodexHistoryDecodeToken
+    ) -> [CodexMessage]? {
+        let currentToken = currentHistoryDecodeToken(for: token.threadId)
+        let didCommit = CodexHistoryDecodeCommit.commitIfCurrent(
+            captured: token,
+            current: currentToken,
+            taskIsCancelled: Task.isCancelled
+        ) {
+            for item in result.subagentIdentityItems {
+                ingestSubagentIdentityMetadata(from: item)
+            }
+        }
+        return didCommit ? result.messages : nil
+    }
+
+    // Snapshots actor-owned decode context on MainActor, then moves the semantic history walk
+    // and message construction to the explicit serial transfer worker. This function has no
+    // actor-owned side effects; callers must validate their captured decode token before commit.
+    func decodeMessagesFromThreadReadOffMain(
+        threadId: String,
+        threadObject: [String: JSONValue]
+    ) async throws -> CodexHistoryDecodeResult {
+        try Task.checkCancellation()
+        let baseDate = decodeHistoryBaseDate(from: threadObject, threadId: threadId)
+        let allowsAsyncUserInput = thread(for: threadId)?.runtimeProvider != .opencode
+        let decoded = try await CodexTransferWork.run {
+            self.decodeHistoryMessages(
+                threadId: threadId,
+                threadObject: threadObject,
+                baseDate: baseDate,
+                allowsAsyncUserInput: allowsAsyncUserInput,
+                assertOffMain: true
+            )
+        }
+        try Task.checkCancellation()
+        return decoded
+    }
+
+    private nonisolated func decodeHistoryMessages(
+        threadId: String,
+        threadObject: [String: JSONValue],
+        baseDate: Date,
+        allowsAsyncUserInput: Bool,
+        assertOffMain: Bool
+    ) -> CodexHistoryDecodeResult {
+        if assertOffMain {
+            CodexTransferWork.assertOffMainThread()
+        }
         let threadTimeZoneIdentifier = decodeHistoryTimeZoneIdentifier(from: threadObject)
         let turns = threadObject["turns"]?.arrayValue ?? []
 
         var offset: TimeInterval = 0
         var result: [CodexMessage] = []
+        var subagentIdentityItems: [[String: JSONValue]] = []
 
         for turnValue in turns {
             guard let turnObject = turnValue.objectValue else { continue }
@@ -161,7 +253,7 @@ extension CodexService {
                         timeZoneIdentifier: timeZoneIdentifier,
                         attachments: imageAttachments,
                         asyncUserInput: normalizedItemType(itemType) == "agentmessage"
-                            && thread(for: threadId)?.runtimeProvider != .opencode
+                            && allowsAsyncUserInput
                             ? CodexAsyncUserInput.decode(from: itemObject) : nil
                     )
 
@@ -372,14 +464,15 @@ extension CodexService {
                             : (turnCompleted ? .resultReady : .resultClosed)
                     )
 
-                case let collabType where collabType == "collabagenttoolcall"
+        case let collabType where collabType == "collabagenttoolcall"
                     || collabType == "collabtoolcall"
                     || collabType.hasPrefix("collabagentspawn")
                     || collabType.hasPrefix("collabwaiting")
                     || collabType.hasPrefix("collabclose")
                     || collabType.hasPrefix("collabresume")
                     || collabType.hasPrefix("collabagentinteraction"):
-                    guard let subagentAction = decodeSubagentActionItem(from: itemObject) else {
+                    subagentIdentityItems.append(itemObject)
+                    guard let subagentAction = decodeSubagentActionPayload(from: itemObject) else {
                         continue
                     }
                     appendHistoryMessage(
@@ -401,10 +494,13 @@ extension CodexService {
             }
         }
 
-        if thread(for: threadId)?.runtimeProvider != .opencode {
+        if allowsAsyncUserInput {
             CodexAsyncUserInputProjection.reconcile(&result)
         }
-        return Self.historyMessagesMergingGeneratedImageArtifacts(result)
+        return CodexHistoryDecodeResult(
+            messages: Self.historyMessagesMergingGeneratedImageArtifacts(result),
+            subagentIdentityItems: subagentIdentityItems
+        )
     }
 
     // Extracts persisted turn outcomes from canonical history so render grouping survives app relaunch.
@@ -486,7 +582,7 @@ extension CodexService {
         CodexTimestampParser.decodeUnixTimestamp(rawValue)
     }
 
-    func decodeItemText(from itemObject: [String: JSONValue]) -> String {
+    nonisolated func decodeItemText(from itemObject: [String: JSONValue]) -> String {
         let contentItems = itemObject["content"]?.arrayValue ?? []
 
         let textParts = contentItems.compactMap { value -> String? in
@@ -552,7 +648,7 @@ extension CodexService {
         return ""
     }
 
-    func decodeHistorySkillMentions(from itemObject: [String: JSONValue]) -> [String] {
+    nonisolated func decodeHistorySkillMentions(from itemObject: [String: JSONValue]) -> [String] {
         let contentItems = itemObject["content"]?.arrayValue ?? []
         var mentions: [String] = []
         var seen: Set<String> = []
@@ -578,7 +674,7 @@ extension CodexService {
         return mentions
     }
 
-    func decodeHistoryPluginMentions(from itemObject: [String: JSONValue]) -> [String] {
+    nonisolated func decodeHistoryPluginMentions(from itemObject: [String: JSONValue]) -> [String] {
         let contentItems = itemObject["content"]?.arrayValue ?? []
         var mentions: [String] = []
         var seen: Set<String> = []
@@ -605,7 +701,7 @@ extension CodexService {
         return mentions
     }
 
-    func decodeGeneratedImageMarkdown(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeGeneratedImageMarkdown(from itemObject: [String: JSONValue]) -> String? {
         let imagePath = firstNonEmptyString([
             itemObject["saved_path"]?.stringValue,
             itemObject["savedPath"]?.stringValue,
@@ -646,7 +742,7 @@ extension CodexService {
 
     // Extracts history image payloads into attachments. Small inline data URLs are preserved
     // so mobile can preview images that are outside the workspace allowlist.
-    func decodeImageAttachments(from itemObject: [String: JSONValue]) -> [CodexImageAttachment] {
+    nonisolated func decodeImageAttachments(from itemObject: [String: JSONValue]) -> [CodexImageAttachment] {
         let contentItems = itemObject["content"]?.arrayValue ?? []
         var attachments: [CodexImageAttachment] = []
 
@@ -684,12 +780,12 @@ extension CodexService {
         return attachments
     }
 
-    private func shouldPreserveHistoryImagePayload(_ payloadDataURL: String?) -> Bool {
+    private nonisolated func shouldPreserveHistoryImagePayload(_ payloadDataURL: String?) -> Bool {
         guard let payloadDataURL else { return false }
         return payloadDataURL.utf8.count <= Self.historyInlineImagePayloadStorageByteLimit
     }
 
-    func decodeImageAttachmentSourceURL(from object: [String: JSONValue]) -> String? {
+    nonisolated func decodeImageAttachmentSourceURL(from object: [String: JSONValue]) -> String? {
         decodeHistoryFirstString(
             forAnyKey: ["url", "image_url", "imageUrl", "path"],
             in: .object(object),
@@ -1911,7 +2007,7 @@ extension CodexService {
         return stablePrefix + filteredTail
     }
 
-    func decodeHistoryTimestamp(from object: [String: JSONValue]) -> Date? {
+    nonisolated func decodeHistoryTimestamp(from object: [String: JSONValue]) -> Date? {
         let numericKeys = [
             "createdAt",
             "created_at",
@@ -1948,7 +2044,7 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryTimeZoneIdentifier(from object: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryTimeZoneIdentifier(from object: [String: JSONValue]) -> String? {
         for key in ["timeZoneIdentifier", "timezoneIdentifier", "timeZone", "timezone", "time_zone"] {
             guard let rawValue = object[key]?.stringValue else {
                 continue
@@ -1962,7 +2058,7 @@ extension CodexService {
         return nil
     }
 
-    func trustedHistoryDate(_ date: Date?) -> Date? {
+    nonisolated func trustedHistoryDate(_ date: Date?) -> Date? {
         guard let date,
               CodexTimestampParser.isTrustworthyServerDate(date) else {
             return nil
@@ -1970,11 +2066,11 @@ extension CodexService {
         return date
     }
 
-    func parseHistoryDateString(_ value: String) -> Date? {
+    nonisolated func parseHistoryDateString(_ value: String) -> Date? {
         CodexTimestampParser.parseString(value)
     }
 
-    func historyTurnID(from turnObject: [String: JSONValue]) -> String? {
+    nonisolated func historyTurnID(from turnObject: [String: JSONValue]) -> String? {
         firstNonEmptyString([
             turnObject["id"]?.stringValue,
             turnObject["turnId"]?.stringValue,
@@ -3111,14 +3207,14 @@ extension CodexService {
         !CodexTimestampParser.isTrustworthyServerDate(date)
     }
 
-    func normalizedItemType(_ rawType: String) -> String {
+    nonisolated func normalizedItemType(_ rawType: String) -> String {
         rawType
             .replacingOccurrences(of: "_", with: "")
             .replacingOccurrences(of: "-", with: "")
             .lowercased()
     }
 
-    func normalizedAssistantPhase(_ rawPhase: String?) -> String? {
+    nonisolated func normalizedAssistantPhase(_ rawPhase: String?) -> String? {
         guard let rawPhase else {
             return nil
         }
@@ -3175,7 +3271,7 @@ extension CodexService {
     }
 
     // Centralizes history-item -> CodexMessage mapping without changing ordering behavior.
-    func appendHistoryMessage(
+    nonisolated func appendHistoryMessage(
         to result: inout [CodexMessage],
         role: CodexMessageRole,
         kind: CodexMessageKind = .chat,
@@ -3314,7 +3410,7 @@ extension CodexService {
             .isEmpty
     }
 
-    func decodeReasoningItemText(from itemObject: [String: JSONValue]) -> String {
+    nonisolated func decodeReasoningItemText(from itemObject: [String: JSONValue]) -> String {
         let summary = decodeHistoryStringParts(itemObject["summary"]).joined(separator: "\n")
         let content = decodeHistoryStringParts(itemObject["content"]).joined(separator: "\n\n")
 
@@ -3333,7 +3429,7 @@ extension CodexService {
         return sections.joined(separator: "\n\n")
     }
 
-    func decodePlanItemText(from itemObject: [String: JSONValue]) -> String {
+    nonisolated func decodePlanItemText(from itemObject: [String: JSONValue]) -> String {
         let decodedText = decodeItemText(from: itemObject)
         if !decodedText.isEmpty {
             return decodedText
@@ -3349,7 +3445,7 @@ extension CodexService {
         return ""
     }
 
-    func decodePlanState(from itemObject: [String: JSONValue]) -> CodexPlanState? {
+    nonisolated func decodePlanState(from itemObject: [String: JSONValue]) -> CodexPlanState? {
         let explanation = decodeNormalizedPlanText(itemObject["explanation"])
             ?? decodeNormalizedPlanText(itemObject["summary"])
         let steps = (itemObject["plan"]?.arrayValue ?? []).compactMap { stepValue -> CodexPlanStep? in
@@ -3371,7 +3467,7 @@ extension CodexService {
     }
 
     // Closed turns should not restore a stale "active" plan accessory from history.
-    func finalizedHistoryPlanState(_ planState: CodexPlanState?, turnCompleted: Bool) -> CodexPlanState? {
+    nonisolated func finalizedHistoryPlanState(_ planState: CodexPlanState?, turnCompleted: Bool) -> CodexPlanState? {
         guard turnCompleted,
               let planState,
               !planState.steps.isEmpty,
@@ -3391,7 +3487,7 @@ extension CodexService {
         historyTurnTerminalState(turnObject) == .completed
     }
 
-    func historyTurnTerminalState(_ turnObject: [String: JSONValue]) -> CodexTurnTerminalState? {
+    nonisolated func historyTurnTerminalState(_ turnObject: [String: JSONValue]) -> CodexTurnTerminalState? {
         let statusObject = turnObject["status"]?.objectValue
         let rawStatus = firstNonEmptyString([
             turnObject["status"]?.stringValue,
@@ -3407,7 +3503,10 @@ extension CodexService {
     // Parses collabAgentToolCall payloads into a stable summary row the timeline can render.
     func decodeSubagentActionItem(from itemObject: [String: JSONValue]) -> CodexSubagentAction? {
         ingestSubagentIdentityMetadata(from: itemObject)
+        return decodeSubagentActionPayload(from: itemObject)
+    }
 
+    private nonisolated func decodeSubagentActionPayload(from itemObject: [String: JSONValue]) -> CodexSubagentAction? {
         let receiverThreadIds = decodeSubagentReceiverThreadIDs(from: itemObject)
         let receiverAgents = decodeSubagentReceiverAgents(
             from: itemObject,
@@ -3552,7 +3651,7 @@ extension CodexService {
     }
 
     // Infers the collab tool type from the event's `type` field when `tool` is missing.
-    private func inferToolFromEventType(_ itemObject: [String: JSONValue]) -> String? {
+    private nonisolated func inferToolFromEventType(_ itemObject: [String: JSONValue]) -> String? {
         guard let rawType = firstStringValue(in: itemObject, keys: ["type"]) else { return nil }
         let normalized = rawType.lowercased()
             .replacingOccurrences(of: "_", with: "")
@@ -3566,7 +3665,7 @@ extension CodexService {
         return nil
     }
 
-    private func decodeNormalizedPlanText(_ value: JSONValue?) -> String? {
+    private nonisolated func decodeNormalizedPlanText(_ value: JSONValue?) -> String? {
         let flattened = Self.normalizedMessageText(decodeHistoryStringParts(value).joined(separator: "\n"))
         guard Self.hasMeaningfulHistoryText(flattened) else {
             return nil
@@ -3574,7 +3673,7 @@ extension CodexService {
         return flattened
     }
 
-    private func decodeSubagentReceiverThreadIDs(from itemObject: [String: JSONValue]) -> [String] {
+    private nonisolated func decodeSubagentReceiverThreadIDs(from itemObject: [String: JSONValue]) -> [String] {
         // Try plural array first.
         let candidate = firstValue(
             forAnyKey: ["receiverThreadIds", "receiver_thread_ids", "threadIds", "thread_ids"],
@@ -3608,7 +3707,7 @@ extension CodexService {
         return []
     }
 
-    private func decodeSubagentReceiverAgents(
+    private nonisolated func decodeSubagentReceiverAgents(
         from itemObject: [String: JSONValue],
         fallbackThreadIds: [String]
     ) -> [CodexSubagentRef] {
@@ -3694,7 +3793,7 @@ extension CodexService {
         }
     }
 
-    private func decodeSubagentAgentStates(from itemObject: [String: JSONValue]) -> [String: CodexSubagentState] {
+    private nonisolated func decodeSubagentAgentStates(from itemObject: [String: JSONValue]) -> [String: CodexSubagentState] {
         let candidate = firstValue(
             forAnyKey: ["statuses", "agentsStates", "agents_states", "agentStates", "agent_states"],
             in: .object(itemObject)
@@ -3740,7 +3839,7 @@ extension CodexService {
     // Builds a single-element agent ref array from top-level fields when the Codex CLI sends
     // one event per agent with singular fields (new_agent_nickname, receiver_thread_id, etc.)
     // instead of a nested receiverAgents array.
-    private func buildSyntheticAgentRefs(
+    private nonisolated func buildSyntheticAgentRefs(
         from itemObject: [String: JSONValue],
         fallbackThreadIds: [String]
     ) -> [CodexSubagentRef] {
@@ -3816,7 +3915,7 @@ extension CodexService {
         )]
     }
 
-    func decodeCommandExecutionItemText(from itemObject: [String: JSONValue]) -> String {
+    nonisolated func decodeCommandExecutionItemText(from itemObject: [String: JSONValue]) -> String {
         let status = decodeHistoryNestedStatus(from: itemObject) ?? "completed"
         let phase = normalizedHistoryCommandPhase(status)
         let command = decodeHistoryFirstString(
@@ -3826,7 +3925,7 @@ extension CodexService {
         return "\(phase) \(shortHistoryCommand(command))"
     }
 
-    func normalizedHistoryCommandPhase(_ rawStatus: String) -> String {
+    nonisolated func normalizedHistoryCommandPhase(_ rawStatus: String) -> String {
         let normalized = rawStatus
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -3842,7 +3941,7 @@ extension CodexService {
         return "running"
     }
 
-    func shortHistoryCommand(_ rawCommand: String, maxLength: Int = 92) -> String {
+    nonisolated func shortHistoryCommand(_ rawCommand: String, maxLength: Int = 92) -> String {
         let previewSource = rawCommand.utf8.count <= Self.historyLargeTextByteLimit
             ? rawCommand
             : String(rawCommand.prefix(maxLength))
@@ -3873,7 +3972,7 @@ extension CodexService {
         return String(preview[..<cutoffIndex]) + "…"
     }
 
-    private func unwrapHistoryShellCommandIfPresent(_ command: String) -> String {
+    private nonisolated func unwrapHistoryShellCommandIfPresent(_ command: String) -> String {
         let tokens = command
             .split(separator: " ", omittingEmptySubsequences: true)
             .map(String.init)
@@ -3914,7 +4013,7 @@ extension CodexService {
         return command
     }
 
-    private func stripHistoryWrappingQuotes(from input: String) -> String {
+    private nonisolated func stripHistoryWrappingQuotes(from input: String) -> String {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return trimmed }
 
@@ -3925,7 +4024,7 @@ extension CodexService {
         return trimmed
     }
 
-    func decodeFileChangeItemText(from itemObject: [String: JSONValue]) -> String {
+    nonisolated func decodeFileChangeItemText(from itemObject: [String: JSONValue]) -> String {
         let status = itemObject["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedStatus = (status?.isEmpty == false) ? status! : "completed"
 
@@ -3950,7 +4049,7 @@ extension CodexService {
     }
 
     // Splits history tool items into dedicated command, file-change, or compact generic activity rows.
-    func decodeHistoryToolCallItem(from itemObject: [String: JSONValue]) -> (kind: CodexMessageKind, text: String)? {
+    nonisolated func decodeHistoryToolCallItem(from itemObject: [String: JSONValue]) -> (kind: CodexMessageKind, text: String)? {
         if isHistoryCommandToolCall(itemObject),
            let commandText = decodeHistoryCommandToolCallText(from: itemObject) {
             return (.commandExecution, commandText)
@@ -3964,18 +4063,18 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryDiffItemText(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryDiffItemText(from itemObject: [String: JSONValue]) -> String? {
         decodeHistoryFileChangeToolPayload(from: itemObject)
     }
 
-    func decodeHistoryToolCallFileChangeText(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryToolCallFileChangeText(from itemObject: [String: JSONValue]) -> String? {
         guard isWorkspaceFileMutationToolCall(itemObject) else {
             return nil
         }
         return decodeHistoryFileChangeToolPayload(from: itemObject)
     }
 
-    private func decodeHistoryFileChangeToolPayload(from itemObject: [String: JSONValue]) -> String? {
+    private nonisolated func decodeHistoryFileChangeToolPayload(from itemObject: [String: JSONValue]) -> String? {
         let status = decodeHistoryNestedStatus(from: itemObject) ?? "completed"
 
         var synthetic = itemObject
@@ -4018,7 +4117,7 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryToolActivityText(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryToolActivityText(from itemObject: [String: JSONValue]) -> String? {
         if let output = decodeHistoryFirstString(
             forAnyKey: [
                 "text",
@@ -4104,7 +4203,7 @@ extension CodexService {
         return summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : summary
     }
 
-    func isHistoryCommandToolCall(_ itemObject: [String: JSONValue]) -> Bool {
+    nonisolated func isHistoryCommandToolCall(_ itemObject: [String: JSONValue]) -> Bool {
         let rawTool = firstNonEmptyString([
             itemObject["name"]?.stringValue,
             itemObject["tool_name"]?.stringValue,
@@ -4114,7 +4213,7 @@ extension CodexService {
         return rawTool == "exec_command" || rawTool == "shell_command"
     }
 
-    func decodeHistoryCommandToolCallText(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryCommandToolCallText(from itemObject: [String: JSONValue]) -> String? {
         let argumentsObject = decodeHistoryToolArgumentsObject(from: itemObject)
         let status = decodeHistoryNestedStatus(from: itemObject) ?? "completed"
         let phase = normalizedHistoryCommandPhase(status)
@@ -4132,7 +4231,7 @@ extension CodexService {
         return "\(phase) \(shortHistoryCommand(command))"
     }
 
-    func decodeHistoryToolArgumentsObject(from itemObject: [String: JSONValue]) -> [String: JSONValue] {
+    nonisolated func decodeHistoryToolArgumentsObject(from itemObject: [String: JSONValue]) -> [String: JSONValue] {
         guard let argumentsValue = itemObject["arguments"] ?? itemObject["input"] else {
             return [:]
         }
@@ -4148,7 +4247,7 @@ extension CodexService {
         return object
     }
 
-    func decodeHistoryFileChangeEntries(
+    nonisolated func decodeHistoryFileChangeEntries(
         from rawChanges: JSONValue?
     ) -> [(path: String, kind: String, diff: String, inlineTotals: (additions: Int, deletions: Int)?)] {
         var changeObjects: [[String: JSONValue]] = []
@@ -4186,7 +4285,7 @@ extension CodexService {
         }
     }
 
-    func decodeHistoryChangePath(from changeObject: [String: JSONValue]) -> String {
+    nonisolated func decodeHistoryChangePath(from changeObject: [String: JSONValue]) -> String {
         let candidates = [
             changeObject["path"]?.stringValue,
             changeObject["file"]?.stringValue,
@@ -4215,7 +4314,7 @@ extension CodexService {
         return "unknown"
     }
 
-    func decodeHistoryChangeKind(from changeObject: [String: JSONValue]) -> String {
+    nonisolated func decodeHistoryChangeKind(from changeObject: [String: JSONValue]) -> String {
         if let kindString = changeObject["kind"]?.stringValue,
            !kindString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return kindString
@@ -4235,7 +4334,7 @@ extension CodexService {
         return "update"
     }
 
-    func decodeHistoryChangeDiff(from changeObject: [String: JSONValue]) -> String {
+    nonisolated func decodeHistoryChangeDiff(from changeObject: [String: JSONValue]) -> String {
         let diff = changeObject["diff"]?.stringValue
             ?? changeObject["unified_diff"]?.stringValue
             ?? changeObject["unifiedDiff"]?.stringValue
@@ -4245,7 +4344,7 @@ extension CodexService {
         return Self.normalizedMessageText(diff)
     }
 
-    func decodeHistoryChangeInlineTotals(
+    nonisolated func decodeHistoryChangeInlineTotals(
         from changeObject: [String: JSONValue]
     ) -> (additions: Int, deletions: Int)? {
         let additions = decodeHistoryNumericField(
@@ -4279,7 +4378,7 @@ extension CodexService {
         return (additions: additions, deletions: deletions)
     }
 
-    func decodeHistoryNumericField(
+    nonisolated func decodeHistoryNumericField(
         from object: [String: JSONValue],
         keys: [String]
     ) -> Int? {
@@ -4298,7 +4397,7 @@ extension CodexService {
         return nil
     }
 
-    func synthesizeHistoryUnifiedDiffFromContent(
+    nonisolated func synthesizeHistoryUnifiedDiffFromContent(
         _ content: String,
         kind: String,
         path: String
@@ -4335,14 +4434,14 @@ extension CodexService {
         return ""
     }
 
-    func decodeHistoryNestedStatus(from itemObject: [String: JSONValue]) -> String? {
+    nonisolated func decodeHistoryNestedStatus(from itemObject: [String: JSONValue]) -> String? {
         decodeHistoryFirstString(
             forAnyKey: ["status"],
             in: .object(itemObject)
         )
     }
 
-    func decodeHistoryFirstString(
+    nonisolated func decodeHistoryFirstString(
         forAnyKey keys: [String],
         in root: JSONValue,
         maxDepth: Int = 8
@@ -4367,7 +4466,7 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryFirstValue(
+    nonisolated func decodeHistoryFirstValue(
         forAnyKey keys: [String],
         in root: JSONValue,
         maxDepth: Int = 8
@@ -4380,7 +4479,7 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryFirstValue(
+    nonisolated func decodeHistoryFirstValue(
         forKey key: String,
         in root: JSONValue,
         maxDepth: Int = 8
@@ -4409,7 +4508,7 @@ extension CodexService {
         return nil
     }
 
-    func decodeHistoryFlattenText(from root: JSONValue, maxDepth: Int = 8) -> String? {
+    nonisolated func decodeHistoryFlattenText(from root: JSONValue, maxDepth: Int = 8) -> String? {
         guard maxDepth >= 0 else { return nil }
         switch root {
         case .string(let text):
@@ -4438,7 +4537,7 @@ extension CodexService {
         }
     }
 
-    func decodeHistoryIsEmptyJSONValue(_ value: JSONValue) -> Bool {
+    nonisolated func decodeHistoryIsEmptyJSONValue(_ value: JSONValue) -> Bool {
         switch value {
         case .null:
             return true
@@ -4453,7 +4552,7 @@ extension CodexService {
         }
     }
 
-    func decodeHistoryStringParts(_ value: JSONValue?) -> [String] {
+    nonisolated func decodeHistoryStringParts(_ value: JSONValue?) -> [String] {
         guard let value else { return [] }
 
         switch value {

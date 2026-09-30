@@ -7,7 +7,7 @@
 import Foundation
 
 // Mirrors the app-server v2 `ThreadGoalStatus` wire values (camelCase).
-enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable, CaseIterable {
+nonisolated enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable, CaseIterable {
     case active
     case paused
     case blocked
@@ -72,7 +72,7 @@ enum CodexThreadGoalStatus: String, Codable, Hashable, Sendable, CaseIterable {
 
 // Mirrors the app-server v2 `ThreadGoal` payload delivered by
 // `thread/goal/get|set` responses and `thread/goal/updated` notifications.
-struct CodexThreadGoal: Equatable, Sendable {
+nonisolated struct CodexThreadGoal: Equatable, Sendable {
     let threadId: String
     let objective: String
     let status: CodexThreadGoalStatus

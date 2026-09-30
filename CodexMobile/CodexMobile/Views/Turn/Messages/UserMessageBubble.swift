@@ -29,8 +29,10 @@ struct UserMessageBubble: View {
         UserBubbleTrailingColumn {
             if !message.attachments.isEmpty {
                 UserAttachmentStrip(attachments: message.attachments) { tappedAttachment in
-                    if let image = AttachmentPreviewImageResolver.resolve(tappedAttachment) {
-                        previewImage = PreviewImagePayload(image: image)
+                    Task { @MainActor in
+                        if let image = await AttachmentPreviewImageResolver.resolve(tappedAttachment) {
+                            previewImage = PreviewImagePayload(image: image)
+                        }
                     }
                 }
             }

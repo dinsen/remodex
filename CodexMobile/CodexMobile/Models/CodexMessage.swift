@@ -6,19 +6,19 @@
 
 import Foundation
 
-enum CodexMessageRole: String, Codable, Hashable, Sendable {
+nonisolated enum CodexMessageRole: String, Codable, Hashable, Sendable {
     case user
     case assistant
     case system
 }
 
-enum CodexMessageDeliveryState: String, Codable, Hashable, Sendable {
+nonisolated enum CodexMessageDeliveryState: String, Codable, Hashable, Sendable {
     case pending
     case confirmed
     case failed
 }
 
-enum CodexMessageKind: String, Codable, Hashable, Sendable {
+nonisolated enum CodexMessageKind: String, Codable, Hashable, Sendable {
     case chat
     case thinking
     case toolActivity
@@ -31,7 +31,7 @@ enum CodexMessageKind: String, Codable, Hashable, Sendable {
     case asyncUserInputAnswer
 }
 
-struct CodexMessageTextRenderSignature: Codable, Hashable, Sendable {
+nonisolated struct CodexMessageTextRenderSignature: Codable, Hashable, Sendable {
     let byteCount: Int
     let revision: Int
 
@@ -56,7 +56,7 @@ nonisolated enum CodexMessageTextRenderSignatureCounter {
     }
 }
 
-struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let threadId: String
     let role: CodexMessageRole

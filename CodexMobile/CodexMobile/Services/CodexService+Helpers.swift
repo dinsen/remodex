@@ -940,12 +940,30 @@ extension CodexService {
         }
     }
 
-    func decodeModel<T: Decodable>(_ type: T.Type, from value: JSONValue) -> T? {
-        guard let data = try? encoder.encode(value) else {
-            return nil
-        }
+    // Model snapshots and batches are converted by the configured transfer codec away from
+    // MainActor. Omitting turns is safe for CodexThread, which stores sidebar metadata only.
+    func decodeModelOffMain<T: Decodable & Sendable>(
+        _ type: T.Type,
+        from value: JSONValue,
+        omittingTopLevelKeys: Set<String> = []
+    ) async -> T? {
+        try? await transferJSONCodec.decodeModel(
+            type,
+            from: value,
+            omittingTopLevelKeys: omittingTopLevelKeys
+        )
+    }
 
-        return try? decoder.decode(type, from: data)
+    func decodeModelsOffMain<T: Decodable & Sendable>(
+        _ type: T.Type,
+        from values: [JSONValue],
+        omittingTopLevelKeys: Set<String> = []
+    ) async -> [T?] {
+        await transferJSONCodec.decodeModels(
+            type,
+            from: values,
+            omittingTopLevelKeys: omittingTopLevelKeys
+        )
     }
 
     func extractTurnID(from value: JSONValue?) -> String? {

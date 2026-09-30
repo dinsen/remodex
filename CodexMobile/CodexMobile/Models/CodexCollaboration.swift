@@ -34,7 +34,7 @@ enum CodexPlanSessionSource: String, Codable, Hashable, Sendable {
     }
 }
 
-struct CodexProposedPlan: Codable, Hashable, Sendable {
+nonisolated struct CodexProposedPlan: Codable, Hashable, Sendable {
     let body: String
     let summary: String?
 
@@ -44,7 +44,7 @@ struct CodexProposedPlan: Codable, Hashable, Sendable {
     }
 }
 
-enum CodexPlanPresentation: String, Codable, Hashable, Sendable {
+nonisolated enum CodexPlanPresentation: String, Codable, Hashable, Sendable {
     case progress
     case resultStreaming
     case resultCompletedItem
@@ -69,7 +69,7 @@ enum CodexPlanPresentation: String, Codable, Hashable, Sendable {
     }
 }
 
-enum CodexPlanStepStatus: String, Codable, Hashable, Sendable {
+nonisolated enum CodexPlanStepStatus: String, Codable, Hashable, Sendable {
     case pending
     case inProgress = "in_progress"
     case completed
@@ -90,7 +90,7 @@ enum CodexPlanStepStatus: String, Codable, Hashable, Sendable {
     }
 }
 
-struct CodexPlanStep: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexPlanStep: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let step: String
     let status: CodexPlanStepStatus
@@ -104,7 +104,7 @@ struct CodexPlanStep: Identifiable, Codable, Hashable, Sendable {
 
 // System plan items track execution/task-planning progress only.
 // Final proposed plans are rendered from assistant output via `<proposed_plan>`.
-struct CodexPlanState: Codable, Hashable, Sendable {
+nonisolated struct CodexPlanState: Codable, Hashable, Sendable {
     var explanation: String?
     var steps: [CodexPlanStep]
 
@@ -114,7 +114,7 @@ struct CodexPlanState: Codable, Hashable, Sendable {
     }
 }
 
-enum CodexProposedPlanParser {
+nonisolated enum CodexProposedPlanParser {
     private static let envelopeExpression = try? NSRegularExpression(
         pattern: "<proposed_plan>([\\s\\S]*?)</proposed_plan>",
         options: [.caseInsensitive]
@@ -278,7 +278,7 @@ nonisolated struct CodexStructuredUserInputQuestion: Identifiable, Codable, Hash
     }
 }
 
-struct CodexStructuredUserInputRequest: Codable, Hashable, Sendable {
+nonisolated struct CodexStructuredUserInputRequest: Codable, Hashable, Sendable {
     let requestID: JSONValue
     let questions: [CodexStructuredUserInputQuestion]
 
@@ -288,7 +288,7 @@ struct CodexStructuredUserInputRequest: Codable, Hashable, Sendable {
     }
 }
 
-struct CodexSubagentRef: Codable, Hashable, Sendable {
+nonisolated struct CodexSubagentRef: Codable, Hashable, Sendable {
     let threadId: String
     let agentId: String?
     let nickname: String?
@@ -313,7 +313,7 @@ struct CodexSubagentRef: Codable, Hashable, Sendable {
     }
 }
 
-struct CodexSubagentState: Codable, Hashable, Sendable {
+nonisolated struct CodexSubagentState: Codable, Hashable, Sendable {
     let threadId: String
     var status: String
     var message: String?
@@ -377,7 +377,7 @@ struct CodexSubagentThreadPresentation: Identifiable, Hashable, Sendable {
     }
 }
 
-struct CodexSubagentAction: Codable, Hashable, Sendable {
+nonisolated struct CodexSubagentAction: Codable, Hashable, Sendable {
     var tool: String
     var status: String
     var prompt: String?

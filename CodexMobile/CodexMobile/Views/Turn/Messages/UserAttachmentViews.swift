@@ -31,8 +31,8 @@ private enum UserAttachmentThumbnailCache {
     }
 }
 
-private enum UserAttachmentThumbnailDecoder {
-    struct DecodedThumbnail: @unchecked Sendable {
+enum UserAttachmentThumbnailDecoder {
+    nonisolated struct DecodedThumbnail: @unchecked Sendable {
         let image: UIImage
     }
 
@@ -40,6 +40,25 @@ private enum UserAttachmentThumbnailDecoder {
         guard let thumbnailData = thumbnailJPEGData(for: attachment, maxPixelSize: maxPixelSize),
               let image = UIImage(data: thumbnailData)
         else {
+            return nil
+        }
+        return DecodedThumbnail(image: image)
+    }
+
+    nonisolated static func thumbnailImage(fromBase64 value: String) -> DecodedThumbnail? {
+        let thumbnailBase64 = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !thumbnailBase64.isEmpty,
+              let thumbnailData = Data(base64Encoded: thumbnailBase64),
+              let image = UIImage(data: thumbnailData) else {
+            return nil
+        }
+        return DecodedThumbnail(image: image)
+    }
+
+    nonisolated static func fullSizeImage(for attachment: CodexImageAttachment) -> DecodedThumbnail? {
+        guard let payloadDataURL = attachment.payloadDataURL,
+              let imageData = decodeImageDataFromDataURL(payloadDataURL),
+              let image = UIImage(data: imageData) else {
             return nil
         }
         return DecodedThumbnail(image: image)
@@ -170,12 +189,12 @@ private struct UserAttachmentThumbnailView: View {
         let cacheKey = cacheKey
         let attachment = attachment
         let maxPixelSize = Int(ceil(side * max(displayScale, 1)))
-        let decodedThumbnail = await Task.detached(priority: .utility) {
+        let decodedThumbnail: UserAttachmentThumbnailDecoder.DecodedThumbnail? = try? await CodexTransferWork.runMedia {
             UserAttachmentThumbnailDecoder.thumbnailImage(
                 for: attachment,
                 maxPixelSize: maxPixelSize
             )
-        }.value
+        }
         guard !Task.isCancelled,
               let image = decodedThumbnail?.image
         else {
@@ -209,31 +228,17 @@ struct UserAttachmentStrip: View {
 @MainActor
 enum AttachmentPreviewImageResolver {
     // Uses full payload data URL first, then falls back to the cached thumbnail for resilience.
-    static func resolve(_ attachment: CodexImageAttachment) -> UIImage? {
-        if let payloadDataURL = attachment.payloadDataURL,
-           let imageData = decodeImageDataFromDataURL(payloadDataURL),
-           let image = UIImage(data: imageData)
-        {
-            return image
+    static func resolve(_ attachment: CodexImageAttachment) async -> UIImage? {
+        if attachment.payloadDataURL != nil {
+            let decodedImage: UserAttachmentThumbnailDecoder.DecodedThumbnail? = try? await CodexTransferWork.runMedia {
+                UserAttachmentThumbnailDecoder.fullSizeImage(for: attachment)
+            }
+            if let image = decodedImage?.image {
+                return image
+            }
         }
 
         let cacheKey = UserAttachmentThumbnailCache.cacheKey(for: attachment)
         return UserAttachmentThumbnailCache.image(forKey: cacheKey)
-    }
-
-    private static func decodeImageDataFromDataURL(_ dataURL: String) -> Data? {
-        guard let commaIndex = dataURL.firstIndex(of: ",") else {
-            return nil
-        }
-
-        let metadata = dataURL[..<commaIndex].lowercased()
-        guard metadata.hasPrefix("data:image"),
-              metadata.contains(";base64")
-        else {
-            return nil
-        }
-
-        let payloadStart = dataURL.index(after: commaIndex)
-        return Data(base64Encoded: String(dataURL[payloadStart...]))
     }
 }

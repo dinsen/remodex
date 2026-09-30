@@ -7,6 +7,6 @@
 import SwiftUI
 
 enum TurnAttachmentThumbnailMetrics {
-    static let side: CGFloat = 60
-    static let cornerRadius: CGFloat = 12
+    nonisolated static let side: CGFloat = 60
+    nonisolated static let cornerRadius: CGFloat = 12
 }

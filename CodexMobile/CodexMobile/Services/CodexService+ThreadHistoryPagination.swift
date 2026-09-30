@@ -232,13 +232,16 @@ extension CodexService {
         }
         let isOpenCodeThread = thread(for: threadId)?.runtimeProvider == .opencode
         let refreshGeneration = currentPerThreadRefreshGeneration(for: threadId)
+        let historyDecodeToken = currentHistoryDecodeToken(for: threadId)
 
         loadingOlderThreadHistoryIDs.insert(threadId)
         olderHistoryLoadErrorByThreadID.removeValue(forKey: threadId)
         refreshThreadTimelineState(for: threadId)
         defer {
-            loadingOlderThreadHistoryIDs.remove(threadId)
-            refreshThreadTimelineState(for: threadId)
+            if historyDecodeTokenMatchesCurrent(historyDecodeToken) {
+                loadingOlderThreadHistoryIDs.remove(threadId)
+                refreshThreadTimelineState(for: threadId)
+            }
         }
 
         do {
@@ -258,7 +261,8 @@ extension CodexService {
                 let hasNextCursor = cursorHasValue(page.nextCursor)
                 debugSyncLog("thread/turns/list older thread=\(threadId) limit=\(ThreadHistoryHydrationPolicy.olderTurnPageSize) turns=\(page.turns.count) hasNextCursor=\(hasNextCursor) elapsedMs=\(elapsedMs)")
                 guard !Task.isCancelled,
-                      (!isOpenCodeThread || isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration)) else {
+                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                      isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                     return
                 }
 
@@ -266,7 +270,16 @@ extension CodexService {
                     "id": .string(threadId),
                     "turns": .array(chronologicalTurnsFromDescendingPage(page.turns)),
                 ]
-                let olderMessages = decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
+                let historyDecodeResult = try await decodeMessagesFromThreadReadOffMain(
+                    threadId: threadId,
+                    threadObject: threadObject
+                )
+                guard let olderMessages = commitHistoryDecodeResult(
+                    historyDecodeResult,
+                    token: historyDecodeToken
+                ) else {
+                    return
+                }
                 registerSubagentThreads(from: olderMessages, parentThreadId: threadId)
 
                 let olderTerminalStates = decodeTurnTerminalStatesFromThreadRead(threadObject)
@@ -344,7 +357,8 @@ extension CodexService {
                 )
 
                 guard !Task.isCancelled,
-                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                      isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                     return
                 }
 
@@ -390,6 +404,7 @@ extension CodexService {
                     }
                     guard !Task.isCancelled,
                           isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                          isHistoryDecodeTokenCurrent(historyDecodeToken),
                           !Self.openCodeOlderPageNeedsRebase(
                             isOpenCodeThread: isOpenCodeThread,
                             snapshotRevision: existingMessageRevision,
@@ -453,6 +468,9 @@ extension CodexService {
         } catch is CancellationError {
             return
         } catch {
+            guard historyDecodeTokenMatchesCurrent(historyDecodeToken), !Task.isCancelled else {
+                return
+            }
             if consumeUnsupportedTurnPagination(error, attemptedMethod: "thread/turns/list") {
                 return
             }

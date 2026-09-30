@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexFuzzyFileMatch: Decodable, Hashable, Sendable, Identifiable {
+nonisolated struct CodexFuzzyFileMatch: Decodable, Hashable, Sendable, Identifiable {
     let root: String
     let path: String
     let fileName: String

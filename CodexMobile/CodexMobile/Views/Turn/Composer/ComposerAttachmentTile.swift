@@ -9,15 +9,14 @@ import SwiftUI
 struct ComposerAttachmentTile: View {
     let attachment: TurnComposerImageAttachment
     let onRemove: (String) -> Void
+    @State private var thumbnailUIImage: UIImage?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Group {
                 switch attachment.state {
-                case .ready(let imageAttachment):
-                    if let image = TurnAttachmentPipeline.thumbnailImage(
-                        fromBase64: imageAttachment.thumbnailBase64JPEG
-                    ) {
+                case .ready:
+                    if let image = thumbnailUIImage {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFill()
@@ -65,9 +64,36 @@ struct ComposerAttachmentTile: View {
             .padding(5)
             .accessibilityLabel("Remove image")
         }
+        .task(id: thumbnailTaskID) {
+            await loadThumbnailIfNeeded()
+        }
     }
 
     // MARK: - Private
+
+    private var thumbnailTaskID: String {
+        switch attachment.state {
+        case .ready(let imageAttachment):
+            return imageAttachment.thumbnailContentFingerprint.cacheKey
+        case .loading:
+            return "\(attachment.id)|loading"
+        case .failed:
+            return "\(attachment.id)|failed"
+        }
+    }
+
+    @MainActor
+    private func loadThumbnailIfNeeded() async {
+        guard case .ready(let imageAttachment) = attachment.state else {
+            thumbnailUIImage = nil
+            return
+        }
+        let image = await TurnAttachmentPipeline.thumbnailImage(
+            fromBase64: imageAttachment.thumbnailBase64JPEG
+        )
+        guard !Task.isCancelled else { return }
+        thumbnailUIImage = image
+    }
 
     private var placeholderTile: some View {
         RoundedRectangle(cornerRadius: TurnAttachmentThumbnailMetrics.cornerRadius, style: .continuous)

@@ -258,6 +258,7 @@ extension CodexService {
 
     // Prunes service-owned render caches so removed/archived threads do not keep stale snapshots alive.
     func removeThreadTimelineState(for threadId: String) {
+        asyncAnswerVerificationThreadIDs.remove(threadId)
         threadTimelineStateByThread.removeValue(forKey: threadId)
         stoppedTurnIDsByThread.removeValue(forKey: threadId)
         composerFocusedThreadIDs.remove(threadId)
@@ -303,6 +304,8 @@ extension CodexService {
 
     // Clears every service-owned timeline cache during global teardown.
     func removeAllThreadTimelineState(preserveRunLifecycle: Bool = false) {
+        historyDecodeContextGeneration &+= 1
+        asyncAnswerVerificationThreadIDs.removeAll()
         threadTimelineStateByThread.removeAll()
         stoppedTurnIDsByThread.removeAll()
         projectedTerminalStateByThreadID.removeAll()
@@ -414,7 +417,20 @@ extension CodexService {
             return
         }
 
+        // A provider-stable item key already points directly at this streaming row. Its
+        // content is still growing, so rescanning every assistant row for flattened replay
+        // on each delta is redundant; completion and catch-up settlement keep the full
+        // replay reconciliation paths. Mirror-minted or unindexed rows retain the fallback.
+        let hasIndexedStableStreamingIdentity = updatedMessage.isStreaming
+            && Self.hasStableAssistantIdentity(updatedMessage.itemId)
+            && updatedMessage.itemId.map {
+                streamingAssistantMessageByItemKey[
+                    streamingItemMessageKey(threadId: threadId, itemId: $0)
+                ] == updatedMessage.id
+            } == true
+
         if updatedMessage.role == .assistant,
+           !hasIndexedStableStreamingIdentity,
            let terminalMessageId = assistantReplayTargetMessageId(
                in: rawMessages,
                threadId: threadId,
@@ -1356,6 +1372,7 @@ extension CodexService {
         }
 
         let refreshGeneration = currentPerThreadRefreshGeneration(for: threadId)
+        let historyDecodeToken = currentHistoryDecodeToken(for: threadId)
         let task = Task<ThreadHistoryLoadOutcome, Error> { @MainActor in
             let hadInitialTurnsLoadedBeforeRefresh = initialTurnsLoadedByThreadID.contains(threadId)
             let hadAuthoritativeLocalStartBeforeRefresh = hasAuthoritativeLocalHistoryStart(threadId: threadId)
@@ -1417,6 +1434,9 @@ extension CodexService {
                             requireCanonical: requiresCanonicalPaginatedHistory
                         )
                     }
+                    guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                        throw CancellationError()
+                    }
                     loadedViaPagination = true
                     loadedProvisionalJsonlFallback = turnsPage.isProvisionalJsonlFallback
                     let hasLegacyOpenCodeCursor = thread(for: threadId)?.runtimeProvider == .opencode
@@ -1435,6 +1455,9 @@ extension CodexService {
                         "turns": .array(chronologicalTurnsFromDescendingPage(turnsPage.turns)),
                     ]
                 } catch let error as CodexServiceError {
+                    guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                        throw CancellationError()
+                    }
                     if shouldTreatAsEmptyUnmaterializedThreadHistory(
                         error,
                         threadId: threadId,
@@ -1465,6 +1488,9 @@ extension CodexService {
                         do {
                             threadObject = try await fetchLegacyThreadHistoryObject(threadId: threadId)
                         } catch let legacyError as CodexServiceError {
+                            guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                                throw CancellationError()
+                            }
                             if case .rpcError(let rpcError) = legacyError, rpcError.code == -32600 {
                                 let shouldMarkHydrated = markHydratedWhenNotMaterialized
                                     && !deferHydratedMarkForNotMaterializedThreadIDs.contains(threadId)
@@ -1481,10 +1507,17 @@ extension CodexService {
                             }
                             throw legacyError
                         }
+                        guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                            throw CancellationError()
+                        }
                         extractContextWindowUsageIfAvailable(threadId: threadId, threadObject: threadObject)
-                        if let threadData = try? JSONEncoder().encode(JSONValue.object(threadObject)),
-                           let decoded = try? JSONDecoder().decode(CodexThread.self, from: threadData) {
-                            decodedThreadFromHistory = decoded
+                        decodedThreadFromHistory = await decodeModelOffMain(
+                            CodexThread.self,
+                            from: .object(threadObject),
+                            omittingTopLevelKeys: ["turns"]
+                        )
+                        guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                            throw CancellationError()
                         }
                     } else {
                         throw error
@@ -1494,6 +1527,9 @@ extension CodexService {
                 do {
                     threadObject = try await fetchLegacyThreadHistoryObject(threadId: threadId)
                 } catch let error as CodexServiceError {
+                    guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                        throw CancellationError()
+                    }
                     if shouldTreatAsEmptyUnmaterializedThreadHistory(
                         error,
                         threadId: threadId,
@@ -1517,14 +1553,30 @@ extension CodexService {
                     }
                     throw error
                 }
+                guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                    throw CancellationError()
+                }
                 extractContextWindowUsageIfAvailable(threadId: threadId, threadObject: threadObject)
-                if let threadData = try? JSONEncoder().encode(JSONValue.object(threadObject)),
-                   let decoded = try? JSONDecoder().decode(CodexThread.self, from: threadData) {
-                    decodedThreadFromHistory = decoded
+                decodedThreadFromHistory = await decodeModelOffMain(
+                    CodexThread.self,
+                    from: .object(threadObject),
+                    omittingTopLevelKeys: ["turns"]
+                )
+                guard isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                    throw CancellationError()
                 }
             }
 
-            let historyMessages = decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
+            let historyDecodeResult = try await decodeMessagesFromThreadReadOffMain(
+                threadId: threadId,
+                threadObject: threadObject
+            )
+            guard let historyMessages = commitHistoryDecodeResult(
+                historyDecodeResult,
+                token: historyDecodeToken
+            ) else {
+                throw CancellationError()
+            }
             let isSuspiciousEmptyHistory = historyMessages.isEmpty
                 && shouldDeferEmptyThreadHistoryPage(
                     threadId: threadId,
@@ -1623,7 +1675,8 @@ extension CodexService {
                     preferRecentWindow: usedRecentWindow
                 )
                 guard !Task.isCancelled,
-                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                      isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                     throw CancellationError()
                 }
                 if messageRevision(for: threadId) != cachedMessageRevision {
@@ -1654,7 +1707,8 @@ extension CodexService {
                         preferRecentWindow: usedRecentWindow
                     )
                     guard !Task.isCancelled,
-                          isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                          isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                          isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                         throw CancellationError()
                     }
                     guard messageRevision(for: threadId) == cachedMessageRevision else {
@@ -1720,7 +1774,8 @@ extension CodexService {
             }
 
             guard !Task.isCancelled,
-                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                  isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                 throw CancellationError()
             }
             if outcome == .loadedPaginatedWindow, !threadHasActiveOrRunningTurn(threadId) {

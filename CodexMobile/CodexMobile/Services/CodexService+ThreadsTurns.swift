@@ -16,23 +16,6 @@ enum ThreadListHydrationPolicy {
     static let requestTimeoutNanoseconds: UInt64 = 12_000_000_000
 }
 
-nonisolated enum CodexThreadPageDecoder {
-    static func decode(_ page: [JSONValue]) async -> [CodexThread] {
-        await Task.detached(priority: .userInitiated) {
-            let encoder = JSONEncoder()
-            let decoder = JSONDecoder()
-
-            return page.compactMap { value in
-                guard let data = try? encoder.encode(value) else {
-                    return nil
-                }
-
-                return try? decoder.decode(CodexThread.self, from: data)
-            }
-        }.value
-    }
-}
-
 private enum StaleInterruptResolution: Equatable {
     case none
     case completed
@@ -64,6 +47,7 @@ extension CodexService {
     // Sections are independently persisted by Codex, so fetch them separately from
     // thread/list to keep empty sections visible in the sidebar.
     func fetchThreadSections() async throws -> CodexThreadSectionsSnapshot {
+        let transferGeneration = transferSessionGeneration
         var sections: [CodexThreadSection] = []
         var cursor: JSONValue = .null
         var seenCursors: Set<String> = []
@@ -80,6 +64,9 @@ extension CodexService {
                 timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
                 timeoutMessage: "threadSection/list timed out while loading Codex sections."
             )
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             guard let result = response.result?.objectValue,
                   let rawSections = result["data"]?.arrayValue
                     ?? result["items"]?.arrayValue
@@ -87,10 +74,15 @@ extension CodexService {
                 throw CodexServiceError.invalidResponse("threadSection/list response missing sections")
             }
 
-            for rawSection in rawSections {
-                guard let section = decodeModel(CodexThreadSection.self, from: rawSection) else {
-                    throw CodexServiceError.invalidResponse("threadSection/list response contained malformed section")
-                }
+            let decodedSections = await decodeModelsOffMain(CodexThreadSection.self, from: rawSections)
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
+            guard decodedSections.count == rawSections.count,
+                  decodedSections.allSatisfy({ $0 != nil }) else {
+                throw CodexServiceError.invalidResponse("threadSection/list response contained malformed section")
+            }
+            for section in decodedSections.compactMap({ $0 }) {
                 if !sections.contains(where: { $0.id == section.id }) {
                     sections.append(section)
                 }
@@ -101,7 +93,10 @@ extension CodexService {
         var sectionThreads: [CodexThread] = []
         var threadIDsBySection: [String: [String]] = [:]
         for section in sections {
-            let threads = try await fetchThreads(in: section)
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
+            let threads = try await fetchThreads(in: section, transferGeneration: transferGeneration)
             sectionThreads.append(contentsOf: threads)
             threadIDsBySection[section.id] = threads.map(\.id)
         }
@@ -113,7 +108,10 @@ extension CodexService {
         )
     }
 
-    private func fetchThreads(in section: CodexThreadSection) async throws -> [CodexThread] {
+    private func fetchThreads(
+        in section: CodexThreadSection,
+        transferGeneration: UUID
+    ) async throws -> [CodexThread] {
         var threads: [CodexThread] = []
         var cursor: JSONValue = .null
         var sourceKinds = threadListSourceKinds
@@ -130,7 +128,8 @@ extension CodexService {
                 page = try await fetchThreadsPage(
                     in: section,
                     cursor: cursor,
-                    sourceKinds: sourceKinds
+                    sourceKinds: sourceKinds,
+                    transferGeneration: transferGeneration
                 )
             } catch {
                 guard sourceKinds == threadListSourceKinds,
@@ -141,7 +140,8 @@ extension CodexService {
                 page = try await fetchThreadsPage(
                     in: section,
                     cursor: cursor,
-                    sourceKinds: sourceKinds
+                    sourceKinds: sourceKinds,
+                    transferGeneration: transferGeneration
                 )
             }
 
@@ -155,7 +155,8 @@ extension CodexService {
     private func fetchThreadsPage(
         in section: CodexThreadSection,
         cursor: JSONValue,
-        sourceKinds: [String]
+        sourceKinds: [String],
+        transferGeneration: UUID
     ) async throws -> (threads: [CodexThread], nextCursor: JSONValue) {
         let response = try await sendRequest(
             method: "thread/list",
@@ -170,6 +171,9 @@ extension CodexService {
             timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
             timeoutMessage: "thread/list timed out while loading Codex section threads."
         )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
         guard let result = response.result?.objectValue,
               let rawThreads = result["data"]?.arrayValue
                 ?? result["items"]?.arrayValue
@@ -177,10 +181,19 @@ extension CodexService {
             throw CodexServiceError.invalidResponse("Section thread/list response missing data array")
         }
 
-        let decodedThreads = await CodexThreadPageDecoder.decode(rawThreads)
-        guard decodedThreads.count == rawThreads.count else {
+        let decodedResults = await decodeModelsOffMain(
+            CodexThread.self,
+            from: rawThreads,
+            omittingTopLevelKeys: ["turns"]
+        )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
+        guard decodedResults.count == rawThreads.count,
+              decodedResults.allSatisfy({ $0 != nil }) else {
             throw CodexServiceError.invalidResponse("Section thread/list response contained malformed data")
         }
+        let decodedThreads = decodedResults.compactMap { $0 }
         return (
             decodedThreads.map { thread in
                 var sectionThread = thread
@@ -405,6 +418,7 @@ extension CodexService {
         }()
         var includesServiceTier = explicitServiceTier != nil
         let accessConfiguration = runtimeAccessConfiguration()
+        let transferGeneration = transferSessionGeneration
 
         while true {
             var params = CodexThreadStartProjectBinding.makeThreadStartParams(
@@ -434,10 +448,23 @@ extension CodexService {
                     )
                 }
 
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
                 guard let result = response.result,
                       let resultObject = result.objectValue,
-                      let threadValue = resultObject["thread"],
-                      let decodedThread = decodeModel(CodexThread.self, from: threadValue) else {
+                      let threadValue = resultObject["thread"] else {
+                    throw CodexServiceError.invalidResponse("thread/start response missing thread")
+                }
+                let decodedThread = await decodeModelOffMain(
+                    CodexThread.self,
+                    from: threadValue,
+                    omittingTopLevelKeys: ["turns"]
+                )
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
+                guard let decodedThread else {
                     throw CodexServiceError.invalidResponse("thread/start response missing thread")
                 }
 
@@ -477,6 +504,9 @@ extension CodexService {
                 activeThreadId = thread.id
                 return thread
             } catch {
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
                 if runtimeProvider == .opencode { throw error }
                 guard consumeUnsupportedServiceTier(error, includesServiceTier: &includesServiceTier) else {
                     throw error
@@ -1114,10 +1144,17 @@ extension CodexService {
             "cancellationToken": tokenValue.map(JSONValue.string) ?? .null,
         ])
 
+        let transferGeneration = transferSessionGeneration
         let response = try await sendRequest(method: "fuzzyFileSearch", params: params)
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
 
-        guard let decodedFiles = decodeFuzzyFileMatches(from: response.result) else {
+        guard let decodedFiles = await decodeFuzzyFileMatches(from: response.result) else {
             throw CodexServiceError.invalidResponse("fuzzyFileSearch response missing result.files")
+        }
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
         }
 
         return decodedFiles.map { match in
@@ -1148,10 +1185,16 @@ extension CodexService {
             paramsObject["forceReload"] = .bool(true)
         }
 
+        let transferGeneration = transferSessionGeneration
+        let historyContextGeneration = historyDecodeContextGeneration
+        let serverIdentity = connectedServerIdentity
         let response: RPCMessage
         do {
             response = try await sendRequest(method: "skills/list", params: .object(paramsObject))
         } catch {
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             guard !normalizedCwds.isEmpty,
                   shouldRetrySkillsListWithCwdFallback(error) else {
                 throw error
@@ -1163,9 +1206,15 @@ extension CodexService {
             }
             response = try await sendRequest(method: "skills/list", params: .object(fallbackParams))
         }
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
 
-        guard let decodedSkills = decodeSkillMetadata(from: response.result) else {
+        guard let decodedSkills = await decodeSkillMetadata(from: response.result) else {
             throw CodexServiceError.invalidResponse("skills/list response missing result.data[].skills")
+        }
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
         }
 
         var allSkills = decodedSkills
@@ -1176,19 +1225,40 @@ extension CodexService {
             }
             // Some runtimes return only cwd-scoped skills when `cwds` is present; merge the
             // global list so personal skills remain discoverable from project threads.
-            if let globalResponse = try? await sendRequest(method: "skills/list", params: .object(globalParams)),
-               let globalSkills = decodeSkillMetadata(from: globalResponse.result) {
-                allSkills.append(contentsOf: globalSkills)
+            do {
+                let globalResponse = try await sendRequest(method: "skills/list", params: .object(globalParams))
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
+                if let globalSkills = await decodeSkillMetadata(from: globalResponse.result) {
+                    guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                        throw CancellationError()
+                    }
+                    allSkills.append(contentsOf: globalSkills)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Global enrichment is optional; keep the scoped results when it fails.
             }
         }
 
-        let dedupedByName = Dictionary(grouping: allSkills) { $0.normalizedName }
-            .compactMap { _, bucket -> CodexSkillMetadata? in
-                bucket.first(where: { $0.enabled }) ?? bucket.first
-            }
-            .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        return dedupedByName
+        let skillsForSorting = allSkills
+        let sortedSkills = try await CodexTransferWork.run {
+            Dictionary(grouping: skillsForSorting) { $0.normalizedName }
+                .compactMap { _, bucket -> CodexSkillMetadata? in
+                    bucket.first(where: { $0.enabled }) ?? bucket.first
+                }
+                .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        try Task.checkCancellation()
+        guard transferSessionGeneration == transferGeneration,
+              historyDecodeContextGeneration == historyContextGeneration,
+              connectedServerIdentity == serverIdentity else {
+            throw CancellationError()
+        }
+        return sortedSkills
     }
 
     // Loads Codex app-server plugins and returns entries usable as `@plugin` mentions.
@@ -1207,21 +1277,37 @@ extension CodexService {
             paramsObject["forceReload"] = .bool(true)
         }
 
+        let transferGeneration = transferSessionGeneration
+        let historyContextGeneration = historyDecodeContextGeneration
+        let serverIdentity = connectedServerIdentity
         let response = try await sendRequest(method: "plugin/list", params: .object(paramsObject))
-
-        guard let decodedPlugins = decodePluginMetadata(from: response.result) else {
-            throw CodexServiceError.invalidResponse("plugin/list response missing result.marketplaces[].plugins")
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
         }
 
-        let mentionablePlugins = decodedPlugins.filter(\.isAvailableForMention)
-        let dedupedByPath = Dictionary(grouping: mentionablePlugins) { $0.mentionPath }
-            .compactMap { _, bucket -> CodexPluginMetadata? in
-                bucket.first
-            }
-            .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .sorted { $0.displayTitle.localizedCaseInsensitiveCompare($1.displayTitle) == .orderedAscending }
+        guard let decodedPlugins = await decodePluginMetadata(from: response.result) else {
+            throw CodexServiceError.invalidResponse("plugin/list response missing result.marketplaces[].plugins")
+        }
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
 
-        return dedupedByPath
+        let sortedPlugins = try await CodexTransferWork.run {
+            let mentionablePlugins = decodedPlugins.filter(\.isAvailableForMention)
+            return Dictionary(grouping: mentionablePlugins) { $0.mentionPath }
+                .compactMap { _, bucket -> CodexPluginMetadata? in
+                    bucket.first
+                }
+                .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .sorted { $0.displayTitle.localizedCaseInsensitiveCompare($1.displayTitle) == .orderedAscending }
+        }
+        try Task.checkCancellation()
+        guard transferSessionGeneration == transferGeneration,
+              historyDecodeContextGeneration == historyContextGeneration,
+              connectedServerIdentity == serverIdentity else {
+            throw CancellationError()
+        }
+        return sortedPlugins
     }
 
     // Accepts the latest pending approval request.
@@ -1551,6 +1637,7 @@ extension CodexService {
         sourceKinds: [String],
         archived: Bool
     ) async throws -> (threads: [CodexThread], nextCursor: JSONValue) {
+        let transferGeneration = transferSessionGeneration
         var params: RPCObject = [
             // Avoid the server's narrower default sourceKinds so multi-project history
             // includes threads started from the app-server flow as well.
@@ -1577,6 +1664,9 @@ extension CodexService {
             timeoutNanoseconds: ThreadListHydrationPolicy.requestTimeoutNanoseconds,
             timeoutMessage: "thread/list timed out while syncing chats."
         )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
 
         guard let resultObject = response.result?.objectValue else {
             throw CodexServiceError.invalidResponse("thread/list response missing payload")
@@ -1590,8 +1680,18 @@ extension CodexService {
             throw CodexServiceError.invalidResponse("thread/list response missing data array")
         }
 
-        let decodedPage = await CodexThreadPageDecoder.decode(page)
-        return (decodedPage, nextThreadListCursor(from: resultObject))
+        let decodedPageResults = await decodeModelsOffMain(
+            CodexThread.self,
+            from: page,
+            omittingTopLevelKeys: ["turns"]
+        )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
+        return (
+            decodedPageResults.compactMap { $0 },
+            nextThreadListCursor(from: resultObject)
+        )
     }
 
     // Requests all user-facing thread sources instead of relying on the server default.
@@ -1739,6 +1839,7 @@ extension CodexService {
             accessConfiguration: accessConfigurationOverride ?? runtimeAccessConfiguration()
         )
         let refreshGeneration = currentPerThreadRefreshGeneration(for: threadId)
+        let historyDecodeToken = currentHistoryDecodeToken(for: threadId)
         if let existingTask = threadResumeTaskByThreadID[threadId] {
             if threadResumeRequestSignatureByThreadID[threadId] == requestedSignature {
                 return try await existingTask.value
@@ -1811,7 +1912,8 @@ extension CodexService {
                 )
             }
             guard !Task.isCancelled,
-                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                  isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                 throw CancellationError()
             }
 
@@ -1822,81 +1924,106 @@ extension CodexService {
 
             var resumedThread: CodexThread?
             var didReceiveEmbeddedHistory = false
-            if let threadValue = resultObject["thread"],
-               var decodedThread = decodeModel(CodexThread.self, from: threadValue) {
-                decodedThread.syncState = .live
-                decodedThread = CodexThreadStartProjectBinding.applyPreferredProjectFallback(
-                    to: decodedThread,
-                    preferredProjectPath: requestedSignature.projectPath
+            if let threadValue = resultObject["thread"] {
+                let decodedThreadFromResponse = await decodeModelOffMain(
+                    CodexThread.self,
+                    from: threadValue,
+                    omittingTopLevelKeys: ["turns"]
                 )
-                upsertThread(decodedThread, treatAsServerState: true)
-                resumedThread = decodedThread
+                guard !Task.isCancelled,
+                      isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                      isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                    throw CancellationError()
+                }
 
-                if let threadObject = threadValue.objectValue {
-                    if didRequestExcludedTurns,
-                       threadObject["turns"]?.arrayValue?.isEmpty == false {
-                        markTurnPaginationUnsupportedForCurrentRuntime()
-                        didRequestExcludedTurns = false
-                    }
-                    let historyMessages = decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
-                    registerSubagentThreads(from: historyMessages, parentThreadId: threadId)
-                    if !historyMessages.isEmpty {
-                        didReceiveEmbeddedHistory = true
-                        initialTurnsLoadedByThreadID.insert(threadId)
-                        updateThreadTimelineProjectionForEmbeddedHistory(
+                if var decodedThread = decodedThreadFromResponse {
+                    decodedThread.syncState = .live
+                    decodedThread = CodexThreadStartProjectBinding.applyPreferredProjectFallback(
+                        to: decodedThread,
+                        preferredProjectPath: requestedSignature.projectPath
+                    )
+                    upsertThread(decodedThread, treatAsServerState: true)
+                    resumedThread = decodedThread
+
+                    if let threadObject = threadValue.objectValue {
+                        if didRequestExcludedTurns,
+                           threadObject["turns"]?.arrayValue?.isEmpty == false {
+                            markTurnPaginationUnsupportedForCurrentRuntime()
+                            didRequestExcludedTurns = false
+                        }
+                        let historyDecodeResult = try await decodeMessagesFromThreadReadOffMain(
                             threadId: threadId,
-                            decodedMessageCount: historyMessages.count
+                            threadObject: threadObject
                         )
-                        let existingMessages = messagesByThread[threadId] ?? []
-                        let activeThreadIDs = Set(activeTurnIdByThread.keys)
-                        let activeTurnIDs = Set(activeTurnIdByThread.values)
-                        let runningIDs = runningThreadIDs
-                        let usedRecentWindow = threadHasActiveOrRunningTurn(threadId)
-                            && Self.shouldPreferRecentHistoryWindow(
-                                existingCount: existingMessages.count,
-                                historyCount: historyMessages.count
-                            )
-                        if !usedRecentWindow {
-                            markThreadLocalHistoryStartAuthoritative(threadId, clearRemoteCursor: true)
-                        }
-                        if usedRecentWindow {
-                            markThreadNeedingCanonicalHistoryReconcile(threadId)
-                        }
-                        let merged = try await mergeHistoryMessagesOffMainActor(
-                            existing: existingMessages,
-                            history: historyMessages,
-                            activeThreadIDs: activeThreadIDs,
-                            activeTurnIDs: activeTurnIDs,
-                            runningThreadIDs: runningIDs,
-                            preferRecentWindow: usedRecentWindow
-                        )
-                        guard !Task.isCancelled,
-                              isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                        guard let historyMessages = commitHistoryDecodeResult(
+                            historyDecodeResult,
+                            token: historyDecodeToken
+                        ) else {
                             throw CancellationError()
                         }
-                        let shouldForceMerge = force || forcedResumeEscalationThreadIDs.contains(threadId)
-                        // Forced resumes are used when reopening a running thread, so merge the
-                        // latest snapshot even mid-run and let mergeHistoryMessages preserve
-                        // existing streaming rows instead of waiting for the final block.
-                        if (shouldForceMerge || !threadHasActiveOrRunningTurn(threadId) || existingMessages.isEmpty)
-                            && merged != existingMessages {
-                            messagesByThread[threadId] = merged
-                            persistMessages()
-                            updateCurrentOutput(for: threadId)
-                        }
-                        if usedRecentWindow, !threadHasActiveOrRunningTurn(threadId) {
-                            scheduleCanonicalHistoryReconcileIfNeeded(for: threadId)
-                        } else if !threadHasActiveOrRunningTurn(threadId) {
-                            markThreadCanonicalHistoryReconciled(threadId)
+                        registerSubagentThreads(from: historyMessages, parentThreadId: threadId)
+                        if !historyMessages.isEmpty {
+                            didReceiveEmbeddedHistory = true
+                            initialTurnsLoadedByThreadID.insert(threadId)
+                            updateThreadTimelineProjectionForEmbeddedHistory(
+                                threadId: threadId,
+                                decodedMessageCount: historyMessages.count
+                            )
+                            let existingMessages = messagesByThread[threadId] ?? []
+                            let activeThreadIDs = Set(activeTurnIdByThread.keys)
+                            let activeTurnIDs = Set(activeTurnIdByThread.values)
+                            let runningIDs = runningThreadIDs
+                            let usedRecentWindow = threadHasActiveOrRunningTurn(threadId)
+                                && Self.shouldPreferRecentHistoryWindow(
+                                    existingCount: existingMessages.count,
+                                    historyCount: historyMessages.count
+                                )
+                            if !usedRecentWindow {
+                                markThreadLocalHistoryStartAuthoritative(threadId, clearRemoteCursor: true)
+                            }
+                            if usedRecentWindow {
+                                markThreadNeedingCanonicalHistoryReconcile(threadId)
+                            }
+                            let merged = try await mergeHistoryMessagesOffMainActor(
+                                existing: existingMessages,
+                                history: historyMessages,
+                                activeThreadIDs: activeThreadIDs,
+                                activeTurnIDs: activeTurnIDs,
+                                runningThreadIDs: runningIDs,
+                                preferRecentWindow: usedRecentWindow
+                            )
+                            guard !Task.isCancelled,
+                                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                                  isHistoryDecodeTokenCurrent(historyDecodeToken) else {
+                                throw CancellationError()
+                            }
+                            let shouldForceMerge = force || forcedResumeEscalationThreadIDs.contains(threadId)
+                            // Forced resumes are used when reopening a running thread, so merge the
+                            // latest snapshot even mid-run and let mergeHistoryMessages preserve
+                            // existing streaming rows instead of waiting for the final block.
+                            if (shouldForceMerge || !threadHasActiveOrRunningTurn(threadId) || existingMessages.isEmpty)
+                                && merged != existingMessages {
+                                messagesByThread[threadId] = merged
+                                persistMessages()
+                                updateCurrentOutput(for: threadId)
+                            }
+                            if usedRecentWindow, !threadHasActiveOrRunningTurn(threadId) {
+                                scheduleCanonicalHistoryReconcileIfNeeded(for: threadId)
+                            } else if !threadHasActiveOrRunningTurn(threadId) {
+                                markThreadCanonicalHistoryReconciled(threadId)
+                            }
                         }
                     }
+                } else if let index = threadIndex(for: threadId) {
+                    threads[index].syncState = .live
                 }
             } else if let index = threadIndex(for: threadId) {
                 threads[index].syncState = .live
             }
 
             guard !Task.isCancelled,
-                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration) else {
+                  isPerThreadRefreshCurrent(for: threadId, generation: refreshGeneration),
+                  isHistoryDecodeTokenCurrent(historyDecodeToken) else {
                 throw CancellationError()
             }
             if !didRequestExcludedTurns || didReceiveEmbeddedHistory {
@@ -3561,17 +3688,17 @@ extension CodexService {
     }
 
     // Parses `result.files` so tests can validate decoding without transport wiring.
-    func decodeFuzzyFileMatches(from result: JSONValue?) -> [CodexFuzzyFileMatch]? {
+    func decodeFuzzyFileMatches(from result: JSONValue?) async -> [CodexFuzzyFileMatch]? {
         guard let resultObject = result?.objectValue,
               let filesValue = resultObject["files"] else {
             return nil
         }
 
-        return decodeModel([CodexFuzzyFileMatch].self, from: filesValue)
+        return await decodeModelOffMain([CodexFuzzyFileMatch].self, from: filesValue)
     }
 
     // Parses skills/list payloads from both bucketed and flat server response shapes.
-    func decodeSkillMetadata(from result: JSONValue?) -> [CodexSkillMetadata]? {
+    func decodeSkillMetadata(from result: JSONValue?) async -> [CodexSkillMetadata]? {
         guard let resultObject = result?.objectValue else {
             return nil
         }
@@ -3581,27 +3708,35 @@ extension CodexService {
 
         if let dataItems = resultObject["data"]?.arrayValue {
             hasSkillContainer = true
+            var bucketValues: [JSONValue] = []
             for item in dataItems {
                 guard let itemObject = item.objectValue else {
                     continue
                 }
-                if let skillsValue = itemObject["skills"],
-                   let decodedSkills = decodeModel([CodexSkillMetadata].self, from: skillsValue) {
-                    collectedSkills.append(contentsOf: decodedSkills)
+                if let skillsValue = itemObject["skills"] {
+                    bucketValues.append(skillsValue)
                 }
             }
+            let decodedBuckets = await decodeModelsOffMain(
+                [CodexSkillMetadata].self,
+                from: bucketValues
+            )
+            collectedSkills.append(contentsOf: decodedBuckets.compactMap { $0 }.flatMap { $0 })
 
             if collectedSkills.isEmpty,
-               let decodedSkills = decodeModel([CodexSkillMetadata].self, from: .array(dataItems)) {
+               let decodedSkills = await decodeModelOffMain(
+                   [CodexSkillMetadata].self,
+                   from: .array(dataItems)
+               ) {
                 collectedSkills.append(contentsOf: decodedSkills)
             }
         }
 
-        if collectedSkills.isEmpty,
-           let skillsValue = resultObject["skills"],
-           let decodedSkills = decodeModel([CodexSkillMetadata].self, from: skillsValue) {
+        if collectedSkills.isEmpty, let skillsValue = resultObject["skills"] {
             hasSkillContainer = true
-            collectedSkills.append(contentsOf: decodedSkills)
+            if let decodedSkills = await decodeModelOffMain([CodexSkillMetadata].self, from: skillsValue) {
+                collectedSkills.append(contentsOf: decodedSkills)
+            }
         } else if resultObject["skills"] != nil {
             hasSkillContainer = true
         }
@@ -3610,27 +3745,23 @@ extension CodexService {
     }
 
     // Parses Codex app-server plugin/list marketplace payloads.
-    func decodePluginMetadata(from result: JSONValue?) -> [CodexPluginMetadata]? {
+    func decodePluginMetadata(from result: JSONValue?) async -> [CodexPluginMetadata]? {
         guard let resultObject = result?.objectValue,
-              let response = decodeModel(CodexPluginListResponse.self, from: .object(resultObject)) else {
+              let response = await decodeModelOffMain(
+                CodexPluginListResponse.self,
+                from: .object(resultObject)
+              ) else {
             return nil
         }
 
-        var plugins: [CodexPluginMetadata] = []
-        for marketplace in response.marketplaces {
-            let marketplaceName = marketplace.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !marketplaceName.isEmpty else {
-                continue
-            }
-
-            for plugin in marketplace.plugins {
-                let pluginName = plugin.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !pluginName.isEmpty else {
-                    continue
-                }
-
-                plugins.append(
-                    CodexPluginMetadata(
+        return try? await CodexTransferWork.run { () -> [CodexPluginMetadata] in
+            response.marketplaces.flatMap { marketplace -> [CodexPluginMetadata] in
+                let marketplaceName = marketplace.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !marketplaceName.isEmpty else { return [] }
+                return marketplace.plugins.compactMap { plugin -> CodexPluginMetadata? in
+                    let pluginName = plugin.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !pluginName.isEmpty else { return nil }
+                    return CodexPluginMetadata(
                         id: plugin.id,
                         name: pluginName,
                         marketplaceName: marketplaceName,
@@ -3641,11 +3772,9 @@ extension CodexService {
                         enabled: plugin.enabled,
                         installPolicy: plugin.installPolicy
                     )
-                )
+                }
             }
         }
-
-        return plugins
     }
 
     func shouldRetrySkillsListWithCwdFallback(_ error: Error) -> Bool {

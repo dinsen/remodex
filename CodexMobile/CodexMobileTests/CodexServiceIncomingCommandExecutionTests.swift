@@ -3095,6 +3095,49 @@ final class CodexServiceIncomingCommandExecutionTests: XCTestCase {
         XCTAssertEqual(assistantRows.map(\.text), [introText, finalText])
     }
 
+    func testThreadReadSemanticHistoryDecodeUsesTransferWorkerAndPreservesItemIdentity() async throws {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+        let itemID = "assistant-item-\(UUID().uuidString)"
+        let expectedText = "History semantic decoding stays item scoped."
+        let threadObject: [String: JSONValue] = [
+            "turns": .array([
+                .object([
+                    "id": .string(turnID),
+                    "status": .object(["type": .string("completed")]),
+                    "items": .array([
+                        .object([
+                            "id": .string(itemID),
+                            "type": .string("agentMessage"),
+                            "content": .array([
+                                .object([
+                                    "type": .string("outputText"),
+                                    "text": .string(expectedText),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]
+
+        let historyDecodeToken = service.currentHistoryDecodeToken(for: threadID)
+        let decodeResult = try await service.decodeMessagesFromThreadReadOffMain(
+            threadId: threadID,
+            threadObject: threadObject
+        )
+        let decoded = try XCTUnwrap(
+            service.commitHistoryDecodeResult(decodeResult, token: historyDecodeToken)
+        )
+
+        XCTAssertEqual(decoded.count, 1)
+        XCTAssertEqual(decoded[0].role, .assistant)
+        XCTAssertEqual(decoded[0].itemId, itemID)
+        XCTAssertEqual(decoded[0].turnId, turnID)
+        XCTAssertEqual(decoded[0].text, expectedText)
+    }
+
     func testHistoryMergeDoesNotRegressClosedSingleAssistantTurnToShorterSnapshot() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"

@@ -11,7 +11,7 @@ import XCTest
 final class CodexFuzzyFileSearchDecodeTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
 
-    func testDecodeFuzzyFileSearchParsesResultFiles() {
+    func testDecodeFuzzyFileSearchParsesResultFiles() async {
         let service = makeService()
         let result: JSONValue = .object([
             "files": .array([
@@ -25,7 +25,7 @@ final class CodexFuzzyFileSearchDecodeTests: XCTestCase {
             ]),
         ])
 
-        let files = service.decodeFuzzyFileMatches(from: result)
+        let files = await service.decodeFuzzyFileMatches(from: result)
 
         XCTAssertEqual(files?.count, 1)
         XCTAssertEqual(files?.first?.root, "/workspace")

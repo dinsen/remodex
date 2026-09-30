@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexSkillMetadata: Decodable, Hashable, Sendable, Identifiable {
+nonisolated struct CodexSkillMetadata: Decodable, Hashable, Sendable, Identifiable {
     let name: String
     let description: String?
     let path: String?
@@ -60,7 +60,7 @@ struct CodexTurnSkillMention: Hashable, Sendable {
     let path: String?
 }
 
-struct CodexPluginMetadata: Hashable, Sendable, Identifiable {
+nonisolated struct CodexPluginMetadata: Hashable, Sendable, Identifiable {
     let id: String
     let name: String
     let marketplaceName: String
@@ -120,17 +120,17 @@ struct CodexPluginMetadata: Hashable, Sendable, Identifiable {
     }
 }
 
-struct CodexPluginListResponse: Decodable {
+nonisolated struct CodexPluginListResponse: Decodable, Sendable {
     let marketplaces: [CodexPluginMarketplace]
 }
 
-struct CodexPluginMarketplace: Decodable {
+nonisolated struct CodexPluginMarketplace: Decodable, Sendable {
     let name: String
     let path: String?
     let plugins: [CodexPluginListItem]
 }
 
-struct CodexPluginListItem: Decodable {
+nonisolated struct CodexPluginListItem: Decodable, Sendable {
     let id: String
     let name: String
     let installed: Bool
@@ -139,7 +139,7 @@ struct CodexPluginListItem: Decodable {
     let interface: CodexPluginInterface?
 }
 
-struct CodexPluginInterface: Decodable, Hashable, Sendable {
+nonisolated struct CodexPluginInterface: Decodable, Hashable, Sendable {
     let displayName: String?
     let shortDescription: String?
     let category: String?

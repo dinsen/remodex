@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexRuntimeSettings: Codable, Hashable, Sendable {
+nonisolated struct CodexRuntimeSettings: Codable, Hashable, Sendable {
     let model: String?
     let reasoningEffort: String?
     let serviceTier: String?
@@ -23,7 +23,7 @@ struct CodexRuntimeSettings: Codable, Hashable, Sendable {
     }
 }
 
-extension CodexRuntimeSettings {
+nonisolated extension CodexRuntimeSettings {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(

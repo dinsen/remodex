@@ -19,29 +19,37 @@ enum TurnComposerImageAttachmentState: Codable, Equatable, Sendable {
 }
 
 enum TurnAttachmentPipeline {
-    private static let maxPayloadDimension: CGFloat = 1600
-    private static let thumbnailSide = TurnAttachmentThumbnailMetrics.side
-    private static let payloadCompressionQuality: CGFloat = 0.6
-    private static let thumbnailCompressionQuality: CGFloat = 0.6
+    nonisolated private static let maxPayloadDimension: CGFloat = 1600
+    nonisolated private static let thumbnailSide = TurnAttachmentThumbnailMetrics.side
+    nonisolated private static let payloadCompressionQuality: CGFloat = 0.6
+    nonisolated private static let thumbnailCompressionQuality: CGFloat = 0.6
+    @MainActor
     private static let thumbnailCache = NSCache<NSString, UIImage>()
 
     // Builds both payload and preview formats from raw picker data.
-    nonisolated static func makeAttachment(from sourceData: Data) -> CodexImageAttachment? {
-        guard let normalizedJPEGData = normalizePayloadJPEG(from: sourceData),
-              let thumbnailBase64 = makeThumbnailBase64JPEG(from: normalizedJPEGData) else {
+    nonisolated static func makeAttachment(from sourceData: Data) async -> CodexImageAttachment? {
+        do {
+            return try await CodexTransferWork.runMedia {
+                guard let normalizedJPEGData = normalizePayloadJPEG(from: sourceData),
+                      let thumbnailBase64 = makeThumbnailBase64JPEG(from: normalizedJPEGData) else {
+                    return nil
+                }
+
+                let payloadDataURL = "data:image/jpeg;base64,\(normalizedJPEGData.base64EncodedString())"
+                return CodexImageAttachment(
+                    thumbnailBase64JPEG: thumbnailBase64,
+                    payloadDataURL: payloadDataURL,
+                    sourceURL: nil
+                )
+            }
+        } catch {
             return nil
         }
-
-        let payloadDataURL = "data:image/jpeg;base64,\(normalizedJPEGData.base64EncodedString())"
-        return CodexImageAttachment(
-            thumbnailBase64JPEG: thumbnailBase64,
-            payloadDataURL: payloadDataURL,
-            sourceURL: nil
-        )
     }
 
     // Decodes/returns cached thumbnails so scrolling does not repeatedly decode base64.
-    static func thumbnailImage(fromBase64 value: String) -> UIImage? {
+    @MainActor
+    static func thumbnailImage(fromBase64 value: String) async -> UIImage? {
         guard !value.isEmpty else {
             return nil
         }
@@ -51,8 +59,10 @@ enum TurnAttachmentPipeline {
             return cached
         }
 
-        guard let data = Data(base64Encoded: value),
-              let image = UIImage(data: data) else {
+        let decoded: UserAttachmentThumbnailDecoder.DecodedThumbnail? = try? await CodexTransferWork.runMedia {
+            UserAttachmentThumbnailDecoder.thumbnailImage(fromBase64: value)
+        }
+        guard let image = decoded?.image else {
             return nil
         }
 

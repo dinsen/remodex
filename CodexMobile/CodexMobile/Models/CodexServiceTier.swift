@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexServiceTier: RawRepresentable, Codable, Hashable, Sendable {
+nonisolated struct CodexServiceTier: RawRepresentable, Codable, Hashable, Sendable {
     let rawValue: String
     let displayName: String
     let description: String

@@ -7,18 +7,26 @@
 
 import Foundation
 
-enum CodexTimestampParser {
-    private static let iso8601Formatters: [ISO8601DateFormatter] = {
+nonisolated enum CodexTimestampParser {
+    nonisolated private static func iso8601FormattersForCurrentThread() -> [ISO8601DateFormatter] {
+        let key = "CodexTimestampParser.iso8601Formatters"
+        let threadDictionary = Thread.current.threadDictionary
+        if let formatters = threadDictionary[key] as? [ISO8601DateFormatter] {
+            return formatters
+        }
+
         let withFractions = ISO8601DateFormatter()
         withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
         let standard = ISO8601DateFormatter()
         standard.formatOptions = [.withInternetDateTime]
 
-        return [withFractions, standard]
-    }()
+        let formatters = [withFractions, standard]
+        threadDictionary[key] = formatters
+        return formatters
+    }
 
-    static func parseString(_ value: String?) -> Date? {
+    nonisolated static func parseString(_ value: String?) -> Date? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else {
             return nil
@@ -28,7 +36,7 @@ enum CodexTimestampParser {
             return decodeUnixTimestamp(numeric)
         }
 
-        for formatter in iso8601Formatters {
+        for formatter in iso8601FormattersForCurrentThread() {
             if let date = formatter.date(from: trimmed) {
                 return date
             }
@@ -38,7 +46,7 @@ enum CodexTimestampParser {
     }
 
     // Accepts second, millisecond, microsecond, and nanosecond Unix timestamps.
-    static func decodeUnixTimestamp(_ rawValue: Double) -> Date {
+    nonisolated static func decodeUnixTimestamp(_ rawValue: Double) -> Date {
         let absoluteValue = abs(rawValue)
         let secondsValue: Double
 
@@ -62,17 +70,17 @@ enum CodexTimestampParser {
     }
 }
 
-enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
+nonisolated enum CodexThreadSyncState: String, Codable, Hashable, Sendable {
     case live
     case archivedLocal
 }
 
-struct CodexThreadSection: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexThreadSection: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let name: String
 }
 
-enum CodexRuntimeProvider: String, Codable, Hashable, Sendable {
+nonisolated enum CodexRuntimeProvider: String, Codable, Hashable, Sendable {
     case codex
     case opencode
 }
@@ -80,7 +88,7 @@ enum CodexRuntimeProvider: String, Codable, Hashable, Sendable {
 // Who created the session, when it was not the user. Scheduled runs are the common case
 // and carry no extra meaning worth a word in a sidebar row, so they render as the clock
 // glyph Synara already uses for automations; named kinds keep their short text.
-enum CodexThreadAutomationSource: Hashable, Sendable {
+nonisolated enum CodexThreadAutomationSource: Hashable, Sendable {
     case scheduled
     case pullRequestFix
 
@@ -101,7 +109,7 @@ enum CodexThreadAutomationSource: Hashable, Sendable {
     }
 }
 
-struct CodexThread: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var title: String?
     var name: String?
@@ -386,12 +394,12 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
 
 extension CodexThread {
     // --- UI helpers -----------------------------------------------------------
-    static let defaultDisplayTitle = "New Thread"
-    static let noProjectDisplayName = "No Project"
-    private static let noProjectGroupKey = "__no_project__"
+    nonisolated static let defaultDisplayTitle = "New Thread"
+    nonisolated static let noProjectDisplayName = "No Project"
+    nonisolated private static let noProjectGroupKey = "__no_project__"
 
     // Old rollouts may still persist "Conversation", so treat both labels as the same placeholder.
-    static func isGenericPlaceholderTitle(_ value: String?) -> Bool {
+    nonisolated static func isGenericPlaceholderTitle(_ value: String?) -> Bool {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else {
             return false
@@ -494,7 +502,7 @@ extension CodexThread {
     }
 
     // Some thread/list payloads carry cwd inside metadata instead of as a top-level field.
-    private static func decodeProjectPath(from metadata: [String: JSONValue]?) -> String? {
+    nonisolated private static func decodeProjectPath(from metadata: [String: JSONValue]?) -> String? {
         guard let metadata else {
             return nil
         }
@@ -601,7 +609,7 @@ extension CodexThread {
 
     // Single source of truth for "this path is a Codex-managed worktree", so callers never have
     // to compare against the glyph name the sidebar happens to use for it.
-    static func isManagedWorktreePath(_ normalizedProjectPath: String?) -> Bool {
+    nonisolated static func isManagedWorktreePath(_ normalizedProjectPath: String?) -> Bool {
         guard let normalizedProjectPath else {
             return false
         }
@@ -610,7 +618,7 @@ extension CodexThread {
     }
 
     // Distinguishes Codex-managed worktrees from the main repo in compact sidebar UIs.
-    static func projectDisplayLabel(for normalizedProjectPath: String?) -> String {
+    nonisolated static func projectDisplayLabel(for normalizedProjectPath: String?) -> String {
         guard let normalizedProjectPath else {
             return noProjectDisplayName
         }
@@ -623,7 +631,7 @@ extension CodexThread {
         return "\(baseLabel) \(worktreeToken)"
     }
 
-    static func projectIconSystemName(for normalizedProjectPath: String?) -> String {
+    nonisolated static func projectIconSystemName(for normalizedProjectPath: String?) -> String {
         guard let normalizedProjectPath else {
             return "bubble.left.and.bubble.right"
         }
@@ -632,14 +640,14 @@ extension CodexThread {
     }
 
     // Shared path gate for every flow that needs to decide whether a cwd represents a real local project.
-    static func normalizedFilesystemProjectPath(_ value: String?) -> String? {
+    nonisolated static func normalizedFilesystemProjectPath(_ value: String?) -> String? {
         normalizeProjectPath(value)
     }
 
     // Git writes are repo-scoped, so every live root chat bound to a real cwd can expose them.
     // Do not tie this to sidebar/thread-list hydration; background refreshes would make
     // the toolbar disappear even though the active repo has not changed.
-    static func gitControlsVisible(
+    nonisolated static func gitControlsVisible(
         for thread: CodexThread,
         workingDirectory rawWorkingDirectory: String?,
         isConnected: Bool
@@ -656,7 +664,7 @@ extension CodexThread {
 
     // --- Date parsing ---------------------------------------------------------
 
-    private static func decodeDateIfPresent(
+    nonisolated private static func decodeDateIfPresent(
         from container: KeyedDecodingContainer<CodingKeys>,
         keys: [CodingKeys]
     ) throws -> Date? {
@@ -683,7 +691,7 @@ extension CodexThread {
 
         return nil
     }
-    private static func decodeStringIfPresent(
+    nonisolated private static func decodeStringIfPresent(
         from container: KeyedDecodingContainer<CodingKeys>,
         keys: [CodingKeys]
     ) -> String? {
@@ -697,7 +705,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func decodeIdentifierIfPresent(
+    nonisolated private static func decodeIdentifierIfPresent(
         from container: KeyedDecodingContainer<CodingKeys>,
         keys: [CodingKeys]
     ) -> String? {
@@ -710,7 +718,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func decodeIntegerIfPresent(
+    nonisolated private static func decodeIntegerIfPresent(
         from container: KeyedDecodingContainer<CodingKeys>,
         keys: [CodingKeys]
     ) -> Int? {
@@ -725,7 +733,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func decodeDoubleIfPresent(
+    nonisolated private static func decodeDoubleIfPresent(
         from container: KeyedDecodingContainer<CodingKeys>,
         keys: [CodingKeys]
     ) -> Double? {
@@ -740,7 +748,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func decodeThreadIdentity(
+    nonisolated private static func decodeThreadIdentity(
         from container: KeyedDecodingContainer<CodingKeys>,
         metadata: [String: JSONValue]?,
         keys: [CodingKeys],
@@ -762,7 +770,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func decodeGoalStatus(
+    nonisolated private static func decodeGoalStatus(
         from container: KeyedDecodingContainer<CodingKeys>,
         metadata: [String: JSONValue]?
     ) -> CodexThreadGoalStatus? {
@@ -782,7 +790,7 @@ extension CodexThread {
         return nil
     }
 
-    private static func normalizeGoalStatus(_ value: String?) -> CodexThreadGoalStatus? {
+    nonisolated private static func normalizeGoalStatus(_ value: String?) -> CodexThreadGoalStatus? {
         guard let value else { return nil }
         let normalized = value
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -799,7 +807,7 @@ extension CodexThread {
         }
     }
 
-    private static func sanitizedAgentIdentity(_ value: String?) -> String? {
+    nonisolated private static func sanitizedAgentIdentity(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -812,7 +820,7 @@ extension CodexThread {
         return trimmed
     }
 
-    private static func normalizeIdentifier(_ value: String?) -> String? {
+    nonisolated private static func normalizeIdentifier(_ value: String?) -> String? {
         guard let value else {
             return nil
         }
@@ -821,7 +829,7 @@ extension CodexThread {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func normalizeProjectPath(_ value: String?) -> String? {
+    nonisolated private static func normalizeProjectPath(_ value: String?) -> String? {
         guard let value else {
             return nil
         }
@@ -852,7 +860,7 @@ extension CodexThread {
     }
 
     // Preserves valid filesystem roots that would otherwise be mangled by generic trailing-slash trimming.
-    private static func normalizedFilesystemRootPath(_ value: String) -> String? {
+    nonisolated private static func normalizedFilesystemRootPath(_ value: String) -> String? {
         if value == "/" {
             return "/"
         }
@@ -886,7 +894,7 @@ extension CodexThread {
     }
 
     // Rejects pseudo-buckets like `server` or `_default` so only real local paths create project groups.
-    private static func isLikelyFilesystemPath(_ value: String) -> Bool {
+    nonisolated private static func isLikelyFilesystemPath(_ value: String) -> Bool {
         if value == "/" {
             return true
         }
@@ -911,7 +919,7 @@ extension CodexThread {
         return value.hasPrefix("\\\\")
     }
 
-    private static func projectBaseDisplayName(for normalizedProjectPath: String) -> String {
+    nonisolated private static func projectBaseDisplayName(for normalizedProjectPath: String) -> String {
         let lastComponent = (normalizedProjectPath as NSString).lastPathComponent
         if !lastComponent.isEmpty, lastComponent != "/" {
             return lastComponent
@@ -920,7 +928,7 @@ extension CodexThread {
         return normalizedProjectPath
     }
 
-    private static func codexManagedWorktreeToken(for normalizedProjectPath: String) -> String? {
+    nonisolated private static func codexManagedWorktreeToken(for normalizedProjectPath: String) -> String? {
         let components = lexicalPathComponents(for: normalizedProjectPath)
         guard let worktreesIndex = components.firstIndex(of: "worktrees"),
               worktreesIndex > 0,
@@ -937,14 +945,14 @@ extension CodexThread {
         return token.isEmpty ? nil : token
     }
 
-    private static func lexicalPathComponents(for normalizedProjectPath: String) -> [String] {
+    nonisolated private static func lexicalPathComponents(for normalizedProjectPath: String) -> [String] {
         normalizedProjectPath
             .replacingOccurrences(of: "\\", with: "/")
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
     }
 
-    private static func codexManagedWorktreeDisplayToken(for normalizedProjectPath: String) -> String? {
+    nonisolated private static func codexManagedWorktreeDisplayToken(for normalizedProjectPath: String) -> String? {
         guard let token = codexManagedWorktreeToken(for: normalizedProjectPath) else {
             return nil
         }

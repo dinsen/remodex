@@ -2250,7 +2250,7 @@ final class TurnViewModel {
     }
 
     private nonisolated static func loadComposerAttachmentState(fromData data: Data) async -> TurnComposerImageAttachmentState {
-        guard let attachment = TurnAttachmentPipeline.makeAttachment(from: data) else {
+        guard let attachment = await TurnAttachmentPipeline.makeAttachment(from: data) else {
             return .failed
         }
         return .ready(attachment)

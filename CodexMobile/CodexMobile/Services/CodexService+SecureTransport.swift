@@ -219,6 +219,7 @@ extension CodexService {
             outputByteCount: 32
         )
 
+        invalidateTransferSession()
         secureSession = CodexSecureSession(
             sessionId: sessionId,
             keyEpoch: serverHello.keyEpoch,
@@ -257,56 +258,42 @@ extension CodexService {
     }
 
     // Handles raw relay JSON before any JSON-RPC decoding so secure controls stay separate.
-    func processIncomingWireText(_ text: String) {
-        if let kind = wireMessageKind(from: text) {
+    @discardableResult
+    func processIncomingWireText(_ text: String, expectedGeneration: UUID? = nil) async -> Bool {
+        let generation = expectedGeneration ?? transferSessionGeneration
+        guard transferSessionGeneration == generation else { return false }
+        let jsonValue = try? await transferJSONCodec.decodeText(JSONValue.self, from: text)
+        guard transferSessionGeneration == generation else { return false }
+
+        if let kind = jsonValue?.objectValue?["kind"]?.stringValue {
             switch kind {
             case "serverHello", "secureReady", "secureError":
-                bufferSecureControlMessage(kind: kind, rawText: text)
-                return
+                let secureError = kind == "secureError"
+                    ? try? await transferJSONCodec.decodeText(SecureErrorMessage.self, from: text)
+                    : nil
+                guard transferSessionGeneration == generation else { return false }
+                bufferSecureControlMessage(kind: kind, rawText: text, secureError: secureError)
+                return true
             case "encryptedEnvelope":
-                handleEncryptedEnvelopeText(text)
-                return
+                return await handleEncryptedEnvelopeText(text, generation: generation)
             default:
                 break
             }
         }
 
-        processIncomingText(text)
-    }
-
-    // Encrypts JSON-RPC requests/responses before they leave the iPhone.
-    func secureWireText(for plaintext: String) throws -> String {
-        guard var secureSession else {
-            throw CodexSecureTransportError.invalidHandshake(
-                "The secure Remodex session is not ready yet. Try reconnecting."
+        do {
+            let message = try await transferJSONCodec.decodeText(RPCMessage.self, from: text)
+            guard transferSessionGeneration == generation else { return false }
+            return await dispatchIncomingRPCMessageOffMain(
+                message,
+                rawText: text,
+                expectedGeneration: generation
             )
+        } catch {
+            guard transferSessionGeneration == generation else { return false }
+            lastErrorMessage = "Unable to decode server payload"
+            return true
         }
-
-        let payload = SecureApplicationPayload(
-            bridgeOutboundSeq: nil,
-            payloadText: plaintext
-        )
-        let payloadData = try JSONEncoder().encode(payload)
-        let nonceData = codexSecureNonce(sender: "iphone", counter: secureSession.nextOutboundCounter)
-        let nonce = try AES.GCM.Nonce(data: nonceData)
-        let sealedBox = try AES.GCM.seal(payloadData, using: secureSession.phoneToMacKey, nonce: nonce)
-        let envelope = SecureEnvelope(
-            kind: "encryptedEnvelope",
-            v: codexSecureProtocolVersion,
-            sessionId: secureSession.sessionId,
-            keyEpoch: secureSession.keyEpoch,
-            sender: "iphone",
-            counter: secureSession.nextOutboundCounter,
-            ciphertext: sealedBox.ciphertext.base64EncodedString(),
-            tag: sealedBox.tag.base64EncodedString()
-        )
-        secureSession.nextOutboundCounter += 1
-        self.secureSession = secureSession
-        let data = try JSONEncoder().encode(envelope)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw CodexSecureTransportError.invalidHandshake("Unable to encode the secure Remodex envelope.")
-        }
-        return text
     }
 
     // Saves the QR-derived bridge metadata used for secure reconnects.
@@ -336,6 +323,7 @@ extension CodexService {
 
     // Resets volatile secure state while preserving the trusted-device registry.
     func resetSecureTransportState(preservePendingQRBootstrapState: Bool = false) {
+        invalidateTransferSession()
         secureSession = nil
         pendingHandshake = nil
         let continuations = pendingSecureControlContinuations
@@ -961,17 +949,27 @@ private extension CodexService {
         )
     }
 
-    func sendWireControlMessage<Value: Encodable>(_ value: Value) async throws {
-        let data = try JSONEncoder().encode(value)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw CodexSecureTransportError.invalidHandshake("Unable to encode the secure Remodex control payload.")
+    func sendWireControlMessage<Value: Encodable & Sendable>(_ value: Value) async throws {
+        let lane = transferSendLane
+        try await lane.withPermit {
+            let generation = self.transferSessionGeneration
+            let socket = try self.currentTransferSocket()
+            let text = try await self.transferJSONCodec.encodeText(value)
+            try Task.checkCancellation()
+            try await self.sendRawTextAdmitted(
+                text,
+                socket: socket,
+                generation: generation,
+                onSendAttempt: nil,
+                shouldSend: nil
+            )
         }
-        try await sendRawText(text)
     }
 
     func waitForSecureControlMessage(kind: String, timeoutSeconds: TimeInterval = 12) async throws -> String {
         if let bufferedSecureError = bufferedSecureControlMessages["secureError"]?.first,
-           let secureError = try? decodeSecureControl(SecureErrorMessage.self, from: bufferedSecureError) {
+           let secureError = try? await transferJSONCodec.decodeText(SecureErrorMessage.self, from: bufferedSecureError),
+           bufferedSecureControlMessages["secureError"]?.first == bufferedSecureError {
             bufferedSecureControlMessages["secureError"] = []
             throw CodexSecureTransportError.secureError(secureError.message)
         }
@@ -1002,9 +1000,8 @@ private extension CodexService {
         }
     }
 
-    func bufferSecureControlMessage(kind: String, rawText: String) {
-        if kind == "secureError",
-           let secureError = try? decodeSecureControl(SecureErrorMessage.self, from: rawText) {
+    func bufferSecureControlMessage(kind: String, rawText: String, secureError: SecureErrorMessage? = nil) {
+        if kind == "secureError", let secureError {
             lastErrorMessage = secureError.message
             if secureError.code == "update_required" {
                 secureConnectionState = .updateRequired
@@ -1064,47 +1061,83 @@ private extension CodexService {
         waiter.continuation.resume(with: result)
     }
 
-    func handleEncryptedEnvelopeText(_ text: String) {
+    func handleEncryptedEnvelopeText(_ text: String, generation: UUID) async -> Bool {
         // No active session yet (handshake in progress) — silently drop stale envelopes.
-        guard var secureSession else { return }
+        guard let secureSession else { return true }
+        let inboundSnapshot = CodexSecureInboundSnapshot(
+            sessionId: secureSession.sessionId,
+            keyEpoch: secureSession.keyEpoch,
+            lastCounter: secureSession.lastInboundCounter,
+            key: secureSession.macToPhoneKey
+        )
 
-        guard let envelope = try? decodeSecureControl(SecureEnvelope.self, from: text),
-              envelope.sessionId == secureSession.sessionId,
-              envelope.keyEpoch == secureSession.keyEpoch,
-              envelope.sender == "mac",
-              envelope.counter > secureSession.lastInboundCounter else {
+        let opened: CodexOpenedSecureEnvelope
+        do {
+            opened = try await transferJSONCodec.openSecureText(text, session: inboundSnapshot)
+        } catch CodexSecureTransferCodecError.invalidEnvelope {
+            guard transferSessionGeneration == generation,
+                  self.secureSession?.sessionId == inboundSnapshot.sessionId,
+                  self.secureSession?.keyEpoch == inboundSnapshot.keyEpoch else { return false }
             lastErrorMessage = "The secure Remodex payload could not be verified."
             secureConnectionState = .rePairRequired
-            return
-        }
-
-        do {
-            let nonce = try AES.GCM.Nonce(
-                data: codexSecureNonce(sender: envelope.sender, counter: envelope.counter)
-            )
-            let sealedBox = try AES.GCM.SealedBox(
-                nonce: nonce,
-                ciphertext: Data(base64EncodedOrEmpty: envelope.ciphertext),
-                tag: Data(base64EncodedOrEmpty: envelope.tag)
-            )
-            let plaintext = try AES.GCM.open(sealedBox, using: secureSession.macToPhoneKey)
-            let payload = try JSONDecoder().decode(SecureApplicationPayload.self, from: plaintext)
-            secureSession.lastInboundCounter = envelope.counter
-            self.secureSession = secureSession
-
-            if let bridgeOutboundSeq = payload.bridgeOutboundSeq {
-                if bridgeOutboundSeq <= lastAppliedBridgeOutboundSeq {
-                    return
-                }
-                advanceBridgeOutboundReplayCursor(to: bridgeOutboundSeq)
-            }
-
-            lastRawMessage = payload.payloadText
-            processIncomingText(payload.payloadText)
+            return true
         } catch {
+            guard transferSessionGeneration == generation,
+                  self.secureSession?.sessionId == inboundSnapshot.sessionId,
+                  self.secureSession?.keyEpoch == inboundSnapshot.keyEpoch else { return false }
             lastErrorMessage = CodexSecureTransportError.decryptFailed.localizedDescription
             secureConnectionState = .rePairRequired
+            return true
         }
+
+        guard transferSessionGeneration == generation,
+              let currentSession = self.secureSession,
+              currentSession.sessionId == inboundSnapshot.sessionId,
+              currentSession.keyEpoch == inboundSnapshot.keyEpoch,
+              currentSession.lastInboundCounter == inboundSnapshot.lastCounter else {
+            return false
+        }
+
+        if let bridgeOutboundSeq = opened.bridgeOutboundSeq {
+            if bridgeOutboundSeq <= lastAppliedBridgeOutboundSeq {
+                var updatedSession = currentSession
+                updatedSession.lastInboundCounter = opened.counter
+                self.secureSession = updatedSession
+                return true
+            }
+        }
+
+        let preparedModelPayload: CodexIncomingModelPayload?
+        switch opened.rpcResult {
+        case .message(let message):
+            preparedModelPayload = await prepareIncomingModelPayloadOffMain(for: message)
+        case .decodeFailed:
+            preparedModelPayload = nil
+        }
+
+        guard !Task.isCancelled,
+              transferSessionGeneration == generation,
+              var updatedSession = self.secureSession,
+              updatedSession.sessionId == inboundSnapshot.sessionId,
+              updatedSession.keyEpoch == inboundSnapshot.keyEpoch,
+              updatedSession.lastInboundCounter == inboundSnapshot.lastCounter else {
+            return false
+        }
+        updatedSession.lastInboundCounter = opened.counter
+        self.secureSession = updatedSession
+
+        if let bridgeOutboundSeq = opened.bridgeOutboundSeq {
+            advanceBridgeOutboundReplayCursor(to: bridgeOutboundSeq)
+        }
+
+        lastRawMessage = opened.payloadText
+        switch opened.rpcResult {
+        case .message(let message):
+            handleIncomingRPCMessage(message, decodedModelPayload: preparedModelPayload ?? .none)
+        case .decodeFailed:
+            lastErrorMessage = "Unable to decode server payload"
+        }
+        return true
     }
 
     // Resolves the live relay session for the preferred trusted Mac before we reconnect the socket.
@@ -1190,7 +1223,7 @@ private extension CodexService {
         request.httpMethod = "POST"
         request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(requestBody)
+        request.httpBody = try await transferJSONCodec.encode(requestBody)
 
         let session = trustedSessionResolveURLSession(for: resolveURL)
         defer { session.invalidateAndCancel() }
@@ -1215,7 +1248,7 @@ private extension CodexService {
         }
 
         if (200..<300).contains(httpResponse.statusCode) {
-            guard let resolved = try? JSONDecoder().decode(CodexTrustedSessionResolveResponse.self, from: data),
+            guard let resolved = try? await transferJSONCodec.decode(CodexTrustedSessionResolveResponse.self, from: data),
                   resolved.ok else {
                 throw CodexTrustedSessionResolveError.invalidResponse("The trusted device relay returned malformed session data.")
             }
@@ -1224,7 +1257,7 @@ private extension CodexService {
             return resolved
         }
 
-        let errorResponse = try? JSONDecoder().decode(CodexRelayErrorResponse.self, from: data)
+        let errorResponse = try? await transferJSONCodec.decode(CodexRelayErrorResponse.self, from: data)
         switch errorResponse?.code {
         case "session_unavailable":
             secureConnectionState = .liveSessionUnresolved
@@ -1323,7 +1356,7 @@ private extension CodexService {
         request.httpMethod = "POST"
         request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(["code": code])
+        request.httpBody = try await transferJSONCodec.encode(["code": code])
 
         let session = trustedSessionResolveURLSession(for: resolveURL)
         defer { session.invalidateAndCancel() }
@@ -1343,7 +1376,7 @@ private extension CodexService {
         }
 
         if (200..<300).contains(httpResponse.statusCode),
-           let resolved = try? JSONDecoder().decode(CodexPairingCodeResolveResponse.self, from: data),
+           let resolved = try? await transferJSONCodec.decode(CodexPairingCodeResolveResponse.self, from: data),
            resolved.ok {
             return CodexPairingQRPayload(
                 v: resolved.v,
@@ -1356,7 +1389,7 @@ private extension CodexService {
             )
         }
 
-        let errorResponse = try? JSONDecoder().decode(CodexRelayErrorResponse.self, from: data)
+        let errorResponse = try? await transferJSONCodec.decode(CodexRelayErrorResponse.self, from: data)
         switch errorResponse?.code {
         case "pairing_code_expired":
             throw CodexSecureTransportError.invalidQR("This pairing code has expired. Generate a new one from the Mac bridge.")
@@ -1412,7 +1445,7 @@ private extension CodexService {
     ) async throws -> SecureServerHello {
         while true {
             let raw = try await waitForSecureControlMessage(kind: "serverHello")
-            let hello = try decodeSecureControl(SecureServerHello.self, from: raw)
+            let hello = try await transferJSONCodec.decodeText(SecureServerHello.self, from: raw)
             if let echoedNonce = hello.clientNonce, echoedNonce != expectedClientNonce {
                 debugSecureLog("discarding stale serverHello (clientNonce mismatch)")
                 continue
@@ -1487,7 +1520,7 @@ private extension CodexService {
     ) async throws -> SecureReadyMessage {
         while true {
             let raw = try await waitForSecureControlMessage(kind: "secureReady")
-            let ready = try decodeSecureControl(SecureReadyMessage.self, from: raw)
+            let ready = try await transferJSONCodec.decodeText(SecureReadyMessage.self, from: raw)
             if ready.sessionId == expectedSessionId,
                ready.keyEpoch == expectedKeyEpoch,
                ready.macDeviceId == expectedMacDeviceId {
@@ -1495,22 +1528,6 @@ private extension CodexService {
             }
             debugSecureLog("discarding stale secureReady (keyEpoch=\(ready.keyEpoch) expected=\(expectedKeyEpoch))")
         }
-    }
-
-    func wireMessageKind(from rawText: String) -> String? {
-        guard let data = rawText.data(using: .utf8),
-              let json = try? JSONDecoder().decode(JSONValue.self, from: data),
-              let object = json.objectValue else {
-            return nil
-        }
-        return object["kind"]?.stringValue
-    }
-
-    func decodeSecureControl<Value: Decodable>(_ type: Value.Type, from rawText: String) throws -> Value {
-        guard let data = rawText.data(using: .utf8) else {
-            throw CodexSecureTransportError.invalidHandshake("The secure control payload was not valid UTF-8.")
-        }
-        return try JSONDecoder().decode(type, from: data)
     }
 
     func randomSecureNonce() -> Data {

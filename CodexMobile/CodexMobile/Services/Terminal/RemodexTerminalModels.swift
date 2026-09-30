@@ -6,11 +6,13 @@
 
 import Foundation
 
-private let remodexTerminalMaxBufferCharacters = 200_000
-private let remodexTerminalMaxBufferBytes = 200_000
-private let remodexDefaultTerminalId = "term-1"
+nonisolated private enum RemodexTerminalSnapshotDefaults {
+    static let maxBufferCharacters = 200_000
+    static let maxBufferBytes = 200_000
+    static let defaultTerminalId = "term-1"
+}
 
-enum RemodexTerminalStatus: String, Codable, Equatable, Sendable {
+nonisolated enum RemodexTerminalStatus: String, Codable, Equatable, Sendable {
     case idle
     case starting
     case running
@@ -141,7 +143,7 @@ struct RemodexTerminalProfile: Codable, Equatable, Sendable {
     }
 }
 
-struct RemodexTerminalSnapshot: Equatable, Sendable {
+nonisolated struct RemodexTerminalSnapshot: Equatable, Sendable {
     var terminalId: String
     var instanceId: String?
     var status: RemodexTerminalStatus
@@ -155,7 +157,7 @@ struct RemodexTerminalSnapshot: Equatable, Sendable {
     var bracketedPasteEnabled: Bool
 
     static let idle = RemodexTerminalSnapshot(
-        terminalId: remodexDefaultTerminalId,
+        terminalId: RemodexTerminalSnapshotDefaults.defaultTerminalId,
         instanceId: nil,
         status: .idle,
         buffer: "",
@@ -208,7 +210,7 @@ struct RemodexTerminalSnapshot: Equatable, Sendable {
             ?? Data(historyText.utf8)
         let decodedHistoryText = historyText.isEmpty ? String(decoding: historyData, as: UTF8.self) : historyText
         self.init(
-            terminalId: resultObject["terminalId"]?.stringValue ?? resultObject["terminal_id"]?.stringValue ?? remodexDefaultTerminalId,
+            terminalId: resultObject["terminalId"]?.stringValue ?? resultObject["terminal_id"]?.stringValue ?? RemodexTerminalSnapshotDefaults.defaultTerminalId,
             instanceId: Self.instanceId(in: resultObject),
             status: RemodexTerminalStatus(rawValue: rawStatus) ?? .idle,
             buffer: Self.trimmedBuffer(decodedHistoryText),
@@ -287,6 +289,20 @@ struct RemodexTerminalSnapshot: Equatable, Sendable {
         buffer = Self.trimmedBuffer(buffer + text)
     }
 
+    static func decodedOffMain(from resultObject: [String: JSONValue]) async throws -> RemodexTerminalSnapshot {
+        try await CodexTransferWork.run {
+            RemodexTerminalSnapshot(resultObject: resultObject)
+        }
+    }
+
+    func applyingTerminalEventOffMain(_ paramsObject: [String: JSONValue]) async throws -> RemodexTerminalSnapshot {
+        try await CodexTransferWork.run {
+            var snapshot = self
+            snapshot.applyTerminalEvent(paramsObject)
+            return snapshot
+        }
+    }
+
     static func bracketedPasteMode(afterScanning text: String, current: Bool) -> Bool {
         let marker = "\u{1B}[?2004"
         var state = current
@@ -315,17 +331,17 @@ struct RemodexTerminalSnapshot: Equatable, Sendable {
     }
 
     private static func trimmedBuffer(_ value: String) -> String {
-        guard value.count > remodexTerminalMaxBufferCharacters else {
+        guard value.count > RemodexTerminalSnapshotDefaults.maxBufferCharacters else {
             return value
         }
-        return String(value.suffix(remodexTerminalMaxBufferCharacters))
+        return String(value.suffix(RemodexTerminalSnapshotDefaults.maxBufferCharacters))
     }
 
     private static func trimmedBufferData(_ value: Data) -> Data {
-        guard value.count > remodexTerminalMaxBufferBytes else {
+        guard value.count > RemodexTerminalSnapshotDefaults.maxBufferBytes else {
             return value
         }
-        return Data(value.suffix(remodexTerminalMaxBufferBytes))
+        return Data(value.suffix(RemodexTerminalSnapshotDefaults.maxBufferBytes))
     }
 
     private static func dataFromBase64(_ value: String?) -> Data? {

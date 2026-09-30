@@ -1229,7 +1229,7 @@ extension CodexService {
         )
     }
 
-    func firstStringValue(in object: IncomingParamsObject?, keys: [String]) -> String? {
+    nonisolated func firstStringValue(in object: IncomingParamsObject?, keys: [String]) -> String? {
         guard let object else {
             return nil
         }

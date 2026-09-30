@@ -6,7 +6,7 @@
 
 import Foundation
 
-enum CodexPlanUpdateVisibilityPolicy {
+nonisolated enum CodexPlanUpdateVisibilityPolicy {
     static func shouldApply(
         text: String? = nil,
         explanation: String? = nil,
@@ -29,7 +29,7 @@ enum CodexPlanUpdateVisibilityPolicy {
     }
 }
 
-enum CodexPlanItemPresentationPolicy {
+nonisolated enum CodexPlanItemPresentationPolicy {
     static func isProgressItem(_ itemObject: [String: JSONValue]) -> Bool {
         let normalizedType = itemObject["type"]?.stringValue?
             .lowercased()

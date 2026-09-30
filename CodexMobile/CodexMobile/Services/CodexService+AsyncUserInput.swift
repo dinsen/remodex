@@ -202,10 +202,16 @@ extension CodexService {
     }
 
     func scheduleAsyncAnswerVerification(threadId: String, delay: TimeInterval, retryCount: Int = 0) {
+        let historyDecodeToken = currentHistoryDecodeToken(for: threadId)
         guard asyncAnswerVerificationThreadIDs.insert(threadId).inserted else { return }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard let self else { return }
+            guard self.historyDecodeTokenMatchesCurrent(historyDecodeToken) else { return }
+            guard !Task.isCancelled else {
+                self.asyncAnswerVerificationThreadIDs.remove(threadId)
+                return
+            }
             guard self.messagesByThread[threadId]?.contains(where: {
                 $0.asyncUserInput?.status == .uncertain || $0.asyncUserInput?.status == .answered
             }) == true else {
@@ -220,7 +226,24 @@ extension CodexService {
                 // The initial turns page can omit older items. Verify removal only
                 // against a full thread/read, then re-read once more before reopening.
                 let threadObject = try await self.fetchLegacyThreadHistoryObject(threadId: threadId)
-                let canonical = self.decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
+                guard self.historyDecodeTokenMatchesCurrent(historyDecodeToken) else { return }
+                guard !Task.isCancelled else {
+                    self.asyncAnswerVerificationThreadIDs.remove(threadId)
+                    return
+                }
+                let historyDecodeResult = try await self.decodeMessagesFromThreadReadOffMain(
+                    threadId: threadId,
+                    threadObject: threadObject
+                )
+                guard let canonical = self.commitHistoryDecodeResult(
+                    historyDecodeResult,
+                    token: historyDecodeToken
+                ) else {
+                    if self.historyDecodeTokenMatchesCurrent(historyDecodeToken) {
+                        self.asyncAnswerVerificationThreadIDs.remove(threadId)
+                    }
+                    return
+                }
                 if self.canVerifyAsyncAnswerAbsence(threadId: threadId, threadObject: threadObject),
                    var messages = self.messagesByThread[threadId] {
                     let nextDelay = CodexAsyncUserInputProjection.reopenRepliesMissingFromCanonicalHistory(
@@ -257,7 +280,9 @@ extension CodexService {
                     )
                 }
             } catch {
+                guard self.historyDecodeTokenMatchesCurrent(historyDecodeToken) else { return }
                 self.asyncAnswerVerificationThreadIDs.remove(threadId)
+                guard !Task.isCancelled else { return }
                 self.retryUncertainAsyncAnswerVerification(
                     threadId: threadId,
                     delay: delay,

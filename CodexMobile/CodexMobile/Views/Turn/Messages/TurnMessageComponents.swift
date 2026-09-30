@@ -823,8 +823,10 @@ struct MessageRow: View, Equatable {
 
                 if !assistantImageAttachments.isEmpty {
                     UserAttachmentStrip(attachments: assistantImageAttachments) { tappedAttachment in
-                        if let image = AttachmentPreviewImageResolver.resolve(tappedAttachment) {
-                            previewImage = PreviewImagePayload(image: image)
+                        Task { @MainActor in
+                            if let image = await AttachmentPreviewImageResolver.resolve(tappedAttachment) {
+                                previewImage = PreviewImagePayload(image: image)
+                            }
                         }
                     }
                     .padding(.top, trailingAssistantImageReferences.isEmpty ? 0 : 4)

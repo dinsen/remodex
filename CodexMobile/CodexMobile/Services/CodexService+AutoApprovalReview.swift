@@ -25,7 +25,7 @@ extension CodexService {
         upsertAutoApprovalReview(review, threadId: threadId)
     }
 
-    func decodeAutoApprovalReview(from paramsObject: IncomingParamsObject) -> CodexAutoApprovalReview? {
+    nonisolated func decodeAutoApprovalReview(from paramsObject: IncomingParamsObject) -> CodexAutoApprovalReview? {
         guard let reviewId = paramsObject["reviewId"]?.stringValue,
               !reviewId.isEmpty,
               let turnId = paramsObject["turnId"]?.stringValue,
@@ -295,11 +295,11 @@ extension CodexService {
         messagesByThread[threadId] = threadMessages
     }
 
-    private func integerTimestamp(_ value: JSONValue?) -> Int {
+    private nonisolated func integerTimestamp(_ value: JSONValue?) -> Int {
         optionalIntegerTimestamp(value) ?? 0
     }
 
-    private func optionalIntegerTimestamp(_ value: JSONValue?) -> Int? {
+    private nonisolated func optionalIntegerTimestamp(_ value: JSONValue?) -> Int? {
         if let integer = value?.intValue {
             return integer
         }

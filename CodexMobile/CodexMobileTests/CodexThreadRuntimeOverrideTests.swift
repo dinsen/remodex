@@ -316,6 +316,66 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         )
     }
 
+    func testOpenCodeModelLoadInvalidationAllowsReplacementWithoutOldOwnerClearingIt() async throws {
+        let service = makeService()
+        var requestCount = 0
+        var firstContinuation: CheckedContinuation<RPCMessage, Error>?
+        var secondContinuation: CheckedContinuation<RPCMessage, Error>?
+        let firstRequestEntered = expectation(description: "first OpenCode model request entered")
+        let secondRequestEntered = expectation(description: "replacement OpenCode model request entered")
+        defer {
+            firstContinuation?.resume(throwing: CancellationError())
+            secondContinuation?.resume(throwing: CancellationError())
+        }
+        service.requestTransportOverride = { method, _ in
+            XCTAssertEqual(method, "remodex/opencode/models")
+            requestCount += 1
+            switch requestCount {
+            case 1:
+                return try await withCheckedThrowingContinuation { continuation in
+                    firstContinuation = continuation
+                    firstRequestEntered.fulfill()
+                }
+            case 2:
+                return try await withCheckedThrowingContinuation { continuation in
+                    secondContinuation = continuation
+                    secondRequestEntered.fulfill()
+                }
+            default:
+                XCTFail("Unexpected OpenCode model request")
+                throw CancellationError()
+            }
+        }
+
+        let firstLoad = Task { try await service.listOpenCodeModels() }
+        await fulfillment(of: [firstRequestEntered], timeout: 1)
+        XCTAssertTrue(service.isLoadingOpenCodeModels)
+
+        service.invalidateTransferSession()
+        XCTAssertFalse(service.isLoadingOpenCodeModels)
+
+        let replacementLoad = Task { try await service.listOpenCodeModels() }
+        await fulfillment(of: [secondRequestEntered], timeout: 1)
+        XCTAssertTrue(service.isLoadingOpenCodeModels)
+
+        let staleRequest = try XCTUnwrap(firstContinuation)
+        firstContinuation = nil
+        staleRequest.resume(returning: openCodeModelsResponse())
+        do {
+            _ = try await firstLoad.value
+            XCTFail("The invalidated request must not return stale models")
+        } catch is CancellationError {
+            // Expected: the old connection generation no longer owns this request.
+        }
+        XCTAssertTrue(service.isLoadingOpenCodeModels)
+
+        let currentRequest = try XCTUnwrap(secondContinuation)
+        secondContinuation = nil
+        currentRequest.resume(returning: openCodeModelsResponse())
+        _ = try await replacementLoad.value
+        XCTAssertFalse(service.isLoadingOpenCodeModels)
+    }
+
     func testModelListDoesNotDuplicateAdvertisedGPT56Models() async throws {
         let service = makeService()
         service.requestTransportOverride = { method, _ in
@@ -658,6 +718,14 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
 
         XCTAssertFalse(service.isThreadReasoningEffortOverridden("thread-old"))
         XCTAssertEqual(service.selectedReasoningEffortForSelectedModel(threadId: "thread-old"), "low")
+    }
+
+    private func openCodeModelsResponse() -> RPCMessage {
+        RPCMessage(
+            id: .string(UUID().uuidString),
+            result: .object(["items": .array([])]),
+            includeJSONRPC: false
+        )
     }
 
     private func makeService() -> CodexService {

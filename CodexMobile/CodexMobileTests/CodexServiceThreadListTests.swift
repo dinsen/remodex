@@ -451,6 +451,125 @@ final class CodexServiceThreadListTests: XCTestCase {
         )
     }
 
+    func testNativePinsFollowCodexDesktopPinnedThreadOrder() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: ["server-first", "server-second"])
+            case "bridge/hostPins/read":
+                return self.hostPinsResponse(
+                    ids: ["server-first", "server-second"],
+                    appServerPinnedThreadOrder: ["server-second", "server-first"]
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.synchronizeNativePins()
+
+        XCTAssertEqual(service.pinnedThreadIDs, ["server-second", "server-first"])
+    }
+
+    func testNativePinRefreshDoesNotCommitAfterMacContextChangesDuringHostOrderRead() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.macScopedContextOverrideDeviceId = "source-mac"
+        service.connectedServerIdentity = "source-server"
+
+        let targetMacDeviceID = "target-mac"
+        let targetPinnedIDsKey = service.macScopedDefaultsKey(
+            CodexService.nativePinnedThreadIDsDefaultsKey,
+            macDeviceId: targetMacDeviceID
+        )
+        let targetPinnedSnapshotsKey = service.macScopedDefaultsKey(
+            CodexService.nativePinnedThreadSnapshotsDefaultsKey,
+            macDeviceId: targetMacDeviceID
+        )
+        let targetAuthorityKey = service.macScopedDefaultsKey(
+            CodexService.pinnedStateAuthorityDefaultsKey,
+            macDeviceId: targetMacDeviceID
+        )
+        service.defaults.set(try service.encoder.encode(["target-pin"]), forKey: targetPinnedIDsKey)
+        service.defaults.set(
+            try service.encoder.encode(["target-pin": [CodexThread(id: "target-pin", title: "Target")]]),
+            forKey: targetPinnedSnapshotsKey
+        )
+        service.defaults.set(
+            try service.encoder.encode(CodexPinnedStateAuthority.native),
+            forKey: targetAuthorityKey
+        )
+
+        let hostReadStarted = expectation(description: "host pin-order read starts")
+        var heldHostRead: CheckedContinuation<RPCMessage, Error>?
+        service.requestTransportOverride = { method, _ in
+            switch method {
+            case "threadSection/list":
+                return self.pinnedSectionListResponse()
+            case "thread/list":
+                return self.threadListResponse(ids: ["source-pin"])
+            case "bridge/hostPins/read":
+                return try await withCheckedThrowingContinuation { continuation in
+                    heldHostRead = continuation
+                    hostReadStarted.fulfill()
+                }
+            default:
+                XCTFail("Unexpected method \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        let refresh = Task { @MainActor in
+            try await service.synchronizeNativePins()
+        }
+        await fulfillment(of: [hostReadStarted], timeout: 1)
+        guard let pendingHostRead = heldHostRead else {
+            refresh.cancel()
+            _ = try? await refresh.value
+            XCTFail("The host pin-order request did not reach the held continuation")
+            return
+        }
+
+        service.invalidateTransferSession()
+        service.connectedServerIdentity = "target-server"
+        service.macScopedContextOverrideDeviceId = targetMacDeviceID
+        service.clearInMemoryMacScopedState()
+        service.loadMacScopedDefaultsState(for: targetMacDeviceID)
+
+        let targetIDsBefore = service.defaults.data(forKey: targetPinnedIDsKey)
+        let targetSnapshotsBefore = service.defaults.data(forKey: targetPinnedSnapshotsKey)
+        let targetAuthorityBefore = service.defaults.data(forKey: targetAuthorityKey)
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["target-pin"])
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+
+        pendingHostRead.resume(returning: hostPinsResponse(
+            ids: ["source-pin"],
+            appServerPinnedThreadOrder: ["source-pin"]
+        ))
+        heldHostRead = nil
+
+        do {
+            try await refresh.value
+            XCTFail("A stale native pin refresh should be rejected after the Mac context changes")
+        } catch is CancellationError {
+            // Expected: the result belongs to the previous session and Mac context.
+        }
+
+        XCTAssertEqual(service.confirmedNativePinnedThreadIDs, ["target-pin"])
+        XCTAssertEqual(service.pinnedThreadIDs, ["target-pin"])
+        XCTAssertEqual(service.pinnedStateAuthority, .native)
+        XCTAssertEqual(service.defaults.data(forKey: targetPinnedIDsKey), targetIDsBefore)
+        XCTAssertEqual(service.defaults.data(forKey: targetPinnedSnapshotsKey), targetSnapshotsBefore)
+        XCTAssertEqual(service.defaults.data(forKey: targetAuthorityKey), targetAuthorityBefore)
+    }
+
     func testHostFallbackPreservesHostOrderWhenNativePinnedSectionIsEmpty() async throws {
         let service = makeService()
         var methods: [String] = []
@@ -1065,6 +1184,39 @@ final class CodexServiceThreadListTests: XCTestCase {
         XCTAssertEqual(moveParams?["threadId"], .string("new-pin"))
         XCTAssertEqual(moveParams?["sectionId"], .string("pinned-section"))
         XCTAssertEqual(moveParams?["beforeThreadId"], .string("old-pin"))
+        XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
+    }
+
+    func testNativePinMutationKeepsNewPinAheadOfStaleDesktopOrder() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.threads = [CodexThread(id: "new-pin"), CodexThread(id: "old-pin")]
+        var serverPins = ["old-pin"]
+        var hostReadCount = 0
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "threadSection/list": return self.pinnedSectionListResponse()
+            case "thread/list": return self.threadListResponse(ids: serverPins)
+            case "bridge/hostPins/read":
+                hostReadCount += 1
+                return self.hostPinsResponse(
+                    ids: ["old-pin"],
+                    appServerPinnedThreadOrder: ["old-pin"]
+                )
+            case "thread/section/move":
+                XCTAssertEqual(params?.objectValue?["beforeThreadId"], .string("old-pin"))
+                serverPins = ["new-pin", "old-pin"]
+                return self.emptyRPCResponse()
+            default:
+                XCTFail("Unexpected method \(method)")
+                return self.emptyRPCResponse()
+            }
+        }
+
+        try await service.setThreadPinned("new-pin", pinned: true)
+
+        XCTAssertEqual(hostReadCount, 2)
         XCTAssertEqual(service.pinnedThreadIDs, ["new-pin", "old-pin"])
     }
 
@@ -2013,14 +2165,21 @@ final class CodexServiceThreadListTests: XCTestCase {
         )
     }
 
-    private func hostPinsResponse(ids: [String]) -> RPCMessage {
-        RPCMessage(
+    private func hostPinsResponse(
+        ids: [String],
+        appServerPinnedThreadOrder: [String]? = nil
+    ) -> RPCMessage {
+        var result: RPCObject = [
+            "schemaVersion": .integer(1),
+            "source": .string("codex-host"),
+            "pinnedThreadIds": .array(ids.map(JSONValue.string)),
+        ]
+        if let appServerPinnedThreadOrder {
+            result["appServerPinnedThreadOrder"] = .array(appServerPinnedThreadOrder.map(JSONValue.string))
+        }
+        return RPCMessage(
             id: .string(UUID().uuidString),
-            result: .object([
-                "schemaVersion": .integer(1),
-                "source": .string("codex-host"),
-                "pinnedThreadIds": .array(ids.map(JSONValue.string)),
-            ]),
+            result: .object(result),
             includeJSONRPC: false
         )
     }

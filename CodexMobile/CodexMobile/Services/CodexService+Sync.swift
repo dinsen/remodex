@@ -719,8 +719,11 @@ extension CodexService {
     }
 
     func clearHydrationCaches() {
+        historyDecodeContextGeneration &+= 1
         hydratedThreadIDs.removeAll()
         loadingThreadIDs.removeAll()
+        loadingOlderThreadHistoryIDs.removeAll()
+        asyncAnswerVerificationThreadIDs.removeAll()
         cancelAllPerThreadRefreshWork()
     }
 

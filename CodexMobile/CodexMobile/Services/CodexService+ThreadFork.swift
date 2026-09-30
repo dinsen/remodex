@@ -35,6 +35,7 @@ extension CodexService {
         let resolvedProjectPath = resolvedForkProjectPath(for: target, sourceThread: sourceThread)
         let sourceModelIdentifier = sourceThread.model?.trimmingCharacters(in: .whitespacesAndNewlines)
         let accessConfiguration = runtimeAccessConfiguration()
+        let transferGeneration = transferSessionGeneration
 
         do {
             var baseParams: RPCObject = ["threadId": .string(normalizedSourceThreadId)]
@@ -46,6 +47,9 @@ extension CodexService {
                 baseParams: baseParams,
                 accessConfiguration: accessConfiguration
             )
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             try validateAppliedAccessConfiguration(
                 in: response,
                 expected: accessConfiguration,
@@ -55,19 +59,29 @@ extension CodexService {
                 response,
                 sourceThreadId: normalizedSourceThreadId,
                 targetProjectPath: resolvedProjectPath,
-                sourceModelIdentifier: (sourceModelIdentifier?.isEmpty == false) ? sourceModelIdentifier : nil
+                sourceModelIdentifier: (sourceModelIdentifier?.isEmpty == false) ? sourceModelIdentifier : nil,
+                transferGeneration: transferGeneration
             )
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             activeThreadId = forkedThread.id
             markThreadAsViewed(forkedThread.id)
             requestImmediateSync(threadId: forkedThread.id)
             return forkedThread
         } catch {
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             if supportsTurnPagination, consumeUnsupportedTurnPagination(error) {
                 let response = try await sendRequestWithSandboxFallback(
                     method: "thread/fork",
                     baseParams: ["threadId": .string(normalizedSourceThreadId)],
                     accessConfiguration: accessConfiguration
                 )
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
                 try validateAppliedAccessConfiguration(
                     in: response,
                     expected: accessConfiguration,
@@ -77,8 +91,12 @@ extension CodexService {
                     response,
                     sourceThreadId: normalizedSourceThreadId,
                     targetProjectPath: resolvedProjectPath,
-                    sourceModelIdentifier: (sourceModelIdentifier?.isEmpty == false) ? sourceModelIdentifier : nil
+                    sourceModelIdentifier: (sourceModelIdentifier?.isEmpty == false) ? sourceModelIdentifier : nil,
+                    transferGeneration: transferGeneration
                 )
+                guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                    throw CancellationError()
+                }
                 activeThreadId = forkedThread.id
                 markThreadAsViewed(forkedThread.id)
                 requestImmediateSync(threadId: forkedThread.id)
@@ -119,11 +137,22 @@ private extension CodexService {
         _ response: RPCMessage,
         sourceThreadId: String,
         targetProjectPath: String?,
-        sourceModelIdentifier: String?
+        sourceModelIdentifier: String?,
+        transferGeneration: UUID
     ) async throws -> CodexThread {
         guard let resultObject = response.result?.objectValue,
-              let threadValue = resultObject["thread"],
-              var decodedThread = decodeModel(CodexThread.self, from: threadValue) else {
+              let threadValue = resultObject["thread"] else {
+            throw CodexServiceError.invalidResponse("thread/fork response missing thread")
+        }
+        let decodedThreadValue = await decodeModelOffMain(
+            CodexThread.self,
+            from: threadValue,
+            omittingTopLevelKeys: ["turns"]
+        )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
+        guard var decodedThread = decodedThreadValue else {
             throw CodexServiceError.invalidResponse("thread/fork response missing thread")
         }
 
@@ -179,6 +208,9 @@ private extension CodexService {
             sourceModelIdentifier: sourceModelIdentifier,
             sourceModelProvider: sourceThread?.modelProvider
         )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
         if let hydratedThread {
             return hydratedThread
         }

@@ -17,7 +17,7 @@ let codexTrustedSessionResolveTag = "remodex-trusted-session-resolve-v1"
 let codexTrustedSessionResolveClockSkewToleranceSeconds: TimeInterval = 90
 let codexPhoneIdentityKeychainAccessibility: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
-enum CodexSecureHandshakeMode: String, Codable, Sendable {
+nonisolated enum CodexSecureHandshakeMode: String, Codable, Sendable {
     case qrBootstrap = "qr_bootstrap"
     case trustedReconnect = "trusted_reconnect"
 }
@@ -33,7 +33,7 @@ enum CodexSecureConnectionState: Equatable, Sendable {
     case updateRequired
 }
 
-struct CodexPairingQRPayload: Codable, Sendable {
+nonisolated struct CodexPairingQRPayload: Codable, Sendable {
     let v: Int
     let relay: String
     let sessionId: String
@@ -71,7 +71,7 @@ struct CodexTrustedMacRegistry: Codable, Sendable {
     static let empty = CodexTrustedMacRegistry(records: [:])
 }
 
-struct SecureClientHello: Codable, Sendable {
+nonisolated struct SecureClientHello: Codable, Sendable {
     let kind: String
     let protocolVersion: Int
     let sessionId: String
@@ -102,7 +102,7 @@ struct SecureClientHello: Codable, Sendable {
     }
 }
 
-struct SecureServerHello: Codable, Sendable {
+nonisolated struct SecureServerHello: Codable, Sendable {
     let kind: String
     let protocolVersion: Int
     let sessionId: String
@@ -119,7 +119,7 @@ struct SecureServerHello: Codable, Sendable {
     var displayName: String? = nil
 }
 
-struct SecureClientAuth: Codable, Sendable {
+nonisolated struct SecureClientAuth: Codable, Sendable {
     let kind: String
     let sessionId: String
     let phoneDeviceId: String
@@ -141,14 +141,14 @@ struct SecureClientAuth: Codable, Sendable {
     }
 }
 
-struct SecureReadyMessage: Codable, Sendable {
+nonisolated struct SecureReadyMessage: Codable, Sendable {
     let kind: String
     let sessionId: String
     let keyEpoch: Int
     let macDeviceId: String
 }
 
-struct SecureResumeState: Codable, Sendable {
+nonisolated struct SecureResumeState: Codable, Sendable {
     let kind: String
     let sessionId: String
     let keyEpoch: Int
@@ -170,26 +170,10 @@ struct SecureResumeState: Codable, Sendable {
     }
 }
 
-struct SecureErrorMessage: Codable, Sendable {
+nonisolated struct SecureErrorMessage: Codable, Sendable {
     let kind: String
     let code: String
     let message: String
-}
-
-struct SecureEnvelope: Codable, Sendable {
-    let kind: String
-    let v: Int
-    let sessionId: String
-    let keyEpoch: Int
-    let sender: String
-    let counter: Int
-    let ciphertext: String
-    let tag: String
-}
-
-struct SecureApplicationPayload: Codable, Sendable {
-    let bridgeOutboundSeq: Int?
-    let payloadText: String
 }
 
 struct CodexSecureSession {
@@ -204,7 +188,7 @@ struct CodexSecureSession {
     var nextOutboundCounter: Int
 }
 
-struct CodexTrustedSessionResolveRequest: Codable, Sendable {
+nonisolated struct CodexTrustedSessionResolveRequest: Codable, Sendable {
     let macDeviceId: String
     let phoneDeviceId: String
     let phoneIdentityPublicKey: String
@@ -213,7 +197,7 @@ struct CodexTrustedSessionResolveRequest: Codable, Sendable {
     let signature: String
 }
 
-struct CodexTrustedSessionResolveResponse: Codable, Sendable {
+nonisolated struct CodexTrustedSessionResolveResponse: Codable, Sendable {
     let ok: Bool
     let macDeviceId: String
     let macIdentityPublicKey: String
@@ -221,7 +205,7 @@ struct CodexTrustedSessionResolveResponse: Codable, Sendable {
     let sessionId: String
 }
 
-struct CodexPairingCodeResolveResponse: Codable, Sendable {
+nonisolated struct CodexPairingCodeResolveResponse: Codable, Sendable {
     let ok: Bool
     let v: Int
     let sessionId: String
@@ -231,7 +215,7 @@ struct CodexPairingCodeResolveResponse: Codable, Sendable {
     var displayName: String? = nil
 }
 
-struct CodexRelayErrorResponse: Codable, Sendable {
+nonisolated struct CodexRelayErrorResponse: Codable, Sendable {
     let ok: Bool?
     let error: String?
     let code: String?
@@ -370,18 +354,6 @@ func codexClientAuthTranscript(from transcriptBytes: Data) -> Data {
     return data
 }
 
-// Derives the deterministic AES-GCM nonce from direction + counter.
-func codexSecureNonce(sender: String, counter: Int) -> Data {
-    var nonce = Data(repeating: 0, count: 12)
-    nonce[0] = (sender == "mac") ? 1 : 2
-    var remaining = UInt64(counter)
-    for index in stride(from: 11, through: 1, by: -1) {
-        nonce[index] = UInt8(remaining & 0xff)
-        remaining >>= 8
-    }
-    return nonce
-}
-
 func codexSecureFingerprint(for publicKeyBase64: String) -> String {
     let digest = SHA256.hash(data: Data(base64EncodedOrEmpty: publicKeyBase64))
     return digest.compactMap { String(format: "%02x", $0) }.joined().prefix(12).uppercased()
@@ -445,7 +417,7 @@ func codexTrustedMacRegistryFromSecureStore() -> CodexTrustedMacRegistry {
     ?? .empty
 }
 
-extension Data {
+nonisolated extension Data {
     init(base64EncodedOrEmpty value: String) {
         self = Data(base64Encoded: value) ?? Data()
     }

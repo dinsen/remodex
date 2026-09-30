@@ -168,6 +168,82 @@ nonisolated private func codexLogPairingTransport(_ message: String, isFailure: 
 }
 
 extension CodexService {
+    func invalidateTransferSession() {
+        transferSessionGeneration = UUID()
+        openCodeModelsLoadID = nil
+        isLoadingOpenCodeModels = false
+        transferSendLane.invalidate()
+        transferSendLane = CodexTransferSendLane()
+    }
+
+    func invalidateTransferSocket() {
+        transferSocketGeneration = UUID()
+        invalidateTransferSession()
+    }
+
+    func currentTransferSocket() throws -> (connection: NWConnection?, task: URLSessionWebSocketTask?, isManual: Bool) {
+        if usesManualWebSocketTransport {
+            guard let connection = webSocketConnection else {
+                throw CodexServiceError.disconnected
+            }
+            return (connection, nil, true)
+        }
+        if let task = webSocketTask {
+            return (nil, task, false)
+        }
+        if let connection = webSocketConnection {
+            return (connection, nil, false)
+        }
+        throw CodexServiceError.disconnected
+    }
+
+    func isCurrentTransferSocket(
+        generation: UUID,
+        connection: NWConnection?,
+        task: URLSessionWebSocketTask?
+    ) -> Bool {
+        guard transferSessionGeneration == generation else { return false }
+        if let connection {
+            return webSocketConnection === connection && webSocketTask == nil
+        }
+        if let task {
+            return webSocketTask === task && webSocketConnection == nil
+        }
+        return false
+    }
+
+    func isCurrentTransferReceive(
+        _ token: CodexTransferReceiveToken,
+        connection: NWConnection?,
+        task: URLSessionWebSocketTask?
+    ) -> Bool {
+        guard token.canContinue(currentSocketGeneration: transferSocketGeneration) else { return false }
+        switch token.mode {
+        case .networkMessage:
+            guard let connection, task == nil, !usesManualWebSocketTransport else { return false }
+            return webSocketConnection === connection && webSocketTask == nil
+        case .urlSessionMessage:
+            guard let task, connection == nil else { return false }
+            return webSocketTask === task && webSocketConnection == nil
+        case .manualTCPChunk:
+            guard let connection, task == nil, usesManualWebSocketTransport else { return false }
+            return webSocketConnection === connection && webSocketTask == nil
+        }
+    }
+
+    func isCurrentTransferReceiveApply(
+        _ token: CodexTransferReceiveToken,
+        sessionGeneration: UUID,
+        connection: NWConnection?,
+        task: URLSessionWebSocketTask?
+    ) -> Bool {
+        token.canApply(
+            currentSocketGeneration: transferSocketGeneration,
+            capturedSessionGeneration: sessionGeneration,
+            currentSessionGeneration: transferSessionGeneration
+        ) && isCurrentTransferReceive(token, connection: connection, task: task)
+    }
+
     // Rejects oversized relay frames before Network.framework turns them into a raw EMSGSIZE failure.
     func validateOutgoingWebSocketMessageSize(_ text: String) throws {
         let payloadSize = text.utf8.count
@@ -313,13 +389,63 @@ extension CodexService {
         onSendAttempt: (@MainActor () -> Void)? = nil,
         shouldSend: (@MainActor () -> Bool)? = nil
     ) async throws {
-        let payload = try encoder.encode(message)
-        guard let plaintext = String(data: payload, encoding: .utf8) else {
-            throw CodexServiceError.invalidResponse("Unable to encode outgoing JSON-RPC payload")
-        }
+        let lane = transferSendLane
+        try await lane.withPermit {
+            let generation = self.transferSessionGeneration
+            let socket = try self.currentTransferSocket()
+            guard let secureSession = self.secureSession else {
+                throw CodexSecureTransportError.invalidHandshake(
+                    "The secure Remodex session is not ready yet. Try reconnecting."
+                )
+            }
+            let outboundSnapshot = CodexSecureOutboundSnapshot(
+                sessionId: secureSession.sessionId,
+                keyEpoch: secureSession.keyEpoch,
+                counter: secureSession.nextOutboundCounter,
+                key: secureSession.phoneToMacKey
+            )
 
-        let secureText = try secureWireText(for: plaintext)
-        try await sendRawText(secureText, onSendAttempt: onSendAttempt, shouldSend: shouldSend)
+            let plaintext = try await self.transferJSONCodec.encodeText(message)
+            try Task.checkCancellation()
+            guard self.isCurrentTransferSocket(
+                generation: generation,
+                connection: socket.connection,
+                task: socket.task
+            ), self.secureSession?.sessionId == outboundSnapshot.sessionId,
+               self.secureSession?.keyEpoch == outboundSnapshot.keyEpoch else {
+                throw CodexServiceError.disconnected
+            }
+
+            let sealOutcome = await self.transferJSONCodec.sealSecureText(plaintext, session: outboundSnapshot)
+            let secureText: String
+            switch sealOutcome {
+            case .failedBeforeSeal(let error):
+                throw error
+            case .sealed(let text, let counter):
+                try self.consumeOutboundSecureCounter(
+                    sessionID: outboundSnapshot.sessionId,
+                    keyEpoch: outboundSnapshot.keyEpoch,
+                    counter: counter
+                )
+                secureText = text
+            case .failedAfterSeal(let counter, let error):
+                try self.consumeOutboundSecureCounter(
+                    sessionID: outboundSnapshot.sessionId,
+                    keyEpoch: outboundSnapshot.keyEpoch,
+                    counter: counter
+                )
+                throw error
+            }
+
+            try Task.checkCancellation()
+            try await self.sendRawTextAdmitted(
+                secureText,
+                socket: socket,
+                generation: generation,
+                onSendAttempt: onSendAttempt,
+                shouldSend: shouldSend
+            )
+        }
     }
 
     // Sends raw secure control messages before the JSON-RPC channel is initialized.
@@ -328,35 +454,70 @@ extension CodexService {
         onSendAttempt: (@MainActor () -> Void)? = nil,
         shouldSend: (@MainActor () -> Bool)? = nil
     ) async throws {
-        try validateOutgoingWebSocketMessageSize(text)
+        let lane = transferSendLane
+        try await lane.withPermit {
+            let generation = self.transferSessionGeneration
+            let socket = try self.currentTransferSocket()
+            try await self.sendRawTextAdmitted(
+                text,
+                socket: socket,
+                generation: generation,
+                onSendAttempt: onSendAttempt,
+                shouldSend: shouldSend
+            )
+        }
+    }
 
-        if usesManualWebSocketTransport {
-            guard let connection = webSocketConnection else {
+    func sendRawTextAdmitted(
+        _ text: String,
+        socket: (connection: NWConnection?, task: URLSessionWebSocketTask?, isManual: Bool),
+        generation: UUID,
+        onSendAttempt: (@MainActor () -> Void)?,
+        shouldSend: (@MainActor () -> Bool)?
+    ) async throws {
+        let prepared: CodexPreparedWebSocketText
+        do {
+            prepared = try await CodexTransferWork.prepareWebSocketText(
+                text,
+                manual: socket.isManual,
+                needsUTF8Data: socket.connection != nil && !socket.isManual,
+                maximumSize: codexWebSocketMaximumMessageSizeBytes
+            )
+        } catch CodexTransferPreparationError.messageTooLarge {
+            throw CodexServiceError.invalidInput(
+                "This payload is too large for the relay connection. Try fewer or smaller images and retry."
+            )
+        }
+
+        try Task.checkCancellation()
+        guard isCurrentTransferSocket(
+            generation: generation,
+            connection: socket.connection,
+            task: socket.task
+        ) else {
+            throw CodexServiceError.disconnected
+        }
+        guard shouldSend?() != false else { throw CancellationError() }
+        onSendAttempt?()
+
+        if socket.isManual {
+            guard let connection = socket.connection, let frame = prepared.manualFrame else {
                 throw CodexServiceError.disconnected
             }
-            guard shouldSend?() != false else { throw CancellationError() }
-            onSendAttempt?()
-            try await sendManualWebSocketFrame(opcode: 0x1, payload: Data(text.utf8), on: connection)
+            try await sendRaw(frame, on: connection)
             return
         }
 
-        if let task = webSocketTask {
-            guard shouldSend?() != false else { throw CancellationError() }
-            onSendAttempt?()
+        if let task = socket.task {
             try await task.send(.string(text))
             return
         }
 
-        guard let connection = webSocketConnection else {
+        guard let connection = socket.connection, let payload = prepared.utf8Data else {
             throw CodexServiceError.disconnected
         }
-
-        let payload = Data(text.utf8)
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "codex-jsonrpc", metadata: [metadata])
-
-        guard shouldSend?() != false else { throw CancellationError() }
-        onSendAttempt?()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(
                 content: payload,
@@ -371,6 +532,17 @@ extension CodexService {
                 }
             )
         }
+    }
+
+    func consumeOutboundSecureCounter(sessionID: String, keyEpoch: Int, counter: Int) throws {
+        guard var currentSession = secureSession,
+              currentSession.sessionId == sessionID,
+              currentSession.keyEpoch == keyEpoch,
+              currentSession.nextOutboundCounter == counter else {
+            throw CodexServiceError.disconnected
+        }
+        currentSession.nextOutboundCounter = counter + 1
+        secureSession = currentSession
     }
 
     func startReceiveLoop(with connection: NWConnection) {
@@ -540,16 +712,20 @@ extension CodexService {
     }
 
     func receiveNextMessage(on connection: NWConnection) {
+        let receiveToken = CodexTransferReceiveToken(
+            socketGeneration: transferSocketGeneration,
+            mode: .networkMessage
+        )
         connection.receiveMessage { [weak self] data, context, _, error in
             guard let self else { return }
 
-            // Pre-decode wire text off the main actor so JSONDecoder doesn't block UI frames.
-            let wireText: String? = data.flatMap { String(data: $0, encoding: .utf8) }
-            let preDecoded = wireText.map { WireMessagePreDecoder.classify($0) }
-
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard self.webSocketConnection === connection else { return }
+                guard self.isCurrentTransferReceive(
+                    receiveToken,
+                    connection: connection,
+                    task: nil
+                ) else { return }
 
                 if let error {
                     self.handleReceiveError(error)
@@ -565,27 +741,41 @@ extension CodexService {
                     return
                 }
 
-                if let text = wireText, let decoded = preDecoded {
-                    if decoded.isSecure {
-                        // Secure control or encrypted envelope — must stay on MainActor.
-                        self.processIncomingWireText(text)
-                    } else if let rpcResult = decoded.rpcResult {
-                        self.handleDecodedRPCResult(rpcResult, rawText: text)
+                if let data, let text = await CodexTransferWork.decodeUTF8(data) {
+                    let sessionGeneration = self.transferSessionGeneration
+                    if self.isCurrentTransferReceiveApply(
+                        receiveToken,
+                        sessionGeneration: sessionGeneration,
+                        connection: connection,
+                        task: nil
+                    ) {
+                        await self.processIncomingWireText(text, expectedGeneration: sessionGeneration)
                     }
                 }
 
-                self.receiveNextMessage(on: connection)
+                if self.isCurrentTransferReceive(receiveToken, connection: connection, task: nil) {
+                    self.receiveNextMessage(on: connection)
+                }
             }
         }
     }
 
     func receiveNextManualChunk(on connection: NWConnection) {
+        let receiveToken = CodexTransferReceiveToken(
+            socketGeneration: transferSocketGeneration,
+            mode: .manualTCPChunk
+        )
+        let receiveSessionGeneration = transferSessionGeneration
         receiveRaw(on: connection) { [weak self] result in
             guard let self else { return }
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard self.webSocketConnection === connection, self.usesManualWebSocketTransport else { return }
+                guard self.isCurrentTransferReceive(
+                    receiveToken,
+                    connection: connection,
+                    task: nil
+                ) else { return }
 
                 switch result {
                 case .failure(let error):
@@ -594,51 +784,51 @@ extension CodexService {
                     self.handleReceiveError(CodexServiceError.disconnected)
                 case .success(let data?):
                     if !data.isEmpty {
-                        self.manualWebSocketReadBuffer.append(data)
                         do {
-                            let didHandleClose = try await self.drainManualWebSocketFrames(on: connection)
+                            let didHandleClose = try await self.drainManualWebSocketFrames(
+                                on: connection,
+                                appending: data
+                            )
                             if didHandleClose {
                                 return
                             }
                         } catch {
-                            self.handleReceiveError(error)
+                            guard self.isCurrentTransferReceive(
+                                receiveToken,
+                                connection: connection,
+                                task: nil
+                            ) else { return }
+                            if self.transferSessionGeneration == receiveSessionGeneration {
+                                self.handleReceiveError(error)
+                            } else {
+                                self.receiveNextManualChunk(on: connection)
+                            }
                             return
                         }
                     }
-                    self.receiveNextManualChunk(on: connection)
+                    if self.isCurrentTransferReceive(receiveToken, connection: connection, task: nil) {
+                        self.receiveNextManualChunk(on: connection)
+                    }
                 }
             }
         }
     }
 
     func receiveNextMessage(on task: URLSessionWebSocketTask) {
+        let receiveToken = CodexTransferReceiveToken(
+            socketGeneration: transferSocketGeneration,
+            mode: .urlSessionMessage
+        )
         task.receive { [weak self] result in
             guard let self else { return }
 
-            // Extract text and pre-decode off the main actor.
-            let decodedPayload: (text: String, classification: WireMessagePreDecoder.Classification)?
-            if case .success(let message) = result {
-                let wireText: String?
-                switch message {
-                case .string(let text):
-                    wireText = text
-                case .data(let data):
-                    wireText = String(data: data, encoding: .utf8)
-                @unknown default:
-                    wireText = nil
-                }
-                if let text = wireText {
-                    decodedPayload = (text, WireMessagePreDecoder.classify(text))
-                } else {
-                    decodedPayload = nil
-                }
-            } else {
-                decodedPayload = nil
-            }
-
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard self.webSocketTask === task else { return }
+                guard self.isCurrentTransferReceive(
+                    receiveToken,
+                    connection: nil,
+                    task: task
+                ) else { return }
 
                 switch result {
                 case .failure(let error):
@@ -646,18 +836,31 @@ extension CodexService {
                         error,
                         relayCloseCode: self.relayCloseCode(for: task.closeCode)
                     )
-                case .success:
-                    if let decodedPayload {
-                        let text = decodedPayload.text
-                        let decoded = decodedPayload.classification
-                        if decoded.isSecure {
-                            self.processIncomingWireText(text)
-                        } else if let rpcResult = decoded.rpcResult {
-                            self.handleDecodedRPCResult(rpcResult, rawText: text)
+                case .success(let message):
+                    let text: String?
+                    switch message {
+                    case .string(let value):
+                        text = value
+                    case .data(let data):
+                        text = await CodexTransferWork.decodeUTF8(data)
+                    @unknown default:
+                        text = nil
+                    }
+                    if let text {
+                        let sessionGeneration = self.transferSessionGeneration
+                        if self.isCurrentTransferReceiveApply(
+                            receiveToken,
+                            sessionGeneration: sessionGeneration,
+                            connection: nil,
+                            task: task
+                        ) {
+                            await self.processIncomingWireText(text, expectedGeneration: sessionGeneration)
                         }
                     }
 
-                    self.receiveNextMessage(on: task)
+                    if self.isCurrentTransferReceive(receiveToken, connection: nil, task: task) {
+                        self.receiveNextMessage(on: task)
+                    }
                 }
             }
         }
@@ -1065,78 +1268,76 @@ extension CodexService {
 
     // Preserves relay close semantics on the raw TCP websocket path so `.local` reconnects
     // reuse the same retry / re-pair policy as the higher-level websocket transports.
-    func drainManualWebSocketFrames(on connection: NWConnection) async throws -> Bool {
-        while let frame = parseManualWebSocketFrame(from: &manualWebSocketReadBuffer) {
-            switch frame.opcode {
-            case 0x1:
-                if let text = String(data: frame.payload, encoding: .utf8) {
-                    lastRawMessage = text
-                    processIncomingWireText(text)
+    func drainManualWebSocketFrames(
+        on connection: NWConnection,
+        appending incomingData: Data = Data()
+    ) async throws -> Bool {
+        var wireParts = [manualWebSocketReadBuffer]
+        if !incomingData.isEmpty {
+            wireParts.append(incomingData)
+        }
+
+        while true {
+            let parseGeneration = transferSessionGeneration
+            let batch = try await CodexTransferWork.parseManualWebSocketFrames(from: wireParts)
+            guard webSocketConnection === connection, usesManualWebSocketTransport else { return false }
+            guard transferSessionGeneration == parseGeneration else { continue }
+
+            manualWebSocketReadBuffer = batch.remainingData
+            var unprocessedFrames = batch.frames
+            var shouldReparseRemainder = false
+
+            while !unprocessedFrames.isEmpty {
+                let frame = unprocessedFrames.removeFirst()
+                let frameGeneration = transferSessionGeneration
+                guard webSocketConnection === connection, usesManualWebSocketTransport else { return false }
+                var shouldRetryCurrentFrame = false
+
+                switch frame.opcode {
+                case 0x1:
+                    if let text = await CodexTransferWork.decodeUTF8(frame.payload) {
+                        guard transferSessionGeneration == frameGeneration else {
+                            shouldRetryCurrentFrame = true
+                            shouldReparseRemainder = true
+                            break
+                        }
+                        let wasProcessed = await processIncomingWireText(text, expectedGeneration: frameGeneration)
+                        if transferSessionGeneration != frameGeneration {
+                            shouldRetryCurrentFrame = !wasProcessed
+                            shouldReparseRemainder = true
+                        }
+                    }
+                case 0x8:
+                    handleReceiveError(
+                        CodexServiceError.disconnected,
+                        relayCloseCode: relayCloseCode(fromManualWebSocketClosePayload: frame.payload)
+                    )
+                    return true
+                case 0x9:
+                    try await sendManualWebSocketFrame(opcode: 0xA, payload: frame.payload, on: connection)
+                case 0xA:
+                    break
+                default:
+                    break
                 }
-            case 0x8:
-                handleReceiveError(
-                    CodexServiceError.disconnected,
-                    relayCloseCode: relayCloseCode(fromManualWebSocketClosePayload: frame.payload)
-                )
-                return true
-            case 0x9:
-                try await sendManualWebSocketFrame(opcode: 0xA, payload: frame.payload, on: connection)
-            case 0xA:
-                break
-            default:
-                break
+
+                if shouldReparseRemainder {
+                    wireParts.removeAll(keepingCapacity: false)
+                    if shouldRetryCurrentFrame {
+                        wireParts.append(frame.wireData)
+                    }
+                    wireParts.append(contentsOf: unprocessedFrames.map(\.wireData))
+                    wireParts.append(batch.remainingData)
+                    break
+                }
             }
-        }
 
-        return false
-    }
-
-    func parseManualWebSocketFrame(from buffer: inout Data) -> (opcode: UInt8, payload: Data)? {
-        guard buffer.count >= 2 else { return nil }
-
-        let firstByte = buffer[buffer.startIndex]
-        let secondByte = buffer[buffer.startIndex + 1]
-        let opcode = firstByte & 0x0F
-        let masked = (secondByte & 0x80) != 0
-
-        var index = 2
-        var payloadLength = Int(secondByte & 0x7F)
-        if payloadLength == 126 {
-            guard buffer.count >= index + 2 else { return nil }
-            payloadLength = Int(buffer[index]) << 8 | Int(buffer[index + 1])
-            index += 2
-        } else if payloadLength == 127 {
-            guard buffer.count >= index + 8 else { return nil }
-            var decodedLength: UInt64 = 0
-            for offset in 0..<8 {
-                decodedLength = (decodedLength << 8) | UInt64(buffer[index + offset])
+            if shouldReparseRemainder {
+                manualWebSocketReadBuffer = Data()
+                continue
             }
-            guard decodedLength <= UInt64(Int.max) else { return nil }
-            payloadLength = Int(decodedLength)
-            index += 8
+            return false
         }
-
-        var maskKey = Data()
-        if masked {
-            guard buffer.count >= index + 4 else { return nil }
-            maskKey = buffer.subdata(in: index..<(index + 4))
-            index += 4
-        }
-
-        guard buffer.count >= index + payloadLength else { return nil }
-        var payload = buffer.subdata(in: index..<(index + payloadLength))
-        buffer.removeSubrange(0..<(index + payloadLength))
-
-        if masked {
-            let maskBytes = [UInt8](maskKey)
-            var payloadBytes = [UInt8](payload)
-            for i in payloadBytes.indices {
-                payloadBytes[i] ^= maskBytes[i % 4]
-            }
-            payload = Data(payloadBytes)
-        }
-
-        return (opcode: opcode, payload: payload)
     }
 
     // Pulls relay-owned custom close codes out of raw websocket close payloads on the direct transport.
@@ -1157,32 +1358,20 @@ extension CodexService {
     }
 
     func sendManualWebSocketFrame(opcode: UInt8, payload: Data, on connection: NWConnection) async throws {
-        var frame = Data()
-        frame.append(0x80 | opcode)
-
-        let maskBit: UInt8 = 0x80
-        if payload.count < 126 {
-            frame.append(maskBit | UInt8(payload.count))
-        } else if payload.count <= 0xFFFF {
-            frame.append(maskBit | 126)
-            frame.append(UInt8((payload.count >> 8) & 0xFF))
-            frame.append(UInt8(payload.count & 0xFF))
-        } else {
-            frame.append(maskBit | 127)
-            let length = UInt64(payload.count)
-            for shift in stride(from: 56, through: 0, by: -8) {
-                frame.append(UInt8((length >> UInt64(shift)) & 0xFF))
+        let lane = transferSendLane
+        try await lane.withPermit {
+            let generation = self.transferSessionGeneration
+            guard self.webSocketConnection === connection, self.usesManualWebSocketTransport else {
+                throw CodexServiceError.disconnected
             }
+            let frame = try await CodexTransferWork.makeManualWebSocketFrame(opcode: opcode, payload: payload)
+            try Task.checkCancellation()
+            guard self.isCurrentTransferSocket(generation: generation, connection: connection, task: nil),
+                  self.usesManualWebSocketTransport else {
+                throw CodexServiceError.disconnected
+            }
+            try await self.sendRaw(frame, on: connection)
         }
-
-        var mask = [UInt8](repeating: 0, count: 4)
-        _ = SecRandomCopyBytes(kSecRandomDefault, mask.count, &mask)
-        frame.append(contentsOf: mask)
-        for (index, byte) in payload.enumerated() {
-            frame.append(byte ^ mask[index % 4])
-        }
-
-        try await sendRaw(frame, on: connection)
     }
 
     func sendRaw(_ data: Data, on connection: NWConnection) async throws {

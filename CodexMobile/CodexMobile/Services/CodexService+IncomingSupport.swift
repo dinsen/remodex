@@ -27,7 +27,7 @@ func normalizedIncomingMethodName(_ method: String) -> String {
     method.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-func normalizeThreadStatusType(_ rawStatusType: String) -> String {
+nonisolated func normalizeThreadStatusType(_ rawStatusType: String) -> String {
     rawStatusType
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
@@ -36,7 +36,7 @@ func normalizeThreadStatusType(_ rawStatusType: String) -> String {
         .replacingOccurrences(of: " ", with: "")
 }
 
-func threadTerminalState(from normalizedStatusType: String) -> CodexTurnTerminalState? {
+nonisolated func threadTerminalState(from normalizedStatusType: String) -> CodexTurnTerminalState? {
     if normalizedStatusType == "stopped" {
         return .stopped
     }
@@ -53,7 +53,7 @@ func threadTerminalState(from normalizedStatusType: String) -> CodexTurnTerminal
     return nil
 }
 
-func firstNonEmptyString(_ values: [String?]) -> String? {
+nonisolated func firstNonEmptyString(_ values: [String?]) -> String? {
     for value in values {
         guard let value else { continue }
         if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -84,7 +84,7 @@ func firstIntValue(in object: IncomingParamsObject?, keys: [String]) -> Int? {
 }
 
 // Keeps generic tool rows compact and human-readable across live and history paths.
-func normalizedToolActivityDescriptor(_ rawDescriptor: String?) -> String? {
+nonisolated func normalizedToolActivityDescriptor(_ rawDescriptor: String?) -> String? {
     guard let rawDescriptor = trimmedNonEmptyString(rawDescriptor) else {
         return nil
     }
@@ -110,7 +110,7 @@ func normalizedToolActivityDescriptor(_ rawDescriptor: String?) -> String? {
     return joined.isEmpty ? nil : joined
 }
 
-func normalizedToolActivityStatus(_ rawStatus: String?, isCompleted: Bool) -> String {
+nonisolated func normalizedToolActivityStatus(_ rawStatus: String?, isCompleted: Bool) -> String {
     let normalized = rawStatus?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
@@ -131,7 +131,7 @@ func normalizedToolActivityStatus(_ rawStatus: String?, isCompleted: Bool) -> St
     }
 }
 
-func toolActivitySummaryLine(
+nonisolated func toolActivitySummaryLine(
     descriptor: String?,
     rawStatus: String?,
     isCompleted: Bool,
@@ -146,7 +146,7 @@ func toolActivitySummaryLine(
 // `changes` without having mutated the workspace (for example, GitHub PR reads).
 // Classify generic tool calls from their identity plus change evidence instead
 // of treating those common result-field names as proof of a file edit.
-func toolCallIdentityDescriptors(from itemObject: IncomingParamsObject) -> [String] {
+nonisolated func toolCallIdentityDescriptors(from itemObject: IncomingParamsObject) -> [String] {
     let nestedTool = itemObject["tool"]?.objectValue
     let nestedCall = itemObject["call"]?.objectValue
     let nestedInvocation = itemObject["invocation"]?.objectValue
@@ -185,7 +185,7 @@ func toolCallIdentityDescriptor(from itemObject: IncomingParamsObject) -> String
     toolCallIdentityDescriptors(from: itemObject).joined(separator: " ")
 }
 
-func isGenericToolCallItemType(_ itemType: String) -> Bool {
+nonisolated func isGenericToolCallItemType(_ itemType: String) -> Bool {
     switch itemType {
     case "toolcall", "mcptoolcall", "dynamictoolcall", "websearch":
         return true
@@ -194,7 +194,7 @@ func isGenericToolCallItemType(_ itemType: String) -> Bool {
     }
 }
 
-func isWorkspaceFileMutationToolCall(_ itemObject: IncomingParamsObject) -> Bool {
+nonisolated func isWorkspaceFileMutationToolCall(_ itemObject: IncomingParamsObject) -> Bool {
     let exactMutationNames: Set<String> = [
         "applypatch",
         "patch",
@@ -362,7 +362,7 @@ func looksLikePatchText(_ text: String) -> Bool {
     return false
 }
 
-func firstValue(forAnyKey keys: [String], in root: JSONValue, maxDepth: Int = 8) -> JSONValue? {
+nonisolated func firstValue(forAnyKey keys: [String], in root: JSONValue, maxDepth: Int = 8) -> JSONValue? {
     for key in keys {
         if let value = firstValue(forKey: key, in: root, maxDepth: maxDepth) {
             return value
@@ -371,7 +371,7 @@ func firstValue(forAnyKey keys: [String], in root: JSONValue, maxDepth: Int = 8)
     return nil
 }
 
-func firstValue(forKey key: String, in root: JSONValue, maxDepth: Int = 8) -> JSONValue? {
+nonisolated func firstValue(forKey key: String, in root: JSONValue, maxDepth: Int = 8) -> JSONValue? {
     guard maxDepth >= 0 else { return nil }
 
     switch root {
@@ -587,7 +587,7 @@ func unwrapShellCommandIfPresent(_ command: String) -> String {
     return command
 }
 
-private func trimmedNonEmptyString(_ candidate: String?) -> String? {
+private nonisolated func trimmedNonEmptyString(_ candidate: String?) -> String? {
     guard let candidate else { return nil }
     let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
     return trimmed.isEmpty ? nil : trimmed
@@ -623,7 +623,7 @@ private func firstInt(forAnyKey keys: [String], in root: JSONValue, maxDepth: In
     return nil
 }
 
-private func isEmptyJSONValue(_ value: JSONValue) -> Bool {
+private nonisolated func isEmptyJSONValue(_ value: JSONValue) -> Bool {
     switch value {
     case .null:
         return true

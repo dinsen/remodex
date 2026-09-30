@@ -413,7 +413,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         }
 
         for threadID in threadIDs {
-            service.handleNotification(method: "thread/started", params: .object([
+            _ = await service.handleNotificationOffMain(method: "thread/started", params: .object([
                 "threadId": .string(threadID),
                 "remodexDesktopMirror": .bool(true),
                 "remodexDesktopIpcMirror": .bool(true),

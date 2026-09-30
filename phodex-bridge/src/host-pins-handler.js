@@ -10,6 +10,7 @@ const { resolveCodexHome } = require("./codex-home");
 
 const HOST_PINS_METHOD = "bridge/hostPins/read";
 const HOST_STATE_FILE = ".codex-global-state.json";
+const APP_SERVER_PIN_ORDER_KEY = "app-server-pinned-thread-order-v1";
 const MAX_HOST_STATE_BYTES = 1_048_576;
 const MAX_HOST_PIN_IDS = 512;
 const MAX_HOST_PIN_ID_CHARS = 256;
@@ -162,25 +163,49 @@ function parseHostPins(raw) {
     throw hostPinsError("host_pins_malformed", "Codex host pins are malformed.");
   }
 
-  const pinnedThreadIds = [];
-  const seen = new Set();
-  for (const value of parsed["pinned-thread-ids"]) {
-    if (typeof value !== "string"
-      || value.length === 0
-      || value.length > MAX_HOST_PIN_ID_CHARS
-      || !SAFE_THREAD_ID_PATTERN.test(value)
-      || seen.has(value)) {
-      throw hostPinsError("host_pins_malformed", "Codex host pins are malformed.");
-    }
-    seen.add(value);
-    pinnedThreadIds.push(value);
+  const pinnedThreadIds = parseHostThreadIds(parsed["pinned-thread-ids"]);
+  if (pinnedThreadIds === null) {
+    throw hostPinsError("host_pins_malformed", "Codex host pins are malformed.");
   }
+
+  const appState = parsed["electron-persisted-atom-state"];
+  const rawAppServerOrder = appState && typeof appState === "object" && !Array.isArray(appState)
+    ? appState[APP_SERVER_PIN_ORDER_KEY]
+    : undefined;
+  const appServerPinnedThreadOrder = rawAppServerOrder === undefined
+    ? undefined
+    : parseHostThreadIds(rawAppServerOrder);
 
   return {
     schemaVersion: 1,
     source: "codex-host",
     pinnedThreadIds,
+    ...(appServerPinnedThreadOrder === undefined || appServerPinnedThreadOrder === null
+      ? {}
+      : { appServerPinnedThreadOrder }),
   };
+}
+
+function parseHostThreadIds(values) {
+  if (!Array.isArray(values) || values.length > MAX_HOST_PIN_IDS) {
+    return null;
+  }
+
+  const ids = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (typeof value !== "string"
+      || value.length === 0
+      || value.length > MAX_HOST_PIN_ID_CHARS
+      || !SAFE_THREAD_ID_PATTERN.test(value)
+      || seen.has(value)) {
+      return null;
+    }
+    seen.add(value);
+    ids.push(value);
+  }
+
+  return ids;
 }
 
 function isBoundedFileSize(size) {

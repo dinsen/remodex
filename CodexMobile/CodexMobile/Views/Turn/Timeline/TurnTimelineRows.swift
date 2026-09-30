@@ -434,7 +434,7 @@ struct TurnTimelineRowsSection: View {
     private static let runningIndicatorRowID = "turn-timeline-running-indicator-row"
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        LazyVStack(alignment: .leading, spacing: 14) {
             if shouldWarmRecentTailProgressively {
                 HStack(spacing: 8) {
                     ProgressView()

@@ -10,7 +10,7 @@ private func codexLogVoiceTranscription(_ message: String) {
     print("[VOICE] \(message)")
 }
 
-struct CodexVoiceTranscriptionPreflight: Equatable, Sendable {
+nonisolated struct CodexVoiceTranscriptionPreflight: Equatable, Sendable {
     static let maxDurationSeconds: TimeInterval = 150
     static let maxByteCount: Int = 10 * 1024 * 1024
     static let requestTimeoutNanoseconds: UInt64 = 180_000_000_000
@@ -253,7 +253,7 @@ extension CodexService {
         durationSeconds: TimeInterval,
         mimeType: String
     ) async throws -> VoiceTranscriptionRequestPayload {
-        try await Task.detached(priority: .userInitiated) {
+        try await CodexTransferWork.run {
             let audioData = try Data(contentsOf: url)
             let normalizedMimeType = mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let preflight = CodexVoiceTranscriptionPreflight(
@@ -278,7 +278,7 @@ extension CodexService {
                 durationSeconds: durationSeconds,
                 durationMilliseconds: Int((durationSeconds * 1_000).rounded())
             )
-        }.value
+        }
     }
 
     // Parses chunked WAV metadata instead of assuming the fmt/data chunks sit at fixed offsets.
@@ -364,7 +364,7 @@ extension CodexService {
     }
 }
 
-private extension Data {
+nonisolated private extension Data {
     func asciiString(in range: Range<Int>) -> String? {
         guard range.lowerBound >= 0, range.upperBound <= count else {
             return nil

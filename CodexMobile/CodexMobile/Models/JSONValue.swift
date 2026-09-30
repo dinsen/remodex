@@ -85,7 +85,7 @@ nonisolated enum JSONValue: Codable, Hashable, Sendable {
     }
 }
 
-extension JSONValue {
+nonisolated extension JSONValue {
     // --- Access helpers -------------------------------------------------------
 
     var stringValue: String? {

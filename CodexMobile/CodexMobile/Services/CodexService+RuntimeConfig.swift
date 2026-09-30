@@ -155,20 +155,39 @@ struct CodexRuntimeDefaultsPayload: Equatable, Sendable {
 extension CodexService {
     @discardableResult
     func listOpenCodeModels() async throws -> [OpenCodeModelOption] {
+        let transferGeneration = transferSessionGeneration
+        let loadID = UUID()
+        openCodeModelsLoadID = loadID
         isLoadingOpenCodeModels = true
-        defer { isLoadingOpenCodeModels = false }
+        defer {
+            if openCodeModelsLoadID == loadID {
+                openCodeModelsLoadID = nil
+                isLoadingOpenCodeModels = false
+            }
+        }
         let response = try await sendRequest(
             method: "remodex/opencode/models",
             params: .object([:]),
             timeoutNanoseconds: RuntimeConfigLoadingPolicy.modelListTimeoutNanoseconds,
             timeoutMessage: "OpenCode models timed out."
         )
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
         guard let items = response.result?.objectValue?["items"]?.arrayValue else {
             throw CodexServiceError.invalidResponse("OpenCode models response missing items")
         }
-        let models = items
-            .compactMap { decodeModel(OpenCodeModelOption.self, from: $0) }
-            .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        let decodedModels = await decodeModelsOffMain(OpenCodeModelOption.self, from: items)
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
+        let models = try await CodexTransferWork.run {
+            decodedModels.compactMap { $0 }
+                .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        }
+        guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+            throw CancellationError()
+        }
         openCodeModels = models
         return models
     }
@@ -330,8 +349,13 @@ extension CodexService {
     }
 
     func listModels() async throws {
+        let transferGeneration = transferSessionGeneration
         isLoadingModels = true
-        defer { isLoadingModels = false }
+        defer {
+            if transferSessionGeneration == transferGeneration {
+                isLoadingModels = false
+            }
+        }
 
         do {
             let response = try await sendRequest(
@@ -344,6 +368,9 @@ extension CodexService {
                 timeoutNanoseconds: RuntimeConfigLoadingPolicy.modelListTimeoutNanoseconds,
                 timeoutMessage: "model/list timed out while syncing runtime options."
             )
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
 
             guard let resultObject = response.result?.objectValue else {
                 throw CodexServiceError.invalidResponse("model/list response missing payload")
@@ -355,12 +382,19 @@ extension CodexService {
                 ?? resultObject["models"]?.arrayValue
                 ?? []
 
-            let decodedModels = items
-                .compactMap { decodeModel(CodexModelOption.self, from: $0) }
-                .filter { model in
+            let decodedResults = await decodeModelsOffMain(CodexModelOption.self, from: items)
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
+            let decodedModels = try await CodexTransferWork.run {
+                decodedResults.compactMap { $0 }.filter { model in
                     !model.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         && !model.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
+            }
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             guard !decodedModels.isEmpty || availableModels.isEmpty else {
                 debugRuntimeLog(
                     "model/list returned no valid models; retaining existing count=\(availableModels.count)"
@@ -375,6 +409,9 @@ extension CodexService {
 
             debugRuntimeLog("model/list success count=\(runtimeModels.count)")
         } catch {
+            guard !Task.isCancelled, transferSessionGeneration == transferGeneration else {
+                throw CancellationError()
+            }
             handleModelListFailure(error)
             throw error
         }

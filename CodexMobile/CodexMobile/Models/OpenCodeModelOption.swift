@@ -1,6 +1,6 @@
 import Foundation
 
-enum OpenCodeModelTier: String, Codable, CaseIterable, Sendable {
+nonisolated enum OpenCodeModelTier: String, Codable, CaseIterable, Sendable {
     case zen
     case go
     case free
@@ -20,7 +20,7 @@ enum OpenCodeModelTier: String, Codable, CaseIterable, Sendable {
     }
 }
 
-struct OpenCodeModelOption: Codable, Hashable, Identifiable, Sendable {
+nonisolated struct OpenCodeModelOption: Codable, Hashable, Identifiable, Sendable {
     let id: String
     let name: String
     let providerID: String
@@ -42,7 +42,7 @@ struct OpenCodeModelOption: Codable, Hashable, Identifiable, Sendable {
 
 // `id` is the exact OpenCode variant key sent on the wire. Custom keys can
 // differ from their reasoning effort, for example `deep` -> `high`.
-struct OpenCodeModelVariant: Codable, Hashable, Identifiable, Sendable {
+nonisolated struct OpenCodeModelVariant: Codable, Hashable, Identifiable, Sendable {
     let id: String
     let reasoningEffort: String?
 }
@@ -50,7 +50,7 @@ struct OpenCodeModelVariant: Codable, Hashable, Identifiable, Sendable {
 // Turns OpenCode catalog names and raw `provider/model` ids into compact,
 // consistently cased labels. The tier is rendered separately, so a trailing
 // "Free" marker is dropped from free-tier names.
-enum OpenCodeModelNaming {
+nonisolated enum OpenCodeModelNaming {
     private static let brandTokens: [String: String] = [
         "deepseek": "DeepSeek",
         "glm": "GLM",

@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct CodexImageAttachment: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct CodexImageAttachment: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let thumbnailBase64JPEG: String
     let payloadDataURL: String?

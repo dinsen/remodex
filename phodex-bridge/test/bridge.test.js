@@ -59,6 +59,9 @@ test("handleHostPinsRequest returns only ordered pinned IDs and never writes", a
   const statePath = path.join(codexHome, ".codex-global-state.json");
   fs.writeFileSync(statePath, JSON.stringify({
     "pinned-thread-ids": ["thread-a", "thread-b"],
+    "electron-persisted-atom-state": {
+      "app-server-pinned-thread-order-v1": ["thread-b", "thread-a"],
+    },
     unrelated: { secret: "must-not-cross-the-rpc-boundary" },
   }), "utf8");
 
@@ -78,6 +81,7 @@ test("handleHostPinsRequest returns only ordered pinned IDs and never writes", a
       schemaVersion: 1,
       source: "codex-host",
       pinnedThreadIds: ["thread-a", "thread-b"],
+      appServerPinnedThreadOrder: ["thread-b", "thread-a"],
     },
   });
   assert.deepEqual(writes, []);

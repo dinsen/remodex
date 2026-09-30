@@ -270,7 +270,7 @@ enum CodexNotificationPayloadKeys {
 }
 
 // Tracks the real terminal outcome of a run, including user interruption.
-enum CodexTurnTerminalState: String, Codable, Equatable, Sendable {
+nonisolated enum CodexTurnTerminalState: String, Codable, Equatable, Sendable {
     case completed
     case failed
     case stopped
@@ -619,6 +619,7 @@ final class CodexService {
     // Interactive SSH terminal state is owned on-device so it can bootstrap a Mac before the bridge runs.
     var terminalSnapshot: RemodexTerminalSnapshot = .idle
     var terminalSnapshotsById: [String: RemodexTerminalSnapshot] = [:]
+    @ObservationIgnored var terminalOutputTransferQueuesById: [String: CodexTerminalOutputTransferQueue] = [:]
     var terminalProfile: RemodexTerminalProfile = RemodexTerminalProfileStore.load()
     @ObservationIgnored let nativeSSHTerminal = RemodexNativeSSHTerminal()
     @ObservationIgnored var nativeSSHTerminalsById: [String: RemodexNativeSSHTerminal] = [:]
@@ -629,9 +630,14 @@ final class CodexService {
     var webSocketSession: URLSession?
     var webSocketSessionDelegate: CodexURLSessionWebSocketDelegate?
     var webSocketTask: URLSessionWebSocketTask?
+    @ObservationIgnored var transferSessionGeneration = UUID()
+    @ObservationIgnored var transferSocketGeneration = UUID()
+    @ObservationIgnored var transferSendLane = CodexTransferSendLane()
+    @ObservationIgnored var openCodeModelsLoadID: UUID?
+    @ObservationIgnored var historyDecodeContextGeneration: UInt64 = 0
     var webSocketKeepAliveTask: Task<Void, Never>?
     // Raw frame buffer used when the relay runs over manual TCP websocket framing.
-    var manualWebSocketReadBuffer = Data()
+    @ObservationIgnored var manualWebSocketReadBuffer = Data()
     var usesManualWebSocketTransport = false
     let webSocketQueue = DispatchQueue(label: "CodexMobile.WebSocket", qos: .userInitiated)
     var pendingRequests: [String: CheckedContinuation<RPCMessage, Error>] = [:]
@@ -893,6 +899,7 @@ final class CodexService {
 
     let encoder: JSONEncoder
     let decoder: JSONDecoder
+    @ObservationIgnored let transferJSONCodec: CodexTransferJSONCodec
     let messagePersistence = CodexMessagePersistence()
     let composerDraftPersistence = CodexComposerDraftPersistence()
     let threadListPersistence = CodexThreadListPersistence()
@@ -934,6 +941,10 @@ final class CodexService {
     ) {
         self.encoder = encoder
         self.decoder = decoder
+        self.transferJSONCodec = CodexTransferJSONCodec(
+            encoder: CodexTransferWork.makeEncoderCopy(from: encoder),
+            decoder: CodexTransferWork.makeDecoderCopy(from: decoder)
+        )
         self.defaults = defaults
         self.userNotificationCenter = userNotificationCenter ?? UNUserNotificationCenter.current()
         self.remoteNotificationRegistrar = remoteNotificationRegistrar ?? CodexApplicationRemoteNotificationRegistrar()
