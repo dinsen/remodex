@@ -111,6 +111,13 @@ final class VoiceComposerPhaseTwoController {
                     connection.close()
                     return
                 }
+                guard connection.state == .connected else {
+                    connection.close()
+                    activePermissionRequestID = nil
+                    isVoiceSessionActive = false
+                    voiceErrorExplanation = "Live Voice could not be started. Check the bridge connection and try again."
+                    return
+                }
                 connection.addTerminalHandler { [weak self, weak connection] in
                     self?.handleVoiceConnectionTerminated(connection)
                 }

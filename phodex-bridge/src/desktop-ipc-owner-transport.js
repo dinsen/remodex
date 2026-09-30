@@ -507,7 +507,10 @@ function createDesktopIpcRouterServer({
   }
 
   async function routeClientRequest(sender, envelope) {
-    const target = await discoverTargetForRequest(sender, envelope);
+    const requestedTargetClientId = readString(envelope.targetClientId);
+    const target = requestedTargetClientId
+      ? await discoverRequestedTargetForRequest(sender, envelope, requestedTargetClientId)
+      : await discoverTargetForRequest(sender, envelope);
     if (!target) {
       writeEnvelopeToClient(sender, {
         type: "response",
@@ -569,6 +572,24 @@ function createDesktopIpcRouterServer({
         error: "Codex IPC routed request write failed.",
       });
     }
+  }
+
+  async function discoverRequestedTargetForRequest(sender, request, targetClientId) {
+    const target = clientsById.get(targetClientId);
+    if (!target || !target.initialized || target === sender || target.socket.destroyed) {
+      return null;
+    }
+    const canHandle = await askClientCanHandle(target, request);
+    // Targeted owner checks intentionally never fall back to another peer. If
+    // the pinned owner disconnected or transferred the thread during discovery,
+    // the caller must re-resolve ownership before attempting another send.
+    return canHandle
+      && clientsById.get(targetClientId) === target
+      && target.initialized
+      && target !== sender
+      && !target.socket.destroyed
+      ? target
+      : null;
   }
 
   function routeClientResponse(client, envelope) {

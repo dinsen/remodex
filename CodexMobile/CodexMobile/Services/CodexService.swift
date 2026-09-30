@@ -533,7 +533,12 @@ final class CodexService {
     var selectedServiceTier: CodexServiceTier?
     // Per-chat runtime overrides let the composer diverge from app-wide defaults.
     var threadRuntimeOverridesByThreadID: [String: CodexThreadRuntimeOverride] = [:]
-    var selectedAccessMode: CodexAccessMode = .onRequest
+    var selectedAccessMode: CodexAccessMode = .onRequest {
+        didSet {
+            guard oldValue != selectedAccessMode else { return }
+            invalidateRealtimeVoiceSessionsForAccessModeChange()
+        }
+    }
     // Bridge-owned ChatGPT auth snapshot used by Settings and voice gating.
     var gptAccountSnapshot: CodexGPTAccountSnapshot = codexGPTAccountInitialSnapshot() {
         didSet {
@@ -646,6 +651,8 @@ final class CodexService {
     // Live Voice events are routed by opaque bridge session id; handlers stay
     // on the main actor and are never persisted or forwarded to another client.
     @ObservationIgnored var realtimeVoiceEventHandlersBySessionID: [String: (JSONValue) -> Void] = [:]
+    @ObservationIgnored var realtimeVoiceConnectionsBySessionID: [String: CodexRealtimeVoiceConnection] = [:]
+    @ObservationIgnored var realtimeVoiceAccessRevision: UInt64 = 0
     // Test hook: stubs trusted-session lookup without performing a real relay HTTP request.
     @ObservationIgnored var trustedSessionResolverOverride: (() async throws -> CodexTrustedSessionResolveResponse)?
     // Test hooks: exercise keepalive lifecycle without waiting 25s or opening a real socket.

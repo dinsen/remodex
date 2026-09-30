@@ -59,7 +59,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>CodexMobile needs local network access to connect to your Codex app-server running on your Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Remodex needs microphone access to record voice notes for ChatGPT transcription.</string>
+	<string>Remodex uses the microphone for voice notes transcribed by ChatGPT and Live Voice streamed through your paired Mac to OpenAI.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Remodex needs photo library access to let you save rendered diagrams and attachments.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

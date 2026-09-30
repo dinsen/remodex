@@ -233,6 +233,7 @@ struct TurnComposerHostView: View {
             runtimeState: runtimeState,
             runtimeActions: runtimeActions,
             voiceButtonPresentation: voiceButtonPresentation,
+            allowsLiveVoice: isCodexRuntime,
             selectedAccessMode: codex.selectedAccessMode,
             contextWindowUsage: codex.contextWindowUsageByThread[thread.id],
             rateLimitBuckets: codex.rateLimitBuckets,
@@ -250,7 +251,10 @@ struct TurnComposerHostView: View {
             onTapTakePhoto: { viewModel.openCamera(codex: codex) },
             onTapVoice: onTapVoice,
             onStartVoiceSession: {
-                try await codex.openRealtimeVoiceConnection(threadID: thread.id)
+                guard isCodexRuntime else {
+                    throw CodexServiceError.invalidInput("Live Voice is available only in Codex conversations.")
+                }
+                return try await codex.openRealtimeVoiceConnection(threadID: thread.id)
             },
             onCancelVoiceRecording: onCancelVoiceRecording,
             onSetPlanModeArmed: { isArmed in

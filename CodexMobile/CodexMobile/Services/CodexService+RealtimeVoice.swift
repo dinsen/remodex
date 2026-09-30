@@ -132,12 +132,10 @@ final class CodexRealtimeVoiceConnection {
 
     func close() {
         guard state != .closed else { return }
-        let wasActive = state == .connected || state == .connecting
         state = .closed
         // Stop capture/playback before sending the close RPC so no queued
         // microphone chunk can race a provider session that is shutting down.
         liveVoiceCoordinator?.stopMedia()
-        guard wasActive else { return }
 
         let sessionID = session.sessionID
         let sendEvent = self.sendEvent
@@ -624,6 +622,12 @@ extension CodexService {
 
     func unregisterRealtimeVoiceEventHandler(sessionID: String) {
         realtimeVoiceEventHandlersBySessionID.removeValue(forKey: sessionID)
+        realtimeVoiceConnectionsBySessionID.removeValue(forKey: sessionID)
+    }
+
+    func invalidateRealtimeVoiceSessionsForAccessModeChange() {
+        realtimeVoiceAccessRevision &+= 1
+        Array(realtimeVoiceConnectionsBySessionID.values).forEach { $0.close() }
     }
 
     func handleRealtimeVoiceEvent(_ paramsObject: IncomingParamsObject?) {
@@ -647,9 +651,26 @@ extension CodexService {
             throw CodexServiceError.invalidInput("Voice needs an active conversation before it can start.")
         }
 
+        let accessRevision = realtimeVoiceAccessRevision
+        // Capture the selected access mode for the lifetime of this live session.
+        // The bridge applies these per-turn fields to each spoken Codex request;
+        // they must never be inherited from stale thread-level Full Access state.
+        let accessConfiguration = runtimeAccessConfiguration()
+        let turnStartAccessConfiguration = JSONValue.object([
+            "approvalPolicyCandidates": .array(accessConfiguration.approvalPolicyCandidates.map { .string($0) }),
+            "approvalsReviewerCandidates": .array(accessConfiguration.approvalsReviewerCandidates.map { reviewer in
+                reviewer.map(JSONValue.string) ?? .null
+            }),
+            "legacySandbox": .string(accessConfiguration.legacySandbox),
+            "sandboxPolicy": accessConfiguration.sandboxPolicy,
+        ])
+
         let response = try await sendRequest(
             method: "voice/realtime/session",
-            params: .object(["threadId": .string(normalizedThreadID)]),
+            params: .object([
+                "threadId": .string(normalizedThreadID),
+                "turnStartAccessConfiguration": turnStartAccessConfiguration,
+            ]),
             timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
             timeoutMessage: "Live Voice session setup timed out. Check the bridge connection and try again."
         )
@@ -676,13 +697,32 @@ extension CodexService {
             throw CodexServiceError.invalidResponse("The bridge returned an expired live Voice session.")
         }
 
+        guard accessRevision == realtimeVoiceAccessRevision else {
+            await closeRealtimeVoiceBridgeSession(sessionID: sessionID)
+            throw CodexServiceError.invalidInput("The access mode changed while Voice was starting. Try again.")
+        }
+
         return CodexRealtimeVoiceSession(sessionID: sessionID, expiresAt: expiresAt, model: model)
+    }
+
+    private func closeRealtimeVoiceBridgeSession(sessionID: String) async {
+        _ = try? await sendRequest(
+            method: "voice/realtime/close",
+            params: .object(["sessionId": .string(sessionID)]),
+            timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
+            timeoutMessage: "Live Voice bridge request timed out. Try again."
+        )
     }
 
     // The bridge opens and owns the provider WebSocket. This object only sends
     // encrypted media/control RPCs back through the same paired transport.
     func openRealtimeVoiceConnection(threadID: String) async throws -> CodexRealtimeVoiceConnection {
+        let accessRevision = realtimeVoiceAccessRevision
         let session = try await requestRealtimeVoiceSession(threadID: threadID)
+        guard accessRevision == realtimeVoiceAccessRevision else {
+            await closeRealtimeVoiceBridgeSession(sessionID: session.sessionID)
+            throw CodexServiceError.invalidInput("The access mode changed while Voice was starting. Try again.")
+        }
         let connection = CodexRealtimeVoiceConnection(session: session) { [weak self] method, params in
             guard let self else {
                 throw CodexServiceError.disconnected
@@ -709,12 +749,20 @@ extension CodexService {
         registerRealtimeVoiceEventHandler(sessionID: session.sessionID) { [weak connection] event in
             connection?.handleBridgeEvent(event)
         }
+        realtimeVoiceConnectionsBySessionID[session.sessionID] = connection
 
         do {
             try await connection.connect()
+            guard accessRevision == realtimeVoiceAccessRevision, connection.state == .connected else {
+                throw CodexServiceError.invalidInput("The access mode changed while Voice was starting. Try again.")
+            }
             try coordinator.start()
+            guard accessRevision == realtimeVoiceAccessRevision, connection.state == .connected else {
+                throw CodexServiceError.invalidInput("The access mode changed while Voice was starting. Try again.")
+            }
             return connection
         } catch {
+            connection.close()
             unregisterRealtimeVoiceEventHandler(sessionID: session.sessionID)
             coordinator.stop()
             throw error

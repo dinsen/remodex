@@ -459,7 +459,10 @@ private struct SettingsGPTAccountCard: View {
     let onShowInfo: () -> Void
 
     var body: some View {
-        SettingsCard(title: "Voice") {
+        SettingsCard(
+            title: "Voice",
+            footer: "Live Voice streams microphone audio through your paired Mac to OpenAI. To speak a reply, Remodex sends the completed final answer from that Codex turn to OpenAI; reasoning and tool output are excluded."
+        ) {
             Toggle("Enable Voice", isOn: $isVoiceEnabled)
 
             Button {
@@ -468,7 +471,7 @@ private struct SettingsGPTAccountCard: View {
             } label: {
                 SettingsLinkRow(
                     title: "ChatGPT Setup",
-                    subtitle: "Auth and transcription on your paired Mac"
+                    subtitle: "ChatGPT sign-in and voice access on your paired Mac"
                 ) {
                     RemodexIcon.image(systemName: "waveform")
                 }

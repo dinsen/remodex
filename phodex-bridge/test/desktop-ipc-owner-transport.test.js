@@ -12,7 +12,10 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 
-const { createDesktopOwnerIpcClient } = require("../src/desktop-ipc-owner-transport");
+const {
+  createDesktopIpcRouterServer,
+  createDesktopOwnerIpcClient,
+} = require("../src/desktop-ipc-owner-transport");
 const { createFrameReader, writeFrame } = require("../src/desktop-ipc-shared");
 
 const skipOnWindows = { skip: process.platform === "win32" };
@@ -259,4 +262,102 @@ test("desktop owner IPC fallback router", { concurrency: false }, async (t) => {
     ));
     assert.equal(peerReceived, true);
   });
+});
+
+test("IPC router honors a pinned target and does not fall back after ownership changes", async (t) => {
+  const socketPath = createSocketPath(t);
+  const router = createDesktopIpcRouterServer({
+    socketPath,
+    netModule: net,
+    now: () => Date.now(),
+    requestTimeoutMs: 500,
+    discoveryTimeoutMs: 200,
+    logPrefix: "[test]",
+  });
+  await router.start();
+
+  const peers = [];
+  t.after(() => {
+    for (const peer of peers) peer.socket.destroy();
+    router.close();
+  });
+
+  async function connectPeer(clientType, canHandle) {
+    const socket = await connectOnce(socketPath);
+    const frames = [];
+    const frameReader = createFrameReader({
+      onFrame: (envelope) => {
+        frames.push(envelope);
+        if (envelope.type === "client-discovery-request") {
+          const handles = canHandle(envelope.request);
+          writeFrame(socket, JSON.stringify({
+            type: "client-discovery-response",
+            requestId: envelope.requestId,
+            response: { canHandle: handles },
+          }));
+        } else if (envelope.type === "request" && envelope.method === "thread-follower-start-turn") {
+          writeFrame(socket, JSON.stringify({
+            type: "response",
+            requestId: envelope.requestId,
+            resultType: "success",
+            method: envelope.method,
+            handledByClientId: peer.clientId,
+            result: { acceptedBy: peer.clientId },
+          }));
+        }
+      },
+    });
+    socket.on("data", (chunk) => frameReader.push(chunk));
+    const peer = { socket, frames, clientId: "" };
+    peers.push(peer);
+    writeFrame(socket, JSON.stringify({
+      type: "request",
+      requestId: `initialize-${clientType}`,
+      method: "initialize",
+      params: { clientType },
+    }));
+    assert.equal(await waitFor(() => frames.some((frame) => (
+      frame.type === "response" && frame.requestId === `initialize-${clientType}`
+    ))), true);
+    peer.clientId = frames.find((frame) => frame.requestId === `initialize-${clientType}`).result.clientId;
+    return peer;
+  }
+
+  const requester = await connectPeer("remodexbridge", () => false);
+  let pinnedOwnerCanHandle = true;
+  const unpinnedOwner = await connectPeer("vscode", () => true);
+  const pinnedOwner = await connectPeer("vscode", () => pinnedOwnerCanHandle);
+
+  async function requestPinnedOwner(requestId) {
+    writeFrame(requester.socket, JSON.stringify({
+      type: "request",
+      requestId,
+      method: "thread-follower-start-turn",
+      params: { conversationId: "voice-thread" },
+      targetClientId: pinnedOwner.clientId,
+    }));
+    assert.equal(await waitFor(() => requester.frames.some((frame) => (
+      frame.type === "response" && frame.requestId === requestId
+    ))), true);
+    return requester.frames.find((frame) => frame.requestId === requestId);
+  }
+
+  const accepted = await requestPinnedOwner("pinned-owner-start");
+  assert.equal(accepted.resultType, "success");
+  assert.equal(accepted.handledByClientId, pinnedOwner.clientId);
+  assert.deepEqual(accepted.result, { acceptedBy: pinnedOwner.clientId });
+  assert.equal(pinnedOwner.frames.some((frame) => (
+    frame.type === "request" && frame.method === "thread-follower-start-turn"
+  )), true);
+  assert.equal(unpinnedOwner.frames.some((frame) => (
+    frame.type === "request" && frame.method === "thread-follower-start-turn"
+  )), false);
+
+  pinnedOwnerCanHandle = false;
+  const rejected = await requestPinnedOwner("pinned-owner-transfer");
+  assert.equal(rejected.resultType, "error");
+  assert.equal(rejected.handledByClientId, "");
+  assert.equal(unpinnedOwner.frames.some((frame) => (
+    frame.type === "request" && frame.method === "thread-follower-start-turn"
+  )), false, "the router must not send to another peer after the pinned owner rejects ownership");
 });

@@ -89,6 +89,7 @@ const STALE_ACTIVE_READ_MAX_AGE_MS = 20_000;
 // or rollout recovery can clear a phantom run.
 const CONNECTED_IPC_ACTIVITY_LEASE_MS = 5 * 60_000;
 const MAX_NORMALIZED_REVIEW_FINGERPRINTS_PER_THREAD = 128;
+const MAX_VOICE_FINAL_ANSWER_BYTES = 480;
 const DESKTOP_FOLLOWER_REQUEST_METHODS = new Set([
   "thread/settings/update",
   "turn/start",
@@ -262,6 +263,7 @@ function createDesktopIpcActionFollower({
   onNormalizedHistoryIndexRebuilt = () => {},
   onFollowerStateChanged = null,
   onActivityObservation = null,
+  onVoiceCodexMessage = null,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   ownershipProbeTimeoutMs = OWNERSHIP_PROBE_TIMEOUT_MS,
 } = {}) {
@@ -727,6 +729,50 @@ function createDesktopIpcActionFollower({
       "thread-follower-start-turn",
       buildThreadFollowerStartTurnParams(threadId, requestId, params)
     );
+  }
+
+  async function startTurnIfDesktopOwned(request, { ownerVerified = false } = {}) {
+    if (!request || typeof request !== "object" || request.method !== "turn/start") {
+      throw new Error("Expected turn/start request.");
+    }
+
+    const threadId = readThreadId(request?.params);
+    const requestId = requestIdKey(request.id);
+    if (!threadId || !requestId) {
+      throw new Error("Missing turn/start request id or thread id.");
+    }
+
+    const ownerIsDesktop = ownerVerified
+      ? resolveThreadOwnerFromState(threadId) === "desktop"
+      : await resolveThreadOwner(threadId) === "desktop";
+    if (!ownerIsDesktop) {
+      throw new Error("Could not confirm Codex Desktop owns this conversation.");
+    }
+
+    // Owner confirmation is asynchronous. Recheck the bridge's synchronous
+    // local claim after it returns, then pin the send to the confirmed Desktop
+    // client so another IPC peer cannot accept the request.
+    const ownerPin = {
+      ownerClientId: confirmedDesktopOwnerClientIdsByThreadId.get(threadId),
+      sourceGeneration: desktopSourceGeneration,
+    };
+    if (!isPinnedDesktopOwnerCurrent(threadId, ownerPin)) {
+      throw new Error("Codex Desktop ownership changed before the Voice request started.");
+    }
+
+    const route = buildDesktopFollowerRoute(request);
+    if (!route) {
+      throw new Error("Could not route the Voice request to Codex Desktop.");
+    }
+    activeThreadIds.add(threadId);
+    return new Promise((resolve, reject) => {
+      submitDesktopFollowerRequest(route, request, {
+        resolve,
+        reject,
+        failClosedOnLocalOwnerChange: true,
+        ownerPin,
+      });
+    });
   }
 
   function stopAll() {
@@ -1293,6 +1339,74 @@ function createDesktopIpcActionFollower({
         || hasDesktopOriginHint(threadId));
   }
 
+  function resolveThreadOwnerFromState(threadId) {
+    const normalizedThreadId = readString(threadId);
+    if (!normalizedThreadId) {
+      return "unknown";
+    }
+    if (liveOwnerThreadIds.has(normalizedThreadId)
+      || isLocallyOwnedThread(normalizedThreadId)
+      || locallyAcquiredThreadIds.has(normalizedThreadId)) {
+      return "local";
+    }
+    return isDesktopRoutableThread(normalizedThreadId) ? "desktop" : "unknown";
+  }
+
+  function isPinnedDesktopOwnerCurrent(threadId, ownerPin) {
+    const normalizedThreadId = readString(threadId);
+    const ownerClientId = readString(ownerPin?.ownerClientId);
+    return Boolean(normalizedThreadId
+      && ownerClientId
+      && ownerClientId !== ipc.clientId
+      && !stopped
+      && ipc.isConnected()
+      && ownerPin.sourceGeneration === desktopSourceGeneration
+      && confirmedDesktopOwnerClientIdsByThreadId.get(normalizedThreadId) === ownerClientId
+      && resolveThreadOwnerFromState(normalizedThreadId) === "desktop");
+  }
+
+  function assertPinnedDesktopOwnerCurrent(threadId, ownerPin) {
+    if (!isPinnedDesktopOwnerCurrent(threadId, ownerPin)) {
+      throw new Error("Codex Desktop ownership changed before the Voice request started.");
+    }
+  }
+
+  function isDesktopOwnershipVerificationCurrent(
+    threadId,
+    ownerClientId,
+    sourceGeneration,
+    previouslyConfirmedOwnerClientId
+  ) {
+    const currentOwnerClientId = confirmedDesktopOwnerClientIdsByThreadId.get(threadId);
+    const ownerMapStillMatches = previouslyConfirmedOwnerClientId
+      ? currentOwnerClientId === previouslyConfirmedOwnerClientId
+        && ownerClientId === previouslyConfirmedOwnerClientId
+      : !currentOwnerClientId || currentOwnerClientId === ownerClientId;
+    return Boolean(!stopped
+      && ipc.isConnected()
+      && sourceGeneration === desktopSourceGeneration
+      && ownerClientId
+      && ownerClientId !== ipc.clientId
+      && !liveOwnerThreadIds.has(threadId)
+      && !isLocallyOwnedThread(threadId)
+      && !locallyAcquiredThreadIds.has(threadId)
+      && !ownerUnavailableThreadIds.has(threadId)
+      && ownerMapStillMatches);
+  }
+
+  async function resolveThreadOwner(threadId) {
+    const normalizedThreadId = readString(threadId);
+    const owner = resolveThreadOwnerFromState(normalizedThreadId);
+    if (owner !== "desktop") {
+      return owner;
+    }
+    if (!await verifyDesktopOwner(normalizedThreadId)) {
+      return "unknown";
+    }
+    const ownerAfterVerification = resolveThreadOwnerFromState(normalizedThreadId);
+    return ownerAfterVerification === "desktop" ? "desktop" : ownerAfterVerification;
+  }
+
   function hasDesktopOriginHint(threadId) {
     if (desktopOriginThreadIds.has(threadId)) {
       return true;
@@ -1338,7 +1452,23 @@ function createDesktopIpcActionFollower({
   // unresponsive IPC peer cannot turn a negative result into a 10-second wait.
   async function verifyDesktopOwner(threadId) {
     if (stopped) return false;
-    let ownerClientId = confirmedDesktopOwnerClientIdsByThreadId.get(threadId);
+    const wasConnectedAtStart = ipc.isConnected();
+    let sourceGeneration = desktopSourceGeneration;
+    const previouslyConfirmedOwnerClientId = wasConnectedAtStart
+      ? confirmedDesktopOwnerClientIdsByThreadId.get(threadId) || ""
+      : "";
+    let ownerClientId = previouslyConfirmedOwnerClientId;
+    if (!wasConnectedAtStart) {
+      try {
+        await ipc.waitUntilConnected(Math.min(requestTimeoutMs, ownershipProbeTimeoutMs));
+      } catch {
+        return false;
+      }
+      if (stopped || !ipc.isConnected()) return false;
+      // A newly initialized IPC source starts a new ownership epoch. Capture it
+      // only after the initialize response has been confirmed.
+      sourceGeneration = desktopSourceGeneration;
+    }
     if (!ownerClientId) {
       try {
         const discovery = await ipc.sendRequest("thread-owner-discovery", {
@@ -1353,20 +1483,37 @@ function createDesktopIpcActionFollower({
         return false;
       }
     }
-    if (!ownerClientId || ownerClientId === ipc.clientId) return false;
+    if (!isDesktopOwnershipVerificationCurrent(
+      threadId,
+      ownerClientId,
+      sourceGeneration,
+      previouslyConfirmedOwnerClientId
+    )) return false;
     try {
-      const result = await ipc.sendRequest("thread-follower-load-complete-history", {
+      const response = await ipc.sendRequest("thread-follower-load-complete-history", {
         conversationId: threadId,
       }, {
         targetClientId: ownerClientId,
         timeoutMs: Math.min(requestTimeoutMs, DESKTOP_HISTORY_PROBE_TIMEOUT_MS),
+        returnEnvelope: true,
       });
-      if (stopped || result?.revision == null) return false;
+      if (!isDesktopOwnershipVerificationCurrent(
+        threadId,
+        ownerClientId,
+        sourceGeneration,
+        previouslyConfirmedOwnerClientId
+      )
+        || response?.handledByClientId !== ownerClientId
+        || response?.result?.revision == null) {
+        return false;
+      }
       confirmedDesktopOwnerClientIdsByThreadId.set(threadId, ownerClientId);
       ownerUnavailableThreadIds.delete(threadId);
       return true;
     } catch {
-      confirmedDesktopOwnerClientIdsByThreadId.delete(threadId);
+      if (confirmedDesktopOwnerClientIdsByThreadId.get(threadId) === ownerClientId) {
+        confirmedDesktopOwnerClientIdsByThreadId.delete(threadId);
+      }
       return false;
     }
   }
@@ -1927,6 +2074,16 @@ function createDesktopIpcActionFollower({
       }
       const terminalTurn = (liveState.turns || []).find((turn) => turnIdOf(turn) === previous.id);
       const terminalStatus = readString(terminalTurn?.status) || "completed";
+      try {
+        onVoiceCodexMessage?.(desktopVoiceTurnCompletionNotification(
+          threadId,
+          previous.id,
+          terminalStatus,
+          terminalTurn
+        ));
+      } catch {
+        // Voice is an optional observer; it must not interrupt Desktop mirroring.
+      }
       sendApplicationResponse(JSON.stringify(desktopLiveTurnLifecycleNotification(
         "turn/completed",
         threadId,
@@ -2448,21 +2605,26 @@ function createDesktopIpcActionFollower({
     return null;
   }
 
-  function submitDesktopFollowerRequest(route, originalMessage) {
+  function submitDesktopFollowerRequest(route, originalMessage, completion = null) {
     let requestPhase = route.method;
     const startedAt = now();
     const alreadyDesktopRoutable = isDesktopRoutableThread(route.threadId);
+    const ownerPin = completion?.ownerPin || null;
     // Lock this thread to the Desktop route while the request is queued or in
     // flight. A second phone mutation must not escape to the local app-server
     // just because the ownership probe expires or IPC disconnects in between.
     desktopMutationRiskThreadIds.add(route.threadId);
     enqueueMutation(route.threadId, async () => {
-      if (liveOwnerThreadIds.has(route.threadId) || isLocallyOwnedThread(route.threadId)) {
+      if (ownerPin) {
+        assertPinnedDesktopOwnerCurrent(route.threadId, ownerPin);
+      } else if (liveOwnerThreadIds.has(route.threadId) || isLocallyOwnedThread(route.threadId)) {
         return { forwardLocally: true };
       }
       const revisionBefore = runtimeSettingsStore?.get?.(route.threadId)?.revision;
       const resolvedRequest = await resolveFollowerRequest(route);
-      if (liveOwnerThreadIds.has(route.threadId) || isLocallyOwnedThread(route.threadId)) {
+      if (ownerPin) {
+        assertPinnedDesktopOwnerCurrent(route.threadId, ownerPin);
+      } else if (liveOwnerThreadIds.has(route.threadId) || isLocallyOwnedThread(route.threadId)) {
         return { forwardLocally: true };
       }
       if (route.method === "thread-follower-start-turn") {
@@ -2470,7 +2632,10 @@ function createDesktopIpcActionFollower({
         // Propagate it without turning a timeout into local delivery failure.
         try {
           requestPhase = "thread-follower-update-thread-settings";
-          await syncDesktopOwnerRuntimeSettings(route.threadId, resolvedRequest.turnStartParams);
+          await syncDesktopOwnerRuntimeSettings(route.threadId, resolvedRequest.turnStartParams, ownerPin);
+          if (ownerPin) {
+            assertPinnedDesktopOwnerCurrent(route.threadId, ownerPin);
+          }
         } catch (error) {
           // Failure to deliver settings does not prove that a turn sent locally
           // would be safe. Only the start-turn route can authorize that fallback.
@@ -2478,18 +2643,32 @@ function createDesktopIpcActionFollower({
         }
       }
       requestPhase = route.method;
+      if (ownerPin) {
+        assertPinnedDesktopOwnerCurrent(route.threadId, ownerPin);
+      }
       return {
         resolvedRequest,
         revisionBefore,
-        result: await ipc.sendRequest(route.method, resolvedRequest.params, {
-          targetClientId: confirmedDesktopOwnerClientIdsByThreadId.get(route.threadId),
-        }),
+        result: ownerPin
+          ? await sendPinnedDesktopOwnerRequest(
+            route.threadId,
+            ownerPin,
+            route.method,
+            resolvedRequest.params
+          )
+          : await ipc.sendRequest(route.method, resolvedRequest.params, {
+            targetClientId: confirmedDesktopOwnerClientIdsByThreadId.get(route.threadId),
+          }),
       };
     })
       .then(({ resolvedRequest, revisionBefore, result, forwardLocally }) => {
         if (forwardLocally) {
           desktopMutationRiskThreadIds.delete(route.threadId);
-          forwardToLocalCodex?.(JSON.stringify(originalMessage));
+          if (completion?.failClosedOnLocalOwnerChange) {
+            completion.reject(new Error("Conversation ownership changed before the Voice request started."));
+          } else {
+            forwardToLocalCodex?.(JSON.stringify(originalMessage));
+          }
           return;
         }
         const currentSettings = runtimeSettingsStore?.get?.(route.threadId);
@@ -2507,14 +2686,21 @@ function createDesktopIpcActionFollower({
             readTurnIdFromAppServerResult(appServerResult)
           );
         }
-        sendApplicationResponse(JSON.stringify({
-          id: originalMessage.id,
-          result: appServerResult,
-        }));
+        if (completion) {
+          completion.resolve(appServerResult);
+        } else {
+          sendApplicationResponse(JSON.stringify({
+            id: originalMessage.id,
+            result: appServerResult,
+          }));
+        }
       })
       .catch((error) => {
         if (/no-client-found|client-disconnected/.test(readString(error?.message))) {
-          confirmedDesktopOwnerClientIdsByThreadId.delete(route.threadId);
+          if (!ownerPin
+            || confirmedDesktopOwnerClientIdsByThreadId.get(route.threadId) === ownerPin.ownerClientId) {
+            confirmedDesktopOwnerClientIdsByThreadId.delete(route.threadId);
+          }
         }
         console.warn(`${logPrefix} desktop follower request failed method=${requestPhase} elapsedMs=${now() - startedAt}: ${error.message}`);
         // Only rerun the request locally when we know Desktop never received it.
@@ -2524,7 +2710,7 @@ function createDesktopIpcActionFollower({
           || rawStatesByThreadId.has(route.threadId)
           || desktopOwnedByProbeThreadIds.has(route.threadId)
           || desktopOriginThreadIds.has(route.threadId);
-        if (typeof forwardToLocalCodex === "function"
+        if (!completion && typeof forwardToLocalCodex === "function"
           && isDeliveryFailureError(error)
           && route.method !== "thread-follower-update-thread-settings"
           && !desktopOwnerStillKnown) {
@@ -2538,15 +2724,24 @@ function createDesktopIpcActionFollower({
         const definitiveStaleSteer = route.method === "thread-follower-steer-turn"
           && error?.desktopIpcResponse === true
           && isDefinitiveStaleSteerError(error.message);
-        sendApplicationResponse(JSON.stringify({
-          id: originalMessage.id,
-          error: {
-            code: -32000,
-            message: definitiveStaleSteer
-              ? error.message
-              : "Could not continue this Codex Desktop-owned thread from the phone.",
-          },
-        }));
+        const pinnedVoiceOwnerChanged = ownerPin
+          && /ownership changed before the Voice request started/i.test(readString(error?.message));
+        const message = definitiveStaleSteer || pinnedVoiceOwnerChanged
+          ? error.message
+          : "Could not continue this Codex Desktop-owned thread from the phone.";
+        if (completion) {
+          const failure = new Error(message);
+          failure.code = -32000;
+          completion.reject(failure);
+        } else {
+          sendApplicationResponse(JSON.stringify({
+            id: originalMessage.id,
+            error: {
+              code: -32000,
+              message,
+            },
+          }));
+        }
       });
   }
 
@@ -2578,7 +2773,7 @@ function createDesktopIpcActionFollower({
   // local composer state. Passing model/effort only inside start-turn leaves
   // that state untouched, so Desktop silently starts with its old selection.
   // Apply the phone's complete runtime choice first, then start the turn.
-  async function syncDesktopOwnerRuntimeSettings(threadId, turnStartParams) {
+  async function syncDesktopOwnerRuntimeSettings(threadId, turnStartParams, ownerPin = null) {
     const params = turnStartParams && typeof turnStartParams === "object"
       ? turnStartParams
       : {};
@@ -2590,12 +2785,35 @@ function createDesktopIpcActionFollower({
       ...(params.collaborationMode ? { collaborationMode: cloneJSON(params.collaborationMode) } : {}),
     };
     if (Object.keys(threadSettings).length === 0) return;
-    await ipc.sendRequest("thread-follower-update-thread-settings", {
+    const requestParams = {
       conversationId: threadId,
       threadSettings,
-    }, {
+    };
+    if (ownerPin) {
+      await sendPinnedDesktopOwnerRequest(
+        threadId,
+        ownerPin,
+        "thread-follower-update-thread-settings",
+        requestParams
+      );
+      return;
+    }
+    await ipc.sendRequest("thread-follower-update-thread-settings", requestParams, {
       targetClientId: confirmedDesktopOwnerClientIdsByThreadId.get(threadId),
     });
+  }
+
+  async function sendPinnedDesktopOwnerRequest(threadId, ownerPin, method, params) {
+    assertPinnedDesktopOwnerCurrent(threadId, ownerPin);
+    const response = await ipc.sendRequest(method, params, {
+      targetClientId: ownerPin.ownerClientId,
+      returnEnvelope: true,
+    });
+    assertPinnedDesktopOwnerCurrent(threadId, ownerPin);
+    if (response?.handledByClientId !== ownerPin.ownerClientId) {
+      throw new Error("Codex Desktop ownership changed before the Voice request started.");
+    }
+    return response.result ?? null;
   }
 
   function commitPhoneRuntimeSettings(threadId, turnStartParams, turnId) {
@@ -2764,6 +2982,8 @@ function createDesktopIpcActionFollower({
   return {
     observeInbound,
     startTurn,
+    startTurnIfDesktopOwned,
+    resolveThreadOwner,
     observeThreadListResponse,
     observeThreadMetadata,
     stopAll,
@@ -2864,6 +3084,7 @@ function createDesktopIpcClient({
   let remainingSocketPaths = [];
   const pendingRequests = new Map();
   const pendingDiscoveries = new Map();
+  const connectedWaiters = new Set();
   const frameReader = createFrameReader({
     onFrame: (envelope) => dispatchEnvelope(envelope),
     onOverflow: () => close(),
@@ -2876,6 +3097,32 @@ function createDesktopIpcClient({
 
     remainingSocketPaths = resolveSocketPaths();
     connectNextSocket();
+  }
+
+  function waitUntilConnected(timeoutMs = requestTimeoutMs) {
+    ensureConnected();
+    if (socket && !socket.destroyed && clientId) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timeout: null };
+      waiter.timeout = setTimeout(() => {
+        connectedWaiters.delete(waiter);
+        reject(new Error("Desktop IPC initialization timed out."));
+      }, timeoutMs);
+      waiter.timeout.unref?.();
+      connectedWaiters.add(waiter);
+    });
+  }
+
+  function settleConnectedWaiters(error = null) {
+    for (const waiter of connectedWaiters) {
+      connectedWaiters.delete(waiter);
+      clearTimeout(waiter.timeout);
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
   }
 
   function connectNextSocket() {
@@ -2895,6 +3142,7 @@ function createDesktopIpcClient({
         .then((result) => {
           clientId = readString(result?.clientId) || clientId;
           onConnected?.(clientId);
+          settleConnectedWaiters();
         })
         .catch((error) => {
           console.warn(`${logPrefix} desktop IPC initialize failed: ${error.message}`);
@@ -3100,6 +3348,9 @@ function createDesktopIpcClient({
       pendingDiscovery.resolve(null);
     }
     pendingDiscoveries.clear();
+    if (remainingSocketPaths.length === 0) {
+      settleConnectedWaiters(new Error("Desktop IPC connection closed before initialization."));
+    }
     onDisconnect();
   }
 
@@ -3127,6 +3378,7 @@ function createDesktopIpcClient({
       return clientId;
     },
     ensureConnected,
+    waitUntilConnected,
     isConnected() {
       return Boolean(socket && !socket.destroyed && clientId);
     },
@@ -3853,6 +4105,53 @@ function desktopLiveTurnLifecycleNotification(method, threadId, turn) {
       remodexActionSource: DESKTOP_IPC_ACTION_SOURCE,
     },
   };
+}
+
+function desktopVoiceTurnCompletionNotification(threadId, turnId, status, turn) {
+  let finalAnswer = null;
+  for (const item of Array.isArray(turn?.items) ? turn.items : []) {
+    if (readString(item?.type) !== "agentMessage"
+      || readString(item?.phase)?.toLowerCase() !== "final_answer") {
+      continue;
+    }
+    const id = readString(item?.id);
+    const text = boundedVoiceFinalAnswerText(item?.text);
+    if (id && text) {
+      finalAnswer = { id, type: "agentMessage", phase: "final_answer", text };
+    }
+  }
+  return {
+    method: "turn/completed",
+    params: {
+      threadId,
+      turnId,
+      turn: {
+        id: turnId,
+        status,
+        items: finalAnswer ? [finalAnswer] : [],
+      },
+    },
+  };
+}
+
+function boundedVoiceFinalAnswerText(value) {
+  const text = readString(value);
+  if (!text) return null;
+  if (Buffer.byteLength(text, "utf8") <= MAX_VOICE_FINAL_ANSWER_BYTES) {
+    return text;
+  }
+
+  const suffix = "...";
+  const byteLimit = MAX_VOICE_FINAL_ANSWER_BYTES - Buffer.byteLength(suffix, "utf8");
+  let bounded = "";
+  let bytes = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > byteLimit) break;
+    bounded += character;
+    bytes += characterBytes;
+  }
+  return `${bounded}${suffix}`;
 }
 
 function notificationWithTurnIdentityContinuity(notification) {

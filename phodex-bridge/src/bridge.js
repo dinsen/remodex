@@ -894,9 +894,20 @@ function startBridge({
       ),
     })
     : null;
+  let realtimeSessionHandler = null;
+  function sendDesktopFollowerResponse(rawMessage) {
+    const parsedMessage = parseBridgeMessage(rawMessage);
+    const isCompactDesktopMirrorCompletion = parsedMessage?.method === "turn/completed"
+      && parsedMessage.params?.remodexDesktopIpcMirror === true
+      && !Array.isArray(parsedMessage.params?.turn?.items);
+    if (parsedMessage?.id == null && !isCompactDesktopMirrorCompletion) {
+      realtimeSessionHandler?.handleCodexMessage(parsedMessage);
+    }
+    sendApplicationResponse(rawMessage);
+  }
   const desktopIpcActionFollower = !config.codexEndpoint
     ? createDesktopIpcActionFollower({
-      sendApplicationResponse,
+      sendApplicationResponse: sendDesktopFollowerResponse,
       readConversationState: async (threadId) => seedConversationStateFromThreadRead(
         await sendCodexRequest("thread/read", buildCompleteThreadReadParams(threadId))
       ),
@@ -947,6 +958,9 @@ function startBridge({
       onFollowerStateChanged(threadId, following) {
         desktopRefresher.handleFollowerStateChanged(threadId, following);
       },
+      onVoiceCodexMessage(message) {
+        realtimeSessionHandler?.handleCodexMessage(message);
+      },
     })
     : null;
   let contextUsageWatcher = null;
@@ -977,8 +991,10 @@ function startBridge({
     sendCodexRequest,
     logPrefix: "[remodex]",
   });
-  const realtimeSessionHandler = createRealtimeSessionHandler({
+  realtimeSessionHandler = createRealtimeSessionHandler({
     sendCodexRequest,
+    startCodexTurn: startRealtimeVoiceCodexTurn,
+    resolveThreadOwner: resolveRealtimeVoiceThreadOwner,
     sendApplicationResponse,
     logPrefix: "[remodex]",
   });
@@ -1254,6 +1270,9 @@ function startBridge({
         && config.desktopIpcLiveSyncEnabled === false) {
         desktopIpcActionFollower?.claimNewLocalThread(parsedMessage.result?.thread?.id);
       }
+    }
+    if (parsedMessage?.id == null) {
+      realtimeSessionHandler.handleCodexMessage(parsedMessage);
     }
     if (handleBridgeManagedCodexResponse(message, parsedMessage)) {
       return;
@@ -2414,6 +2433,51 @@ function startBridge({
     if (errorMessage.includes("already initialized")) {
       codexHandshakeState = "warm";
     }
+  }
+
+  async function resolveRealtimeVoiceThreadOwner(threadId) {
+    const normalizedThreadId = readString(threadId);
+    if (!normalizedThreadId) {
+      return "unknown";
+    }
+    if (desktopIpcLiveOwner?.isThreadOwned(normalizedThreadId)
+      || desktopIpcActionFollower?.isLocallyAcquiredThread?.(normalizedThreadId)) {
+      return "local";
+    }
+    const followerOwner = typeof desktopIpcActionFollower?.resolveThreadOwner === "function"
+      ? await desktopIpcActionFollower.resolveThreadOwner(normalizedThreadId)
+      : "unknown";
+    if (followerOwner === "local") {
+      return "local";
+    }
+    if (followerOwner === "desktop") {
+      return "desktop";
+    }
+    if (config.codexEndpoint) {
+      return "single-runtime";
+    }
+    return "unknown";
+  }
+
+  async function startRealtimeVoiceCodexTurn(params) {
+    const threadId = readString(params?.threadId);
+    const owner = await resolveRealtimeVoiceThreadOwner(threadId);
+    if (!threadId || owner === "unknown") {
+      throw new Error("Could not confirm which Codex runtime owns this conversation.");
+    }
+
+    if (owner === "desktop") {
+      if (typeof desktopIpcActionFollower?.startTurnIfDesktopOwned !== "function") {
+        throw new Error("Codex Desktop turn routing is unavailable.");
+      }
+      return desktopIpcActionFollower.startTurnIfDesktopOwned({
+        id: `bridge-managed-voice-${randomBytes(12).toString("hex")}`,
+        method: "turn/start",
+        params,
+      }, { ownerVerified: true });
+    }
+
+    return sendCodexRequest("turn/start", normalizeTurnStartParamsForCodex(params));
   }
 
   // Runs bridge-private JSON-RPC calls against the local app-server so token-bearing responses

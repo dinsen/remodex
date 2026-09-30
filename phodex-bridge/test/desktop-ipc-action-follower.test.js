@@ -27,6 +27,7 @@ const {
 const {
   matchDesktopTurnIdentityContinuities,
 } = require("../src/desktop-ipc-conversation-projector");
+const { createRealtimeSessionHandler } = require("../src/voice-handler");
 
 test("desktop identity repair pairs synthetic turns independently of parallel active turns", () => {
   const sharedTurn = {
@@ -383,6 +384,36 @@ function sendActivitySnapshot(socket, threadId, status, overrides = {}) {
       },
     },
   });
+}
+
+function makeFollowerVoiceLiveSocket(upstreamMessages) {
+  const listeners = new Map();
+  const socket = {
+    readyState: 1,
+    on(eventName, listener) {
+      listeners.set(eventName, listener);
+    },
+    send(rawMessage) {
+      const event = JSON.parse(String(rawMessage));
+      upstreamMessages.push(event);
+      if (event.type === "session.start") {
+        queueMicrotask(() => listeners.get("message")?.({
+          data: JSON.stringify({
+            type: "session.started",
+            session: { expires_at: 1_800_000_000 },
+          }),
+        }));
+      }
+    },
+    close() {
+      socket.readyState = 3;
+      listeners.get("close")?.();
+    },
+    emitMessage(event) {
+      listeners.get("message")?.({ data: JSON.stringify(event) });
+    },
+  };
+  return socket;
 }
 
 function createFakeIpcTransport({ failWriteForMethod = null, onRequest = null } = {}) {
@@ -2460,6 +2491,495 @@ test("desktop IPC follower routes phone turns to Desktop-owned threads", async (
     });
   }
   assert.equal(serverFrames.length, serverFrameCountBeforeUnsupportedMutations);
+});
+
+test("Voice starts only on a verified Desktop owner and targets that owner", async (t) => {
+  const { tempDir, socketPath } = createIpcTestSocket("remodex-ipc-voice-desktop-start-");
+  const serverFrames = [];
+  let serverSocket = null;
+  const server = net.createServer((socket) => {
+    serverSocket = socket;
+    attachFrameReader(socket, (frame) => {
+      serverFrames.push(frame);
+      if (frame.method === "initialize") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: "desktop-owner",
+          result: { clientId: "remodex-test" },
+        });
+      } else if (frame.method === "thread-owner-discovery") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: "desktop-owner",
+          result: { supportsUntrustedAppInput: true },
+        });
+      } else if (frame.method === "thread-follower-load-complete-history") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: "desktop-owner",
+          result: { revision: 1 },
+        });
+      } else if (frame.method === "thread-follower-start-turn") {
+        writeFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: "desktop-owner",
+          result: { result: { turn: { id: "voice-desktop-turn" } } },
+        });
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => {
+    server.close();
+    serverSocket?.destroy();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const outbound = [];
+  const follower = createDesktopIpcActionFollower({
+    socketPath,
+    sendApplicationResponse(message) {
+      outbound.push(JSON.parse(message));
+    },
+    requestTimeoutMs: 500,
+  });
+  t.after(() => follower.stopAll());
+  follower.observeThreadMetadata({
+    id: "voice-desktop-thread",
+    originator: "Codex Desktop",
+    source: "vscode",
+  });
+
+  assert.equal(await follower.resolveThreadOwner("voice-desktop-thread"), "desktop");
+  const result = await follower.startTurnIfDesktopOwned({
+    id: "bridge-managed-voice-test",
+    method: "turn/start",
+    params: {
+      threadId: "voice-desktop-thread",
+      input: [{ type: "input_text", text: "Use the current approval mode." }],
+      approvalPolicy: "on-request",
+      approvalsReviewer: "user",
+      sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+    },
+  });
+
+  assert.deepEqual(result, { turn: { id: "voice-desktop-turn" } });
+  const startFrame = serverFrames.find((frame) => frame.method === "thread-follower-start-turn");
+  assert.equal(startFrame?.targetClientId, "desktop-owner");
+  assert.deepEqual(startFrame?.params.turnStart.request, {
+    threadId: "voice-desktop-thread",
+    input: [{ type: "input_text", text: "Use the current approval mode." }],
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      networkAccess: true,
+      writableRoots: [],
+      excludeSlashTmp: false,
+      excludeTmpdirEnvVar: false,
+    },
+    clientUserMessageId: "bridge-managed-voice-test",
+  });
+  assert.equal(outbound.some((message) => message.id === "bridge-managed-voice-test"), false);
+
+  const localFollower = createDesktopIpcActionFollower({
+    socketPath: path.join(tempDir, "no-local-route.sock"),
+    sendApplicationResponse() {},
+    isLocallyOwnedThread: (threadId) => threadId === "local-voice-thread",
+  });
+  t.after(() => localFollower.stopAll());
+  assert.equal(await localFollower.resolveThreadOwner("local-voice-thread"), "local");
+  await assert.rejects(
+    localFollower.startTurnIfDesktopOwned({
+      id: "local-voice-start",
+      method: "turn/start",
+      params: { threadId: "local-voice-thread", input: "must route through app-server" },
+    }),
+    /Could not confirm Codex Desktop owns this conversation/
+  );
+});
+
+test("Voice stale owner failure preserves a newer Desktop owner snapshot", async (t) => {
+  const threadId = "voice-owner-transfer-after-send";
+  let ownerClientId = "desktop-owner";
+  let pinnedStartTarget = "";
+  const ipc = createFakeIpcTransport({
+    onRequest(frame, socket) {
+      if (frame.method === "thread-owner-discovery") {
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: ownerClientId,
+          result: { supportsUntrustedAppInput: true },
+        });
+        return;
+      }
+      if (frame.method === "thread-follower-load-complete-history") {
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: ownerClientId,
+          result: { revision: 1 },
+        });
+        return;
+      }
+      if (frame.method === "thread-follower-start-turn") {
+        pinnedStartTarget = frame.targetClientId;
+        ownerClientId = "desktop-new-owner";
+        emitFrame(socket, {
+          type: "broadcast",
+          method: "thread-stream-state-changed",
+          sourceClientId: ownerClientId,
+          version: 11,
+          params: {
+            conversationId: threadId,
+            change: { type: "snapshot", conversationState: { requests: [], turns: [] } },
+          },
+        });
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "error",
+          method: frame.method,
+          error: "no-client-found",
+        });
+      }
+    },
+  });
+  const follower = createDesktopIpcActionFollower({
+    socketPath: "/tmp/fake-remodex-voice-owner-transfer-after-send.sock",
+    netModule: ipc.netModule,
+    sendApplicationResponse() {},
+    requestTimeoutMs: 500,
+  });
+  t.after(() => follower.stopAll());
+  follower.observeThreadMetadata({
+    id: threadId,
+    originator: "Codex Desktop",
+    source: "vscode",
+  });
+
+  assert.equal(await follower.resolveThreadOwner(threadId), "desktop");
+  await assert.rejects(follower.startTurnIfDesktopOwned({
+    id: "voice-start-old-owner",
+    method: "turn/start",
+    params: { threadId, input: [{ type: "text", text: "Do not retry after transfer." }] },
+  }, { ownerVerified: true }));
+
+  assert.equal(pinnedStartTarget, "desktop-owner");
+  const discoveryCountBeforeRecheck = ipc.state.frames.filter((frame) => (
+    frame.method === "thread-owner-discovery"
+  )).length;
+  assert.equal(await follower.resolveThreadOwner(threadId), "desktop");
+  assert.equal(ipc.state.frames.filter((frame) => (
+    frame.method === "thread-owner-discovery"
+  )).length, discoveryCountBeforeRecheck, "the failed stale request must not erase the newer owner pin");
+  const historyRequests = ipc.state.frames.filter((frame) => (
+    frame.method === "thread-follower-load-complete-history"
+  ));
+  assert.equal(historyRequests.at(-1)?.targetClientId, "desktop-new-owner");
+  assert.equal(ipc.state.frames.some((frame) => frame.method === "thread-follower-start-turn"
+    && frame.targetClientId !== "desktop-owner"), false);
+});
+
+test("Voice Desktop start fails closed when ownership changes before the queued send", async (t) => {
+  const threadId = "voice-pinned-owner-thread";
+  let currentOwnerClientId = "desktop-owner";
+  let localOwnership = false;
+  const ipc = createFakeIpcTransport({
+    onRequest(frame, socket) {
+      let result = null;
+      if (frame.method === "thread-owner-discovery") {
+        result = { supportsUntrustedAppInput: true };
+      } else if (frame.method === "thread-follower-load-complete-history") {
+        result = { revision: 1 };
+      } else if (frame.method === "thread-follower-start-turn") {
+        result = { result: { turn: { id: "unsafe-start" } } };
+      }
+      if (result) {
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: currentOwnerClientId,
+          result,
+        });
+      }
+    },
+  });
+  const normalizations = [];
+  const follower = createDesktopIpcActionFollower({
+    socketPath: "/tmp/fake-remodex-voice-pinned-owner.sock",
+    netModule: ipc.netModule,
+    sendApplicationResponse() {},
+    isLocallyOwnedThread: (candidateThreadId) => (
+      candidateThreadId === threadId && localOwnership
+    ),
+    normalizeTurnStartParams: (params) => new Promise((resolve) => {
+      normalizations.push({ params, resolve });
+    }),
+    requestTimeoutMs: 500,
+  });
+  t.after(() => follower.stopAll());
+  follower.observeThreadMetadata({
+    id: threadId,
+    originator: "Codex Desktop",
+    source: "vscode",
+  });
+  assert.equal(await follower.resolveThreadOwner(threadId), "desktop");
+
+  const startVoiceTurn = (id) => follower.startTurnIfDesktopOwned({
+    id,
+    method: "turn/start",
+    params: { threadId, input: [{ type: "text", text: "Continue safely." }] },
+  }, { ownerVerified: true });
+
+  const transferStart = startVoiceTurn("voice-transfer-start");
+  await waitFor(() => normalizations.length === 1);
+  currentOwnerClientId = "desktop-new-owner";
+  emitFrame(ipc.state.socket, {
+    type: "broadcast",
+    method: "thread-stream-state-changed",
+    sourceClientId: currentOwnerClientId,
+    version: 11,
+    params: {
+      conversationId: threadId,
+      change: { type: "snapshot", conversationState: { requests: [], turns: [] } },
+    },
+  });
+  normalizations[0].resolve(normalizations[0].params);
+  await assert.rejects(transferStart, /ownership changed before the Voice request started/i);
+  assert.equal(ipc.state.frames.some((frame) => frame.method === "thread-follower-start-turn"), false);
+
+  assert.equal(await follower.resolveThreadOwner(threadId), "desktop");
+  const localClaimStart = startVoiceTurn("voice-local-claim-start");
+  await waitFor(() => normalizations.length === 2);
+  localOwnership = true;
+  normalizations[1].resolve(normalizations[1].params);
+  await assert.rejects(localClaimStart, /ownership changed before the Voice request started/i);
+  assert.equal(ipc.state.frames.some((frame) => frame.method === "thread-follower-start-turn"), false);
+
+  localOwnership = false;
+  const disconnectStart = startVoiceTurn("voice-disconnect-start");
+  await waitFor(() => normalizations.length === 3);
+  ipc.state.socket.destroy();
+  normalizations[2].resolve(normalizations[2].params);
+  await assert.rejects(disconnectStart, /ownership changed before the Voice request started/i);
+  assert.equal(ipc.state.frames.some((frame) => frame.method === "thread-follower-start-turn"), false);
+});
+
+test("Desktop canonical completion gives Voice only the final answer", async (t) => {
+  const threadId = "voice-canonical-desktop-thread";
+  const ownerClientId = "desktop-owner";
+  const ipc = createFakeIpcTransport({
+    onRequest(frame, socket) {
+      if (frame.method === "thread-follower-load-complete-history") {
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: ownerClientId,
+          result: { revision: 1 },
+        });
+      } else if (frame.method === "thread-follower-start-turn") {
+        emitFrame(socket, {
+          type: "response",
+          requestId: frame.requestId,
+          resultType: "success",
+          method: frame.method,
+          handledByClientId: ownerClientId,
+          result: { result: { turn: { id: "voice-canonical-turn" } } },
+        });
+      }
+    },
+  });
+  const phoneMessages = [];
+  const providerMessages = [];
+  const voiceObservations = [];
+  let voiceHandler = null;
+  let connected = false;
+  const follower = createDesktopIpcActionFollower({
+    socketPath: "/tmp/fake-remodex-voice-canonical.sock",
+    netModule: ipc.netModule,
+    sendApplicationResponse(rawMessage) {
+      const message = JSON.parse(rawMessage);
+      phoneMessages.push(message);
+      const isCompactDesktopCompletion = message.method === "turn/completed"
+        && message.params?.remodexDesktopIpcMirror === true
+        && !Array.isArray(message.params?.turn?.items);
+      if (message.id == null && !isCompactDesktopCompletion) {
+        voiceHandler?.handleCodexMessage(message);
+      }
+    },
+    onActivityObservation(observation) {
+      if (observation.type === "connected") connected = true;
+    },
+    onVoiceCodexMessage(message) {
+      voiceObservations.push(message);
+      voiceHandler?.handleCodexMessage(message);
+    },
+    requestTimeoutMs: 500,
+  });
+  t.after(() => follower.stopAll());
+  follower.observeInbound(JSON.stringify({
+    id: "voice-canonical-thread-read",
+    method: "thread/read",
+    params: { threadId },
+  }));
+  await waitFor(() => connected);
+
+  const historicalTurn = { id: "older-canonical-turn", status: "completed", items: [] };
+  const emitCanonicalSnapshot = (status, turns) => emitFrame(ipc.state.socket, {
+    type: "broadcast",
+    method: "thread-stream-state-changed",
+    sourceClientId: ownerClientId,
+    version: 11,
+    params: {
+      conversationId: threadId,
+      change: {
+        type: "snapshot",
+        conversationState: {
+          threadRuntimeStatus: { type: status === "inProgress" ? "active" : "idle" },
+          requests: [],
+          turns,
+          turnHistory: { history: {
+            entitiesByKey: { "turn:older-canonical-turn": historicalTurn },
+            islands: [{ entries: [{ value: "turn:older-canonical-turn" }] }],
+          } },
+        },
+      },
+    },
+  });
+  emitCanonicalSnapshot("idle", []);
+  await waitFor(() => phoneMessages.some((message) => message.method === "thread/replaced"));
+  assert.equal(await follower.resolveThreadOwner(threadId), "desktop");
+
+  const fakeSocket = makeFollowerVoiceLiveSocket(providerMessages);
+  voiceHandler = createRealtimeSessionHandler({
+    apiKey: "test-only-key",
+    delegationCompletionTimeoutMs: 800,
+    sendCodexRequest: async (method, params) => {
+      assert.equal(method, "thread/read");
+      return { thread: { id: params.threadId } };
+    },
+    resolveThreadOwner: (requestedThreadId) => follower.resolveThreadOwner(requestedThreadId),
+    startCodexTurn: (params) => follower.startTurnIfDesktopOwned({
+      id: "voice-canonical-start",
+      method: "turn/start",
+      params,
+    }, { ownerVerified: true }),
+    WebSocketImpl: class {
+      constructor() { return fakeSocket; }
+    },
+  });
+
+  const sessionResponses = [];
+  voiceHandler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "voice-canonical-session",
+    method: "voice/realtime/session",
+    params: { threadId },
+  }), (rawMessage) => sessionResponses.push(JSON.parse(rawMessage)));
+  await waitFor(() => sessionResponses.length === 1);
+  assert.equal(sessionResponses[0].error, undefined);
+  assert.ok(sessionResponses[0].result?.sessionId);
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "voice-canonical-transcript",
+    start_ms: 0,
+    end_ms: 400,
+    delta: "Read the current Desktop result.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 400,
+    delegation: { id: "voice-canonical-delegation", type: "delegation", target: "client" },
+  });
+  await waitFor(() => ipc.state.frames.some((frame) => frame.method === "thread-follower-start-turn"));
+
+  const privateReasoning = "VOICE_PRIVATE_REASONING";
+  const privateToolOutput = "VOICE_PRIVATE_TOOL_OUTPUT";
+  const privateProgress = "VOICE_PRIVATE_COMMENTARY";
+  emitCanonicalSnapshot("inProgress", [{
+    id: "voice-canonical-turn",
+    status: "inProgress",
+    items: [
+      { id: "reasoning", type: "reasoning", text: privateReasoning },
+      { id: "tool", type: "commandExecution", command: "private command", aggregatedOutput: privateToolOutput },
+      { id: "progress", type: "agentMessage", phase: "commentary", text: privateProgress },
+    ],
+  }]);
+  await wait(15);
+  emitCanonicalSnapshot("completed", [{
+    id: "voice-canonical-turn",
+    status: "completed",
+    items: [
+      { id: "reasoning", type: "reasoning", text: privateReasoning },
+      { id: "tool", type: "commandExecution", command: "private command", aggregatedOutput: privateToolOutput },
+      { id: "progress", type: "agentMessage", phase: "commentary", text: privateProgress },
+      {
+        id: "voice-canonical-answer",
+        type: "agentMessage",
+        phase: "final_answer",
+        text: "The verified Desktop result is complete.",
+        privateMetadata: "must not cross to Voice",
+      },
+    ],
+  }]);
+  await waitFor(() => providerMessages.some((message) => message.type === "session.commentary.append"));
+
+  const commentary = providerMessages
+    .filter((message) => message.type === "session.commentary.append")
+    .map((message) => message.content);
+  assert.deepEqual(commentary, ["The verified Desktop result is complete."]);
+  assert.equal(voiceObservations.length, 1);
+  assert.deepEqual(voiceObservations[0].params.turn.items, [{
+    id: "voice-canonical-answer",
+    type: "agentMessage",
+    phase: "final_answer",
+    text: "The verified Desktop result is complete.",
+  }]);
+  const serializedVoiceData = JSON.stringify({ observations: voiceObservations, providerMessages });
+  assert.equal(serializedVoiceData.includes(privateReasoning), false);
+  assert.equal(serializedVoiceData.includes(privateToolOutput), false);
+  assert.equal(serializedVoiceData.includes(privateProgress), false);
+  assert.equal(serializedVoiceData.includes("privateMetadata"), false);
+
+  const phoneCompletion = phoneMessages.find((message) => (
+    message.method === "turn/completed"
+      && message.params?.threadId === threadId
+      && message.params?.turnId === "voice-canonical-turn"
+  ));
+  assert.deepEqual(phoneCompletion?.params.turn, {
+    id: "voice-canonical-turn",
+    status: "completed",
+  });
+
+  voiceHandler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "voice-canonical-close",
+    method: "voice/realtime/close",
+    params: { sessionId: sessionResponses[0].result.sessionId },
+  }), () => {});
+  await wait(0);
+  fakeSocket.emitMessage({ type: "session.closed" });
 });
 
 test("desktop IPC follower keeps Desktop ownership after unproven no-handler text", async (t) => {

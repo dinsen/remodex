@@ -14,6 +14,25 @@ const {
   resolveVoiceAuth,
 } = require("../src/voice-handler");
 
+const FULL_ACCESS_TURN_START_ACCESS = {
+  approvalPolicyCandidates: ["never"],
+  approvalsReviewerCandidates: ["user", null],
+  legacySandbox: "danger-full-access",
+  sandboxPolicy: { type: "dangerFullAccess" },
+};
+const ASK_TURN_START_ACCESS = {
+  approvalPolicyCandidates: ["on-request", "onRequest"],
+  approvalsReviewerCandidates: ["user", null],
+  legacySandbox: "workspace-write",
+  sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+};
+const AUTO_REVIEW_TURN_START_ACCESS = {
+  approvalPolicyCandidates: ["on-request", "onRequest"],
+  approvalsReviewerCandidates: ["auto_review", "guardian_subagent"],
+  legacySandbox: "workspace-write",
+  sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+};
+
 test("resolveOpenAIAPIKey prefers the Mac Keychain and never includes the key in its metadata", () => {
   const commandCalls = [];
   const result = resolveOpenAIAPIKey({
@@ -188,6 +207,614 @@ test("GPT-Live client delegation invokes the scoped Codex adapter and appends a 
     content: "Codex verified the requested result.",
   });
   assert.equal(typeof upstreamMessages.at(-1).event_id, "string");
+});
+
+test("GPT-Live waits for the matching Codex turn and sends only its final answer", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const turnStarts = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    delegationCompletionTimeoutMs: 500,
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") {
+        return { thread: { id: "thread-123" } };
+      }
+      assert.equal(method, "turn/start");
+      turnStarts.push(params);
+      return { turn: { id: `turn-live-${turnStarts.length}` } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-final-answer",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_final_1",
+    start_ms: 0,
+    end_ms: 500,
+    delta: "Summarize the latest changes.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "delegate_final_1", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  assert.deepEqual(turnStarts, [{
+    threadId: "thread-123",
+    input: [{ type: "text", text: "Summarize the latest changes." }],
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+  }]);
+  const commentary = () => upstreamMessages.filter((event) => event.type === "session.commentary.append");
+  assert.equal(commentary().length, 0, "the start acknowledgement is not a spoken answer");
+
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "another-thread",
+      turn: { id: "turn-live-1", status: "completed", items: [
+        { id: "wrong-thread-answer", type: "agentMessage", text: "Do not speak this." },
+      ] },
+    },
+  });
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-123",
+      turn: { id: "different-turn", status: "completed", items: [
+        { id: "wrong-turn-answer", type: "agentMessage", text: "Do not speak this either." },
+      ] },
+    },
+  });
+  assert.equal(commentary().length, 0, "other threads and turns cannot complete this delegation");
+
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-123",
+      turn: {
+        id: "turn-live-1",
+        status: "completed",
+        items: [
+          { id: "user-input", type: "userMessage", text: "Summarize the latest changes." },
+          { id: "analysis", type: "reasoning", text: "Private reasoning." },
+          { id: "tool-output", type: "commandExecution", command: "cat secrets" },
+          { id: "progress", type: "agentMessage", phase: "commentary", text: "I am checking the diff." },
+          { id: "unknown-phase", type: "agentMessage", text: "Do not speak an unclassified message." },
+          { id: "answer-first", type: "agentMessage", phase: "final_answer", text: "An earlier answer." },
+          { id: "answer-final", type: "agentMessage", phase: "final_answer", text: "The change is complete." },
+        ],
+      },
+    },
+  });
+  await tick();
+
+  assert.deepEqual(commentary().map((event) => event.content), ["The change is complete."]);
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input_final_2",
+    start_ms: 600,
+    end_ms: 900,
+    delta: "What changed?",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 900,
+    delegation: { id: "delegate_final_2", type: "delegation", target: "client" },
+  });
+  await delay(150);
+  assert.equal(turnStarts.length, 2, "a later request starts a fresh Codex turn");
+
+  handler.handleCodexMessage({
+    method: "item/completed",
+    params: {
+      threadId: "thread-123",
+      turnId: "turn-live-2",
+      item: { id: "answer-other-thread", type: "agentMessage", text: "Wrong thread." },
+    },
+  });
+  handler.handleCodexMessage({
+    method: "item/completed",
+    params: {
+      threadId: "thread-123",
+      turnId: "turn-live-1",
+      item: { id: "answer-other-turn", type: "agentMessage", text: "Wrong turn." },
+    },
+  });
+  handler.handleCodexMessage({
+    method: "item/completed",
+    params: {
+      threadId: "thread-123",
+      turnId: "turn-live-2",
+      item: { id: "progress-final-2", type: "agentMessage", phase: "commentary", text: "Still working." },
+    },
+  });
+  handler.handleCodexMessage({
+    method: "item/completed",
+    params: {
+      threadId: "thread-123",
+      turnId: "turn-live-2",
+      item: { id: "answer-final-2", type: "agentMessage", phase: "final_answer", text: "Only this answer is spoken." },
+    },
+  });
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-123",
+      turn: { id: "turn-live-2", status: "completed" },
+    },
+  });
+  await tick();
+  assert.deepEqual(commentary().map((event) => event.content), [
+    "The change is complete.",
+    "Only this answer is spoken.",
+  ]);
+  assert.equal(sessionId, responses[0].result.sessionId);
+});
+
+test("GPT-Live applies the access configuration captured for each Voice session", async () => {
+  const upstreamMessages = [];
+  const sockets = [];
+  const turnStarts = [];
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") return { thread: { id: params.threadId } };
+      assert.equal(method, "turn/start");
+      turnStarts.push(params);
+      return { turn: { id: `turn-access-${turnStarts.length}` } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        const socket = makeLiveSocket({ upstreamMessages });
+        sockets.push(socket);
+        return socket;
+      }
+    },
+  });
+
+  async function runRequest(sessionIndex, accessConfiguration, text) {
+    const responses = [];
+    handler.handleRealtimeSessionRequest(JSON.stringify({
+      id: `access-session-${sessionIndex}`,
+      method: "voice/realtime/session",
+      params: {
+        threadId: "thread-access",
+        turnStartAccessConfiguration: accessConfiguration,
+      },
+    }), (response) => responses.push(JSON.parse(response)));
+    await tick();
+    assert.equal(responses[0].error, undefined);
+
+    const socket = sockets[sessionIndex - 1];
+    const startMs = sessionIndex * 1_000;
+    const endMs = startMs + 300;
+    socket.emitMessage({
+      type: "session.input_transcript.delta",
+      event_id: `access-transcript-${sessionIndex}`,
+      start_ms: startMs,
+      end_ms: endMs,
+      delta: text,
+    });
+    socket.emitMessage({
+      type: "session.delegation.created",
+      offset_ms: endMs,
+      delegation: { id: `access-delegation-${sessionIndex}`, type: "delegation", target: "client" },
+    });
+    await delay(150);
+
+    const turnId = `turn-access-${sessionIndex}`;
+    handler.handleCodexMessage({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-access",
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [{
+            id: `answer-access-${sessionIndex}`,
+            type: "agentMessage",
+            phase: "final_answer",
+            text: "Done.",
+          }],
+        },
+      },
+    });
+    await tick();
+  }
+
+  await runRequest(1, FULL_ACCESS_TURN_START_ACCESS, "Use full access.");
+  await runRequest(2, ASK_TURN_START_ACCESS, "Switch to Ask.");
+  await runRequest(3, AUTO_REVIEW_TURN_START_ACCESS, "Switch to Auto Review.");
+
+  assert.deepEqual(turnStarts.map(({ approvalPolicy, approvalsReviewer, sandboxPolicy, sandbox }) => ({
+    approvalPolicy,
+    approvalsReviewer,
+    sandboxPolicy,
+    sandbox,
+  })), [
+    {
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandboxPolicy: { type: "dangerFullAccess" },
+      sandbox: undefined,
+    },
+    {
+      approvalPolicy: "on-request",
+      approvalsReviewer: "user",
+      sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+      sandbox: undefined,
+    },
+    {
+      approvalPolicy: "on-request",
+      approvalsReviewer: "auto_review",
+      sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+      sandbox: undefined,
+    },
+  ]);
+});
+
+test("GPT-Live retries only explicit Codex access-parameter compatibility rejections", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const turnStarts = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") return { thread: { id: params.threadId } };
+      turnStarts.push(params);
+      if (turnStarts.length === 1) {
+        const error = new Error("Invalid params: unknown field sandboxPolicy");
+        error.code = -32602;
+        throw error;
+      }
+      return { turnId: "turn-legacy-sandbox" };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "legacy-sandbox-session",
+    method: "voice/realtime/session",
+    params: {
+      threadId: "thread-legacy-sandbox",
+      turnStartAccessConfiguration: ASK_TURN_START_ACCESS,
+    },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "legacy-sandbox-transcript",
+    start_ms: 0,
+    end_ms: 300,
+    delta: "Use the compatible sandbox field.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 300,
+    delegation: { id: "legacy-sandbox-delegation", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  assert.equal(responses[0].error, undefined);
+  assert.equal(turnStarts.length, 2);
+  assert.equal(turnStarts[0].sandboxPolicy.type, "workspaceWrite");
+  assert.equal(turnStarts[0].sandbox, undefined);
+  assert.equal(turnStarts[1].sandboxPolicy, undefined);
+  assert.equal(turnStarts[1].sandbox, "workspace-write");
+  assert.equal(turnStarts[1].approvalPolicy, "on-request");
+  assert.equal(turnStarts[1].approvalsReviewer, "user");
+});
+
+test("GPT-Live buffers a matching completion that arrives before the turn/start response", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  let handler;
+  handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") return { thread: { id: params.threadId } };
+      assert.equal(method, "turn/start");
+      handler.handleCodexMessage({
+        method: "turn/completed",
+        params: {
+          threadId: params.threadId,
+          turn: {
+            id: "turn-before-start-response",
+            status: "completed",
+            items: [{
+              id: "answer-before-start-response",
+              type: "agentMessage",
+              phase: "final_answer",
+              text: "The matching final answer.",
+            }],
+          },
+        },
+      });
+      return { turn: { id: "turn-before-start-response" } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "pre-start-completion-session",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-pre-start-completion" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "pre-start-transcript",
+    start_ms: 0,
+    end_ms: 300,
+    delta: "Check completion ordering.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 300,
+    delegation: { id: "pre-start-delegation", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  assert.deepEqual(upstreamMessages
+    .filter((event) => event.type === "session.commentary.append")
+    .map((event) => event.content), ["The matching final answer."]);
+});
+
+test("GPT-Live close during turn-start wait suppresses a late answer", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  let completeStart;
+  let startCalls = 0;
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    sendCodexRequest: (method, params) => {
+      if (method === "thread/read") return Promise.resolve({ thread: { id: params.threadId } });
+      startCalls += 1;
+      return new Promise((resolve) => { completeStart = resolve; });
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "close-during-start-session",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-close-during-start" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "close-during-start-transcript",
+    start_ms: 0,
+    end_ms: 300,
+    delta: "Close while starting.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 300,
+    delegation: { id: "close-during-start-delegation", type: "delegation", target: "client" },
+  });
+  await delay(150);
+  assert.equal(startCalls, 1);
+
+  fakeSocket.emitMessage({ type: "session.closed" });
+  completeStart({ turn: { id: "late-turn-after-close" } });
+  await tick();
+
+  assert.equal(upstreamMessages.some((event) => event.type === "session.commentary.append"), false);
+});
+
+test("GPT-Live rejects overlapping Codex delegation and clears the lock after completion", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const turnStarts = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    delegationCompletionTimeoutMs: 500,
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") return { thread: { id: "thread-123" } };
+      turnStarts.push(params);
+      return { turn: { id: `busy-turn-${turnStarts.length}` } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-busy",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  const emitRequest = (text, startMs, endMs, delegationId) => {
+    fakeSocket.emitMessage({
+      type: "session.input_transcript.delta",
+      event_id: `input-${delegationId}`,
+      start_ms: startMs,
+      end_ms: endMs,
+      delta: text,
+    });
+    fakeSocket.emitMessage({
+      type: "session.delegation.created",
+      offset_ms: endMs,
+      delegation: { id: delegationId, type: "delegation", target: "client" },
+    });
+  };
+  emitRequest("First request", 0, 500, "delegate-busy-1");
+  await delay(150);
+  emitRequest("Overlapping request", 600, 900, "delegate-busy-2");
+  await delay(150);
+
+  assert.equal(turnStarts.length, 1, "a second voice request does not start a concurrent turn");
+  assert.match(
+    upstreamMessages.find((event) => event.delegation_id === "delegate-busy-2")?.content || "",
+    /already working/
+  );
+
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-123",
+      turn: { id: "busy-turn-1", status: "completed", items: [
+        { id: "answer-busy-1", type: "agentMessage", phase: "final_answer", text: "First request completed." },
+      ] },
+    },
+  });
+  await tick();
+  emitRequest("Later request", 1_000, 1_300, "delegate-busy-3");
+  await delay(150);
+  assert.equal(turnStarts.length, 2, "the thread lock is released after the matching turn completes");
+  handler.handleCodexMessage({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-123",
+      turn: { id: "busy-turn-2", status: "completed", items: [
+        { id: "answer-busy-2", type: "agentMessage", phase: "final_answer", text: "Later request completed." },
+      ] },
+    },
+  });
+  await tick();
+  assert.ok(upstreamMessages.some((event) => event.content === "Later request completed."));
+});
+
+test("GPT-Live does not retry an uncertain Codex start and times out completion waiters", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const turnStarts = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    delegationCompletionTimeoutMs: 10,
+    sendCodexRequest: async (method, params) => {
+      if (method === "thread/read") return { thread: { id: "thread-123" } };
+      turnStarts.push(params);
+      if (turnStarts.length === 1) {
+        throw new Error("timed out after the request may have reached Codex");
+      }
+      return { turn: { id: "timeout-turn-2" } };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-uncertain",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  const emitRequest = (text, startMs, endMs, delegationId) => {
+    fakeSocket.emitMessage({
+      type: "session.input_transcript.delta",
+      event_id: `input-${delegationId}`,
+      start_ms: startMs,
+      end_ms: endMs,
+      delta: text,
+    });
+    fakeSocket.emitMessage({
+      type: "session.delegation.created",
+      offset_ms: endMs,
+      delegation: { id: delegationId, type: "delegation", target: "client" },
+    });
+  };
+  emitRequest("Possibly started", 0, 500, "delegate-uncertain");
+  await delay(150);
+  assert.equal(turnStarts.length, 1, "an uncertain start is never retried automatically");
+  assert.match(
+    upstreamMessages.find((event) => event.delegation_id === "delegate-uncertain")?.content || "",
+    /didn't retry it/
+  );
+
+  emitRequest("Wait for completion", 600, 900, "delegate-timeout");
+  await delay(170);
+  assert.equal(turnStarts.length, 2);
+  assert.match(
+    upstreamMessages.find((event) => event.delegation_id === "delegate-timeout")?.content || "",
+    /haven't received its final answer/
+  );
+
+  emitRequest("Try after timeout", 1_000, 1_300, "delegate-after-timeout");
+  await delay(150);
+  assert.equal(turnStarts.length, 3, "timeout cleanup releases the waiter for a later request");
+});
+
+test("GPT-Live commentary stays under its byte limit without splitting Unicode characters", async () => {
+  const responses = [];
+  const upstreamMessages = [];
+  const fakeSocket = makeLiveSocket({ upstreamMessages });
+  const handler = createRealtimeSessionHandler({
+    apiKey: "local-only-api-key",
+    sendCodexRequest: activeThreadRequest(),
+    runDelegatedTask: async () => "🎙️".repeat(300),
+    WebSocketImpl: class {
+      constructor() {
+        return fakeSocket;
+      }
+    },
+  });
+  handler.handleRealtimeSessionRequest(JSON.stringify({
+    id: "live-unicode-cap",
+    method: "voice/realtime/session",
+    params: { threadId: "thread-123" },
+  }), (response) => responses.push(JSON.parse(response)));
+  await tick();
+
+  fakeSocket.emitMessage({
+    type: "session.input_transcript.delta",
+    event_id: "input-unicode-cap",
+    start_ms: 0,
+    end_ms: 500,
+    delta: "Read the answer aloud.",
+  });
+  fakeSocket.emitMessage({
+    type: "session.delegation.created",
+    offset_ms: 500,
+    delegation: { id: "delegate-unicode-cap", type: "delegation", target: "client" },
+  });
+  await delay(150);
+
+  const content = upstreamMessages.find((event) => event.type === "session.commentary.append")?.content || "";
+  assert.ok(Buffer.byteLength(content, "utf8") <= 480);
+  assert.equal(Buffer.from(content, "utf8").toString("utf8"), content);
 });
 
 test("GPT-Live drops delayed delegation work after the session begins closing", async () => {

@@ -30,6 +30,16 @@ const LIVE_CLOSE_FINALIZATION_TIMEOUT_MS = 5_000;
 const LIVE_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
 const LIVE_DELEGATION_TRANSCRIPT_SETTLE_MS = 100;
 const LIVE_DELEGATION_TRANSCRIPT_TIMEOUT_MS = 3_000;
+const LIVE_DELEGATION_COMPLETION_TIMEOUT_MS = 120_000;
+const MAX_LIVE_COMMENTARY_BYTES = 480;
+const DEFAULT_VOICE_TURN_START_ACCESS_CONFIGURATION = Object.freeze({
+  approvalPolicyCandidates: Object.freeze(["on-request", "onRequest"]),
+  approvalsReviewerCandidates: Object.freeze(["user", null]),
+  legacySandbox: "workspace-write",
+  sandboxPolicy: Object.freeze({ type: "workspaceWrite", networkAccess: true }),
+});
+const MAX_BUFFERED_LIVE_CODEX_NOTIFICATIONS = 32;
+const MAX_BUFFERED_LIVE_CODEX_ITEMS = 32;
 const MAX_TIMER_DELAY_MS = 0x7fff_ffff;
 const MAX_LIVE_AUDIO_CHUNK_BYTES = 512 * 1024;
 const MAX_LIVE_EVENT_BYTES = 64 * 1024;
@@ -201,6 +211,8 @@ function createRealtimeSessionHandler({
   commandRunner,
   WebSocketImpl = DefaultWebSocket,
   sendCodexRequest = null,
+  startCodexTurn = null,
+  resolveThreadOwner = null,
   runDelegatedTask = null,
   sendApplicationResponse = null,
   logger = console,
@@ -209,10 +221,12 @@ function createRealtimeSessionHandler({
   sessionTimeoutMs = LIVE_START_TIMEOUT_MS,
   closeFinalizationTimeoutMs = LIVE_CLOSE_FINALIZATION_TIMEOUT_MS,
   idleTimeoutMs = LIVE_IDLE_TIMEOUT_MS,
+  delegationCompletionTimeoutMs = LIVE_DELEGATION_COMPLETION_TIMEOUT_MS,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
 } = {}) {
   const sessions = new Map();
+  const liveCodexDelegationsByThreadId = new Map();
   const resolveCredential = () => {
     // apiKey is an explicit dependency-injection hook for tests and local
     // embedding. Production bridge construction leaves it undefined so the
@@ -267,13 +281,57 @@ function createRealtimeSessionHandler({
     return false;
   }
 
+  function handleCodexMessage(message) {
+    if (!message || typeof message !== "object" || message.id != null) {
+      return false;
+    }
+    const method = readString(message.method);
+    if (method !== "item/completed" && method !== "turn/completed") {
+      return false;
+    }
+
+    const record = readLiveCodexCompletionRecord(method, message.params);
+    if (!record) {
+      return false;
+    }
+    const waiter = liveCodexDelegationsByThreadId.get(record.threadId);
+    if (!waiter || waiter.settled) {
+      return false;
+    }
+    if (waiter.turnId) {
+      return observeLiveCodexCompletion(waiter, record);
+    }
+
+    // App-server completion notifications can arrive before its turn/start
+    // response. Buffer only small, typed summaries until the response supplies
+    // the exact turn ID; unrelated notifications are discarded afterward.
+    if (waiter.startNotifications.length >= MAX_BUFFERED_LIVE_CODEX_NOTIFICATIONS) {
+      waiter.startNotifications.shift();
+    }
+    waiter.startNotifications.push(record);
+    return true;
+  }
+
   function handleSessionStart(parsed, sendResponse) {
     const threadId = readString(parsed.params?.threadId);
+    const accessConfigurationWasProvided = Object.prototype.hasOwnProperty.call(
+      parsed.params || {},
+      "turnStartAccessConfiguration"
+    );
+    const turnStartAccessConfiguration = normalizeVoiceTurnStartAccessConfiguration(
+      parsed.params?.turnStartAccessConfiguration
+    );
     const id = parsed.id;
     Promise.resolve()
       .then(async () => {
         if (!threadId) {
           throw voiceError("invalid_realtime_scope", "Voice needs an active conversation before it can start.");
+        }
+        if (accessConfigurationWasProvided && !turnStartAccessConfiguration) {
+          throw voiceError(
+            "invalid_realtime_access_configuration",
+            "Voice couldn't apply the selected Codex access mode. Update the app and try again."
+          );
         }
         const credential = resolveCredential();
         if (!credential?.apiKey) {
@@ -284,14 +342,25 @@ function createRealtimeSessionHandler({
         }
 
         await verifyRealtimeThread(sendCodexRequest, threadId);
+        if (typeof resolveThreadOwner === "function") {
+          const owner = await resolveThreadOwner(threadId);
+          if (owner !== "local" && owner !== "desktop" && owner !== "single-runtime") {
+            throw voiceError(
+              "realtime_thread_owner_unavailable",
+              "Voice couldn't confirm which Codex runtime owns this conversation. Reopen it and try again."
+            );
+          }
+        }
 
         return await openLiveSession({
           threadId,
+          turnStartAccessConfiguration,
           apiKey: credential.apiKey,
           now,
           sessionTimeoutMs,
           closeFinalizationTimeoutMs,
           idleTimeoutMs,
+          delegationCompletionTimeoutMs,
           setTimeoutImpl,
           clearTimeoutImpl,
         });
@@ -420,11 +489,13 @@ function createRealtimeSessionHandler({
 
   async function openLiveSession({
     threadId,
+    turnStartAccessConfiguration,
     apiKey: normalizedApiKey,
     now: clock,
     sessionTimeoutMs: timeoutMs,
     closeFinalizationTimeoutMs: finalizationTimeoutMs,
     idleTimeoutMs: idleTimeout,
+    delegationCompletionTimeoutMs,
     setTimeoutImpl: setTimer,
     clearTimeoutImpl: clearTimer,
   }) {
@@ -444,12 +515,14 @@ function createRealtimeSessionHandler({
     const state = {
       sessionId,
       threadId,
+      turnStartAccessConfiguration,
       socket,
       inputTranscriptSegments: [],
       inputTranscriptEventIds: new Set(),
       lastDelegationOffsetMs: 0,
       delegations: new Set(),
       pendingDelegations: new Map(),
+      activeCodexDelegation: null,
       started: false,
       startSent: false,
       closed: false,
@@ -710,7 +783,7 @@ function createRealtimeSessionHandler({
     try {
       result = typeof runDelegatedTask === "function"
         ? await runDelegatedTask(context)
-        : await runDefaultLiveDelegation(context);
+        : await runDefaultLiveDelegation({ ...context, liveSessionState: state });
     } catch {
       result = "I couldn't complete that Codex request on the Mac.";
     }
@@ -725,23 +798,169 @@ function createRealtimeSessionHandler({
     });
   }
 
-  async function runDefaultLiveDelegation({ threadId, transcript }) {
-    if (typeof sendCodexRequest !== "function") {
+  async function runDefaultLiveDelegation({ threadId, transcript, liveSessionState }) {
+    if (typeof startCodexTurn !== "function" && typeof sendCodexRequest !== "function") {
       return "Codex is unavailable on this Mac right now.";
     }
     const text = readString(transcript);
     if (!text) {
       return "I didn't catch a voice request to send to Codex.";
     }
+
+    const activeWaiter = liveCodexDelegationsByThreadId.get(threadId);
+    if (activeWaiter && !activeWaiter.settled) {
+      return "Codex is already working in this conversation. Try again when it finishes.";
+    }
+
+    const waiter = createLiveCodexDelegationWaiter({
+      threadId,
+      liveSessionState,
+      liveCodexDelegationsByThreadId,
+    });
     try {
-      await sendCodexRequest("turn/start", {
+      const baseParams = {
         threadId,
         input: [{ type: "text", text }],
-      });
-      return "Codex started the requested task on the Mac.";
-    } catch {
-      return "Codex could not start the requested task on the Mac.";
+      };
+      const response = await startVoiceTurnWithAccessFallback(
+        (params) => typeof startCodexTurn === "function"
+          ? startCodexTurn(params)
+          : sendCodexRequest("turn/start", params),
+        baseParams,
+        liveSessionState.turnStartAccessConfiguration
+      );
+      if (waiter.settled) {
+        return await waiter.promise;
+      }
+      const turnId = readString(response?.turn?.id)
+        || readString(response?.turnId)
+        || readString(response?.turn_id);
+      if (!turnId) {
+        settleLiveCodexDelegation(
+          waiter,
+          "I couldn't confirm whether Codex started, so I didn't retry it. Check the conversation before asking again."
+        );
+        return await waiter.promise;
+      }
+
+      waiter.turnId = turnId;
+      waiter.timeoutTimer = liveSessionState.setTimeoutImpl(() => {
+        settleLiveCodexDelegation(
+          waiter,
+          "Codex is still working, but I haven't received its final answer yet."
+        );
+      }, Math.max(0, Number(delegationCompletionTimeoutMs) || 0));
+      waiter.timeoutTimer?.unref?.();
+
+      for (const record of waiter.startNotifications.splice(0)) {
+        if (record.turnId === turnId) {
+          observeLiveCodexCompletion(waiter, record);
+        }
+        if (waiter.settled) {
+          break;
+        }
+      }
+      return await waiter.promise;
+    } catch (error) {
+      const result = isCodexBusyError(error)
+        ? "Codex is already working in this conversation. Try again when it finishes."
+        : "I couldn't confirm whether Codex started, so I didn't retry it. Check the conversation before asking again.";
+      settleLiveCodexDelegation(waiter, result);
+      return await waiter.promise;
     }
+  }
+
+  function createLiveCodexDelegationWaiter({ threadId, liveSessionState, liveCodexDelegationsByThreadId: waiters }) {
+    let resolvePromise;
+    const waiter = {
+      threadId,
+      turnId: null,
+      liveSessionState,
+      startNotifications: [],
+      completedItemsById: new Map(),
+      timeoutTimer: null,
+      settled: false,
+      result: null,
+      resolve: null,
+      promise: new Promise((resolve) => {
+        resolvePromise = resolve;
+      }),
+    };
+    waiter.resolve = resolvePromise;
+    waiters.set(threadId, waiter);
+    liveSessionState.activeCodexDelegation = waiter;
+    return waiter;
+  }
+
+  function observeLiveCodexCompletion(waiter, record) {
+    if (waiter.settled || record.threadId !== waiter.threadId || record.turnId !== waiter.turnId) {
+      return false;
+    }
+    if (record.method === "item/completed") {
+      const { item } = record;
+      if (item && !waiter.completedItemsById.has(item.id)
+        && waiter.completedItemsById.size >= MAX_BUFFERED_LIVE_CODEX_ITEMS) {
+        const oldestItemId = waiter.completedItemsById.keys().next().value;
+        waiter.completedItemsById.delete(oldestItemId);
+      }
+      if (item) {
+        waiter.completedItemsById.set(item.id, item);
+      }
+      return true;
+    }
+
+    if (record.method !== "turn/completed") {
+      return false;
+    }
+    if (record.status !== "completed") {
+      settleLiveCodexDelegation(waiter, "Codex couldn't complete that request.");
+      return true;
+    }
+
+    const answer = record.finalAnswer || Array.from(waiter.completedItemsById.values()).at(-1);
+    settleLiveCodexDelegation(
+      waiter,
+      answer?.text || "Codex finished, but I couldn't confirm a final answer."
+    );
+    return true;
+  }
+
+  function settleLiveCodexDelegation(waiter, result) {
+    if (!waiter || waiter.settled) {
+      return;
+    }
+    waiter.settled = true;
+    waiter.result = result;
+    if (waiter.timeoutTimer) {
+      waiter.liveSessionState.clearTimeoutImpl(waiter.timeoutTimer);
+      waiter.timeoutTimer = null;
+    }
+    if (liveCodexDelegationsByThreadId.get(waiter.threadId) === waiter) {
+      liveCodexDelegationsByThreadId.delete(waiter.threadId);
+    }
+    if (waiter.liveSessionState.activeCodexDelegation === waiter) {
+      waiter.liveSessionState.activeCodexDelegation = null;
+    }
+    waiter.startNotifications.length = 0;
+    waiter.completedItemsById.clear();
+    waiter.resolve(result);
+  }
+
+  function cancelLiveCodexDelegation(state) {
+    const waiter = state?.activeCodexDelegation;
+    if (waiter) {
+      settleLiveCodexDelegation(waiter, "The Live Voice session ended before Codex returned its answer.");
+    }
+  }
+
+  function isCodexBusyError(error) {
+    const details = [
+      error?.code,
+      error?.message,
+      error?.data?.code,
+      error?.data?.message,
+    ].filter((value) => value != null).join(" ").toLowerCase();
+    return /busy|in.?progress|active.?turn|already (?:running|active|working)/i.test(details);
   }
 
 function touchLiveSession(state) {
@@ -781,6 +1000,7 @@ function touchLiveSession(state) {
     // synchronous provider callback cannot race another close/audio operation
     // into the live socket. Idle/expiry cleanup uses this same graceful path.
     state.closeRequested = true;
+    cancelLiveCodexDelegation(state);
     try {
       sendLiveSocketEvent(state, { type: "session.close" });
     } catch (error) {
@@ -815,6 +1035,7 @@ function touchLiveSession(state) {
     }
     state.closed = true;
     sessions.delete(state.sessionId);
+    cancelLiveCodexDelegation(state);
     if (state.startTimer) {
       state.clearTimeoutImpl(state.startTimer);
       state.startTimer = null;
@@ -863,7 +1084,7 @@ function touchLiveSession(state) {
     state[timerKey]?.unref?.();
   }
 
-  return { handleRealtimeSessionRequest };
+  return { handleRealtimeSessionRequest, handleCodexMessage };
 }
 
 async function verifyRealtimeThread(sendCodexRequest, threadId) {
@@ -895,6 +1116,211 @@ function isInactiveRealtimeThread(thread) {
 
   const status = readString(thread?.status?.type || thread?.status);
   return ["archived", "inactive", "deleted"].includes(status?.toLowerCase());
+}
+
+function readLiveCodexCompletionRecord(method, params) {
+  const threadId = readString(params?.threadId);
+  if (!threadId) {
+    return null;
+  }
+  if (method === "item/completed") {
+    const turnId = readString(params?.turnId);
+    const item = readLiveCodexFinalMessage(params?.item);
+    if (!turnId || !item) {
+      return null;
+    }
+    return { method, threadId, turnId, item };
+  }
+  if (method !== "turn/completed") {
+    return null;
+  }
+
+  const turn = params?.turn;
+  const turnId = readString(turn?.id);
+  if (!turnId) {
+    return null;
+  }
+  let finalAnswer = null;
+  if (Array.isArray(turn.items)) {
+    for (const item of turn.items) {
+      finalAnswer = readLiveCodexFinalMessage(item) || finalAnswer;
+    }
+  }
+  return {
+    method,
+    threadId,
+    turnId,
+    status: readString(turn.status)?.toLowerCase() || "",
+    finalAnswer,
+  };
+}
+
+function normalizeVoiceTurnStartAccessConfiguration(value) {
+  if (value == null) {
+    return {
+      approvalPolicyCandidates: [...DEFAULT_VOICE_TURN_START_ACCESS_CONFIGURATION.approvalPolicyCandidates],
+      approvalsReviewerCandidates: [...DEFAULT_VOICE_TURN_START_ACCESS_CONFIGURATION.approvalsReviewerCandidates],
+      legacySandbox: DEFAULT_VOICE_TURN_START_ACCESS_CONFIGURATION.legacySandbox,
+      sandboxPolicy: { ...DEFAULT_VOICE_TURN_START_ACCESS_CONFIGURATION.sandboxPolicy },
+    };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const policies = value.approvalPolicyCandidates;
+  const reviewers = value.approvalsReviewerCandidates;
+  const sandboxPolicy = value.sandboxPolicy;
+  if (!Array.isArray(policies) || !Array.isArray(reviewers)
+    || !sandboxPolicy || typeof sandboxPolicy !== "object" || Array.isArray(sandboxPolicy)) {
+    return null;
+  }
+
+  const isFullAccess = sameStringArray(policies, ["never"])
+    && sameNullableStringArray(reviewers, ["user", null])
+    && value.legacySandbox === "danger-full-access"
+    && sandboxPolicy.type === "dangerFullAccess";
+  const isAsk = sameStringArray(policies, ["on-request", "onRequest"])
+    && sameNullableStringArray(reviewers, ["user", null]);
+  const isAutoReview = sameStringArray(policies, ["on-request", "onRequest"])
+    && sameNullableStringArray(reviewers, ["auto_review", "guardian_subagent"]);
+  const isWorkspaceSandbox = value.legacySandbox === "workspace-write"
+    && sandboxPolicy.type === "workspaceWrite"
+    && sandboxPolicy.networkAccess === true;
+  if (!isFullAccess && !(isWorkspaceSandbox && (isAsk || isAutoReview))) {
+    return null;
+  }
+
+  return {
+    approvalPolicyCandidates: [...policies],
+    approvalsReviewerCandidates: [...reviewers],
+    legacySandbox: value.legacySandbox,
+    sandboxPolicy: isFullAccess
+      ? { type: "dangerFullAccess" }
+      : { type: "workspaceWrite", networkAccess: true },
+  };
+}
+
+function sameStringArray(value, expected) {
+  return Array.isArray(value)
+    && value.length === expected.length
+    && value.every((entry, index) => entry === expected[index]);
+}
+
+function sameNullableStringArray(value, expected) {
+  return Array.isArray(value)
+    && value.length === expected.length
+    && value.every((entry, index) => entry === expected[index]);
+}
+
+async function startVoiceTurnWithAccessFallback(startTurn, baseParams, accessConfiguration) {
+  const access = accessConfiguration || normalizeVoiceTurnStartAccessConfiguration(null);
+  const sandboxParameters = [
+    { name: "sandboxPolicy", value: access.sandboxPolicy },
+    { name: "sandbox", value: access.legacySandbox },
+  ];
+  let lastError = null;
+
+  for (const [sandboxIndex, sandboxParameter] of sandboxParameters.entries()) {
+    const policies = access.approvalPolicyCandidates;
+    const reviewers = access.approvalsReviewerCandidates;
+    for (const [reviewerIndex, reviewer] of reviewers.entries()) {
+      let reviewerError = null;
+      for (const [policyIndex, policy] of policies.entries()) {
+        const params = {
+          ...baseParams,
+          [sandboxParameter.name]: sandboxParameter.value,
+          approvalPolicy: policy,
+        };
+        if (reviewer == null) {
+          delete params.approvalsReviewer;
+        } else {
+          params.approvalsReviewer = reviewer;
+        }
+
+        try {
+          return await startTurn(params);
+        } catch (error) {
+          lastError = error;
+          reviewerError = error;
+          const hasMorePolicies = policyIndex < policies.length - 1;
+          if (hasMorePolicies
+            && shouldRetryVoiceApprovalPolicyFallback(error)
+            && !shouldRetryVoiceApprovalsReviewerFallback(error)) {
+            continue;
+          }
+          break;
+        }
+      }
+
+      const hasMoreReviewers = reviewerIndex < reviewers.length - 1;
+      if (hasMoreReviewers && shouldRetryVoiceApprovalsReviewerFallback(reviewerError)) {
+        continue;
+      }
+      break;
+    }
+
+    const hasMoreSandboxParameters = sandboxIndex < sandboxParameters.length - 1;
+    if (hasMoreSandboxParameters && shouldRetryVoiceSandboxFallback(lastError)) {
+      continue;
+    }
+    if (lastError) {
+      throw lastError;
+    }
+  }
+
+  throw lastError || new Error("Codex could not start the Voice request.");
+}
+
+function shouldRetryVoiceApprovalPolicyFallback(error) {
+  if (!isVoiceCodexParameterCompatibilityError(error)) return false;
+  const message = readString(error?.message)?.toLowerCase() || "";
+  return message.includes("approvalpolicy")
+    || message.includes("approval_policy")
+    || message.includes("onrequest")
+    || message.includes("on-request");
+}
+
+function shouldRetryVoiceApprovalsReviewerFallback(error) {
+  if (!isVoiceCodexParameterCompatibilityError(error)) return false;
+  const message = readString(error?.message)?.toLowerCase() || "";
+  return message.includes("approvalsreviewer")
+    || message.includes("approvals_reviewer")
+    || message.includes("auto_review")
+    || message.includes("guardian_subagent");
+}
+
+function shouldRetryVoiceSandboxFallback(error) {
+  if (!isVoiceCodexParameterCompatibilityError(error)) return false;
+  const message = readString(error?.message)?.toLowerCase() || "";
+  const identifiesSandbox = message.includes("sandboxpolicy")
+    || message.includes("sandbox_policy")
+    || message.includes("sandbox");
+  const identifiesCompatibilityFailure = message.includes("invalid")
+    || message.includes("unknown field")
+    || message.includes("unexpected field")
+    || message.includes("unrecognized field")
+    || message.includes("failed to parse")
+    || message.includes("unsupported");
+  return identifiesSandbox && identifiesCompatibilityFailure;
+}
+
+function isVoiceCodexParameterCompatibilityError(error) {
+  const code = Number(error?.code);
+  return code === -32600 || code === -32602;
+}
+
+function readLiveCodexFinalMessage(item) {
+  if (readString(item?.type) !== "agentMessage") {
+    return null;
+  }
+  const phase = readString(item?.phase)?.toLowerCase();
+  if (phase !== "final_answer") {
+    return null;
+  }
+  const id = readString(item?.id);
+  const text = readString(item?.text);
+  return id && text ? { id, text: truncateLiveCommentary(text) } : null;
 }
 
 function isPlausibleFutureRealtimeExpiry(expiresAt, now) {
@@ -1066,10 +1492,25 @@ function truncateLiveCommentary(value) {
     ? value
     : readString(value?.content || value?.summary || value?.text);
   const normalized = text || "Codex handled the delegated request on the Mac.";
-  // GPT-Live limits commentary content to 500 tokens. Four characters per
-  // token is conservative for ordinary English and keeps the wire payload
-  // comfortably below that limit.
-  return normalized.length <= 2_000 ? normalized : `${normalized.slice(0, 1_997)}...`;
+  if (Buffer.byteLength(normalized, "utf8") <= MAX_LIVE_COMMENTARY_BYTES) {
+    return normalized;
+  }
+
+  // Stay below GPT-Live's 500-token commentary limit even when tokenization is
+  // dense, and truncate only at Unicode code-point boundaries.
+  const suffix = "...";
+  const contentByteLimit = MAX_LIVE_COMMENTARY_BYTES - Buffer.byteLength(suffix, "utf8");
+  let truncated = "";
+  let truncatedBytes = 0;
+  for (const character of normalized) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (truncatedBytes + characterBytes > contentByteLimit) {
+      break;
+    }
+    truncated += character;
+    truncatedBytes += characterBytes;
+  }
+  return `${truncated}${suffix}`;
 }
 
 function sendRealtimeErrorResponse(id, sendResponse, error, logger, logPrefix) {

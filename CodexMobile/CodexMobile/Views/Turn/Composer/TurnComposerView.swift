@@ -61,6 +61,7 @@ struct TurnComposerView: View, Equatable {
     let runtimeState: TurnComposerRuntimeState
     let runtimeActions: TurnComposerRuntimeActions
     let voiceButtonPresentation: TurnComposerVoiceButtonPresentation
+    var allowsLiveVoice: Bool = true
 
     let selectedAccessMode: CodexAccessMode
     let contextWindowUsage: ContextWindowUsage?
@@ -155,7 +156,7 @@ struct TurnComposerView: View, Equatable {
 
     private var voicePhaseOneControl: VoiceComposerPhaseOne.TrailingControl {
         VoiceComposerPhaseOne.trailingControl(
-            isVoiceEnabled: isVoiceEnabled,
+            isVoiceEnabled: isVoiceEnabled && allowsLiveVoice,
             hasSendableContent: accessoryState.hasSendableContent(input: input),
             isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive
         )
@@ -452,6 +453,11 @@ struct TurnComposerView: View, Equatable {
                 voicePhaseTwoController.disableVoice()
             }
         }
+        .onChange(of: allowsLiveVoice) { _, isAllowed in
+            if !isAllowed {
+                voicePhaseTwoController.disableVoice()
+            }
+        }
         .onDisappear {
             voicePhaseTwoController.endVoiceSession()
         }
@@ -531,9 +537,10 @@ struct TurnComposerView: View, Equatable {
     }
 
     private func handleVoiceWaveTap() {
+        guard allowsLiveVoice else { return }
         Task { @MainActor in
             await voicePhaseTwoController.handleWaveTap(
-                isVoiceEnabled: isVoiceEnabled,
+                isVoiceEnabled: isVoiceEnabled && allowsLiveVoice,
                 startSession: onStartVoiceSession
             )
         }
@@ -623,6 +630,7 @@ struct TurnComposerView: View, Equatable {
             && lhs.isRuntimeSelectionLoading == rhs.isRuntimeSelectionLoading
             && lhs.runtimeState == rhs.runtimeState
             && lhs.voiceButtonPresentation == rhs.voiceButtonPresentation
+            && lhs.allowsLiveVoice == rhs.allowsLiveVoice
             && lhs.selectedAccessMode == rhs.selectedAccessMode
             && lhs.contextWindowUsage == rhs.contextWindowUsage
             && lhs.rateLimitBuckets == rhs.rateLimitBuckets

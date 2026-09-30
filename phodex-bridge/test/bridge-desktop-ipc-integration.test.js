@@ -124,6 +124,198 @@ test("bridge resumes an old Desktop task from read-only metadata before any IPC 
   assert.equal(fakeCodex.sent.some((message) => message.method === "thread/settings/update"), false);
 });
 
+test("bridge observes Codex turn notifications for GPT-Live and still forwards them", async (t) => {
+  const relayServer = new WebSocket.Server({ port: 0 });
+  const relayMessages = [];
+  const voiceCodexMessages = [];
+  let relaySocket = null;
+  let bridge = null;
+  let fakeCodex = null;
+  await new Promise((resolve) => relayServer.once("listening", resolve));
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (data) => {
+      const parsed = safeParseJSON(data.toString("utf8"));
+      if (parsed) relayMessages.push(parsed);
+    });
+  });
+  const { startBridge } = loadBridgeWithTestDoubles({
+    createCodexTransportImpl: () => {
+      fakeCodex = createFakeCodexTransport();
+      return fakeCodex;
+    },
+    voiceHandlerModule: {
+      createVoiceHandler: () => ({ handleVoiceRequest: () => false }),
+      createRealtimeSessionHandler: () => ({
+        handleRealtimeSessionRequest: () => false,
+        handleCodexMessage(message) {
+          voiceCodexMessages.push(message);
+        },
+      }),
+    },
+  });
+  t.after(() => {
+    bridge?.stop();
+    relaySocket?.close();
+    relayServer.close();
+  });
+
+  bridge = startBridge({
+    printPairingQr: false,
+    config: {
+      relayUrl: `ws://127.0.0.1:${relayServer.address().port}`,
+      pushServiceUrl: "",
+      refreshEnabled: false,
+      keepMacAwakeEnabled: false,
+      codexEndpoint: "fake://codex",
+      refreshCommand: "",
+      codexBundleId: "",
+      codexAppPath: "",
+      desktopIpcLiveSyncEnabled: false,
+    },
+  });
+  await waitFor(() => relaySocket && relaySocket.readyState === WebSocket.OPEN);
+
+  const notification = {
+    method: "turn/completed",
+    params: {
+      threadId: "voice-thread",
+      turn: { id: "voice-turn", status: "completed", items: [] },
+    },
+  };
+  fakeCodex.emitMessage(notification);
+  await waitFor(() => voiceCodexMessages.length === 1);
+  await waitFor(() => relayMessages.some((message) => message.method === "turn/completed"));
+
+  assert.deepEqual(voiceCodexMessages, [notification]);
+  assert.equal(relayMessages.some((message) => message.method === "turn/completed"), true);
+});
+
+test("bridge routes GPT-Live starts to Desktop and observes Desktop completion notifications", async (t) => {
+  const relayServer = new WebSocket.Server({ port: 0 });
+  const relayMessages = [];
+  const voiceCodexMessages = [];
+  const followerStarts = [];
+  let followerSendApplicationResponse = null;
+  let voiceDependencies = null;
+  let relaySocket = null;
+  let bridge = null;
+  let fakeCodex = null;
+  await new Promise((resolve) => relayServer.once("listening", resolve));
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (data) => {
+      const parsed = safeParseJSON(data.toString("utf8"));
+      if (parsed) relayMessages.push(parsed);
+    });
+  });
+  const { startBridge } = loadBridgeWithTestDoubles({
+    createCodexTransportImpl: () => {
+      fakeCodex = createFakeCodexTransport();
+      return fakeCodex;
+    },
+    desktopIpcActionFollowerModule: {
+      isDeliveryFailureError: () => false,
+      seedConversationStateFromThreadRead: () => null,
+      createDesktopIpcActionFollower(options) {
+        followerSendApplicationResponse = options.sendApplicationResponse;
+        return {
+          observeInbound: () => false,
+          observeThreadListResponse() {},
+          observeThreadMetadata() {},
+          hasFreshLiveThreadState: () => false,
+          hasLiveThreadState: () => false,
+          isLocallyAcquiredThread: () => false,
+          resolveThreadOwner: async (threadId) => threadId === "desktop-voice-thread" ? "desktop" : "unknown",
+          startTurnIfDesktopOwned: async (request) => {
+            followerStarts.push(request);
+            return { turnId: "desktop-voice-turn" };
+          },
+          stopAll() {},
+        };
+      },
+    },
+    desktopIpcLiveOwnerModule: {
+      createDesktopIpcLiveOwner() {
+        return {
+          observeInbound() {},
+          observeOutbound() {},
+          stopAll() {},
+          isThreadOwned: () => false,
+          isFreshThreadOwned: () => false,
+        };
+      },
+    },
+    voiceHandlerModule: {
+      createVoiceHandler: () => ({ handleVoiceRequest: () => false }),
+      createRealtimeSessionHandler(dependencies) {
+        voiceDependencies = dependencies;
+        return {
+          handleRealtimeSessionRequest: () => false,
+          handleCodexMessage(message) {
+            voiceCodexMessages.push(message);
+          },
+        };
+      },
+    },
+  });
+  t.after(() => {
+    bridge?.stop();
+    relaySocket?.close();
+    relayServer.close();
+  });
+
+  bridge = startBridge({
+    printPairingQr: false,
+    config: {
+      relayUrl: `ws://127.0.0.1:${relayServer.address().port}`,
+      pushServiceUrl: "",
+      refreshEnabled: false,
+      keepMacAwakeEnabled: false,
+      codexEndpoint: "",
+      refreshCommand: "",
+      codexBundleId: "",
+      codexAppPath: "",
+      desktopIpcLiveSyncEnabled: false,
+    },
+  });
+  await waitFor(() => relaySocket && relaySocket.readyState === WebSocket.OPEN);
+
+  assert.equal(await voiceDependencies.resolveThreadOwner("desktop-voice-thread"), "desktop");
+  const turnStartParams = {
+    threadId: "desktop-voice-thread",
+    input: [{ type: "input_text", text: "A spoken request" }],
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandboxPolicy: { type: "workspaceWrite", networkAccess: true },
+  };
+  assert.deepEqual(await voiceDependencies.startCodexTurn(turnStartParams), {
+    turnId: "desktop-voice-turn",
+  });
+  assert.equal(followerStarts.length, 1);
+  assert.equal(followerStarts[0].method, "turn/start");
+  assert.equal(followerStarts[0].params, turnStartParams);
+  assert.equal(fakeCodex.sent.some((message) => message.method === "turn/start"), false);
+
+  const notification = {
+    method: "turn/completed",
+    params: {
+      threadId: "desktop-voice-thread",
+      turn: {
+        id: "desktop-voice-turn",
+        status: "completed",
+        items: [{ id: "final-answer", type: "agentMessage", phase: "final_answer", text: "The Desktop answer." }],
+      },
+    },
+  };
+  followerSendApplicationResponse(JSON.stringify(notification));
+  await waitFor(() => voiceCodexMessages.length === 1);
+  await waitFor(() => relayMessages.some((message) => message.method === "turn/completed"));
+
+  assert.deepEqual(voiceCodexMessages, [notification]);
+  assert.equal(relayMessages.some((message) => message.method === "turn/completed"), true);
+});
+
 for (const desktopIpcLiveSyncEnabled of [true, false]) {
 test(`bridge transfers a dormant Desktop-origin task after local resume succeeds (live sync ${desktopIpcLiveSyncEnabled})`, async (t) => {
   const { tempDir, socketPath: ipcSocketPath } = createIpcTestSocket("remodex-bridge-local-takeover-");
@@ -1920,13 +2112,21 @@ function loadBridgeWithTestDoubles({
   desktopIpcActionFollowerModule = null,
   desktopIpcLiveOwnerModule = null,
   rolloutLiveMirrorModule = null,
+  voiceHandlerModule = null,
 }) {
   const bridgePath = require.resolve("../src/bridge");
+  const voiceHandlerPath = require.resolve("../src/voice-handler");
   const originalLoad = Module._load;
   delete require.cache[bridgePath];
+  if (voiceHandlerModule) {
+    delete require.cache[voiceHandlerPath];
+  }
   Module._load = function loadWithBridgeDoubles(request, parent, isMain) {
     if (parent?.filename === bridgePath && request === "./codex-transport") {
       return { createCodexTransport: createCodexTransportImpl };
+    }
+    if (parent?.filename === bridgePath && request === "./voice-handler" && voiceHandlerModule) {
+      return voiceHandlerModule;
     }
     if (parent?.filename === bridgePath && request === "./opencode-runtime" && createOpenCodeRuntimeImpl) {
       return { createOpenCodeRuntime: createOpenCodeRuntimeImpl };
@@ -1965,6 +2165,9 @@ function loadBridgeWithTestDoubles({
   } finally {
     Module._load = originalLoad;
     delete require.cache[bridgePath];
+    if (voiceHandlerModule) {
+      delete require.cache[voiceHandlerPath];
+    }
   }
 }
 

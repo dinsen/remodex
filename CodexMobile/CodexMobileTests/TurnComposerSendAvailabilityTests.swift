@@ -159,9 +159,11 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         service.isConnected = true
         var requestedMethod: String?
         var requestedThreadID: String?
+        var requestedAccessConfiguration: JSONValue?
         service.requestTransportOverride = { method, params in
             requestedMethod = method
             requestedThreadID = params?.objectValue?["threadId"]?.stringValue
+            requestedAccessConfiguration = params?.objectValue?["turnStartAccessConfiguration"]
             return RPCMessage(
                 id: .string("voice-session-response"),
                 result: .object([
@@ -178,9 +180,119 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
 
         XCTAssertEqual(requestedMethod, "voice/realtime/session")
         XCTAssertEqual(requestedThreadID, "thread-42")
+        XCTAssertEqual(requestedAccessConfiguration, .object([
+            "approvalPolicyCandidates": .array([.string("on-request"), .string("onRequest")]),
+            "approvalsReviewerCandidates": .array([.string("user"), .null]),
+            "legacySandbox": .string("workspace-write"),
+            "sandboxPolicy": .object([
+                "type": .string("workspaceWrite"),
+                "networkAccess": .bool(true),
+            ]),
+        ]))
         XCTAssertEqual(session.sessionID, "live-session-42")
         XCTAssertEqual(session.model, "gpt-live-1")
         XCTAssertTrue(session.expiresAt > Date())
+    }
+
+    func testRealtimeVoiceSessionRequestCarriesAutoReviewAccessConfiguration() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.selectedAccessMode = .autoReview
+        var requestedAccessConfiguration: JSONValue?
+        service.requestTransportOverride = { _, params in
+            requestedAccessConfiguration = params?.objectValue?["turnStartAccessConfiguration"]
+            return RPCMessage(
+                id: .string("voice-session-response"),
+                result: .object([
+                    "sessionId": .string("live-session-auto-review"),
+                    "model": .string("gpt-live-1"),
+                    "expiresAt": .double(Date().timeIntervalSince1970 + 60),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        _ = try await service.requestRealtimeVoiceSession(threadID: "thread-42")
+
+        XCTAssertEqual(requestedAccessConfiguration, .object([
+            "approvalPolicyCandidates": .array([.string("on-request"), .string("onRequest")]),
+            "approvalsReviewerCandidates": .array([.string("auto_review"), .string("guardian_subagent")]),
+            "legacySandbox": .string("workspace-write"),
+            "sandboxPolicy": .object([
+                "type": .string("workspaceWrite"),
+                "networkAccess": .bool(true),
+            ]),
+        ]))
+    }
+
+    func testRealtimeVoiceAccessModeChangeClosesActiveBridgeSession() async throws {
+        let service = makeService()
+        service.selectedAccessMode = .fullAccess
+        let bridgeClosed = expectation(description: "bridge session is closed")
+        let connection = CodexRealtimeVoiceConnection(
+            session: CodexRealtimeVoiceSession(
+                sessionID: "live-session-access-change",
+                expiresAt: Date().addingTimeInterval(60),
+                model: "gpt-live-1"
+            )
+        ) { method, _ in
+            XCTAssertEqual(method, "voice/realtime/close")
+            bridgeClosed.fulfill()
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+        connection.setTerminalHandler {
+            service.unregisterRealtimeVoiceEventHandler(sessionID: connection.session.sessionID)
+        }
+        service.realtimeVoiceConnectionsBySessionID[connection.session.sessionID] = connection
+        try await connection.connect()
+
+        service.selectedAccessMode = .onRequest
+
+        await fulfillment(of: [bridgeClosed], timeout: 1)
+        XCTAssertEqual(connection.state, .closed)
+        XCTAssertNil(service.realtimeVoiceConnectionsBySessionID[connection.session.sessionID])
+    }
+
+    func testRealtimeVoiceAccessModeChangeClosesSessionReturnedByPendingStart() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.selectedAccessMode = .fullAccess
+        let startEntered = expectation(description: "session request reached bridge")
+        let bridgeClosed = expectation(description: "late bridge session is closed")
+        var sessionContinuation: CheckedContinuation<RPCMessage, Never>?
+        service.requestTransportOverride = { method, _ in
+            if method == "voice/realtime/session" {
+                startEntered.fulfill()
+                return await withCheckedContinuation { sessionContinuation = $0 }
+            }
+            XCTAssertEqual(method, "voice/realtime/close")
+            bridgeClosed.fulfill()
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+
+        let requestTask = Task { @MainActor in
+            try await service.requestRealtimeVoiceSession(threadID: "thread-42")
+        }
+        await fulfillment(of: [startEntered], timeout: 1)
+        service.selectedAccessMode = .onRequest
+        sessionContinuation?.resume(returning: RPCMessage(
+            id: .string("voice-session-response"),
+            result: .object([
+                "sessionId": .string("late-live-session"),
+                "model": .string("gpt-live-1"),
+                "expiresAt": .double(Date().timeIntervalSince1970 + 60),
+            ]),
+            includeJSONRPC: false
+        ))
+        sessionContinuation = nil
+
+        do {
+            _ = try await requestTask.value
+            XCTFail("A session started under the old access mode must be rejected")
+        } catch {
+            XCTAssertTrue(error is CodexServiceError)
+        }
+        await fulfillment(of: [bridgeClosed], timeout: 1)
     }
 
     func testRealtimeVoiceSessionRequestRejectsExpiredSession() async {
