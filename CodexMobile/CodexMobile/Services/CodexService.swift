@@ -260,6 +260,13 @@ enum CodexRunCompletionResult: String, Equatable, Sendable {
     case failed
 }
 
+struct CodexRunCompletionEvent: Equatable, Sendable {
+    static let maxRetainedPerResult = 3
+    let turnId: String
+    let result: CodexRunCompletionResult
+    let receivedAt: Date
+}
+
 enum CodexNotificationPayloadKeys {
     static let source = "source"
     static let threadId = "threadId"
@@ -421,7 +428,7 @@ struct AssistantRevertStateCacheEntry {
 @MainActor
 @Observable
 final class CodexService {
-    static let minimumSupportedBridgePackageVersion = "3.2.0"
+    static let minimumSupportedBridgePackageVersion = "4.0.0"
 
     // --- Public state ---------------------------------------------------------
 
@@ -617,6 +624,8 @@ final class CodexService {
     var lastPresentedAvailableBridgePackageVersion: String?
     // Mirrors the sidebar ready-dot with a tappable in-app banner when another chat finishes.
     var threadCompletionBanner: CodexThreadCompletionBanner?
+    // Transient, admitted completions for Live Activities; never restored from history.
+    var recentRunCompletionEventsByThread: [String: CodexRunCompletionEvent] = [:]
     // Explains why a push-opened chat could not be restored and offers a recovery path.
     var missingNotificationThreadPrompt: CodexMissingNotificationThreadPrompt?
     // Owns the scarce App Store review prompt budget for successful in-app runs.
@@ -825,12 +834,13 @@ final class CodexService {
     var localNetworkAuthorizationStatus: LocalNetworkAuthorizationStatus = .unknown
     var backgroundTurnGraceTaskID: UIBackgroundTaskIdentifier = .invalid
     var hasConfiguredNotifications = false
-    var runCompletionNotificationDedupedAt: [String: Date] = [:]
     var structuredUserInputNotificationDedupedAt: [String: Date] = [:]
     var notificationCenterDelegateProxy: CodexNotificationCenterDelegateProxy?
     var notificationObserverTokens: [NSObjectProtocol] = []
     var remoteNotificationDeviceToken: String?
     var lastPushRegistrationSignature: String?
+    var completionPushSessionID: String?
+    var pushRegistrationGeneration = 0
     var shouldAutoReconnectOnForeground = false
     // Test hook so connection handling can model `.inactive` without waiting for real app lifecycle changes.
     @ObservationIgnored var applicationStateProvider: () -> UIApplication.State = { UIApplication.shared.applicationState }
@@ -937,6 +947,7 @@ final class CodexService {
     static let turnTerminalStatesDefaultsKey = "codex.turnTerminalStates"
     static let threadHistoryPaginationStateDefaultsKey = "codex.threadHistoryPaginationState"
     static let notificationsPromptedDefaultsKey = "codex.notifications.prompted"
+    static let handledRunCompletionsDefaultsKey = "codex.notifications.handledRunCompletions"
     static let keepMacAwakeWhileBridgeRunsDefaultsKey = "codex.keepMacAwakeWhileBridgeRuns"
 
     init(

@@ -2167,7 +2167,8 @@ extension CodexService {
                     }
                     // A missed live terminal event can be recovered from this
                     // authoritative turn snapshot. Only notify when the closed
-                    // turn is the one we were tracking, not an older sibling.
+                    // turn is the one we were tracking and its completion time
+                    // proves it is recent. Untimestamped history only updates state.
                     if let existingTurnID,
                        snapshot.latestTurnID == existingTurnID,
                        let status = snapshot.latestTurnStatus {
@@ -2185,11 +2186,14 @@ extension CodexService {
                                 turnId: existingTurnID,
                                 state: result == .failed ? .failed : .completed
                             )
-                            notifyRunCompletionIfNeeded(
-                                threadId: normalizedThreadID,
-                                turnId: existingTurnID,
-                                result: result
-                            )
+                            if let completedAt = snapshot.latestTurnCompletedAt,
+                               isFreshCompletionNotification(completedAt: completedAt) {
+                                notifyRunCompletionIfNeeded(
+                                    threadId: normalizedThreadID,
+                                    turnId: existingTurnID,
+                                    result: result
+                                )
+                            }
                         }
                     }
                     clearRunningState(for: normalizedThreadID)
@@ -3911,7 +3915,8 @@ extension CodexService {
         interruptibleTurnID: String?,
         hasInterruptibleTurnWithoutID: Bool,
         latestTurnID: String?,
-        latestTurnStatus: String?
+        latestTurnStatus: String?,
+        latestTurnCompletedAt: Date?
     ) {
         if supportsTurnPagination {
             do {
@@ -3926,7 +3931,7 @@ extension CodexService {
                 )
 
                 guard let resultObject = response.result?.objectValue else {
-                    return (nil, false, nil, nil)
+                    return (nil, false, nil, nil, nil)
                 }
 
                 let turnObjects = (
@@ -3951,7 +3956,7 @@ extension CodexService {
                    ),
                    !Self.isSyntheticPlaceholderTurnID(mirrorActiveTurnID),
                    turnTerminalState(for: mirrorActiveTurnID, threadId: threadId) == nil {
-                    return (mirrorActiveTurnID, false, snapshot.latestTurnID, snapshot.latestTurnStatus)
+                    return (mirrorActiveTurnID, false, snapshot.latestTurnID, snapshot.latestTurnStatus, snapshot.latestTurnCompletedAt)
                 }
                 return snapshot
             } catch {
@@ -4019,10 +4024,11 @@ extension CodexService {
         interruptibleTurnID: String?,
         hasInterruptibleTurnWithoutID: Bool,
         latestTurnID: String?,
-        latestTurnStatus: String?
+        latestTurnStatus: String?,
+        latestTurnCompletedAt: Date?
     ) {
         guard !turnObjects.isEmpty else {
-            return (nil, false, nil, nil)
+            return (nil, false, nil, nil, nil)
         }
 
         let newestTurnObjects = newestFirst ? turnObjects : Array(turnObjects.reversed())
@@ -4036,10 +4042,14 @@ extension CodexService {
             }
             return turnID
         }.first
-        let latestTurnStatus = newestTurnObjects.first { turn in
+        let latestTurn = newestTurnObjects.first { turn in
             normalizedInterruptIdentifier(turn["id"]?.stringValue
                 ?? turn["turnId"]?.stringValue ?? turn["turn_id"]?.stringValue) == latestTurnID
-        }.flatMap { normalizedInterruptTurnStatus(from: $0) }
+        }
+        let latestTurnStatus = latestTurn.flatMap { normalizedInterruptTurnStatus(from: $0) }
+        let latestTurnCompletedAt = firstDateValue(
+            in: latestTurn, keys: ["completedAt", "completed_at", "completedAtMs", "completed_at_ms"]
+        )
 
         // Parallel turns can finish out of order. A newer terminal turn does not
         // prove that an older in-progress sibling is no longer interruptible.
@@ -4072,7 +4082,7 @@ extension CodexService {
                    !knownParallelTurnIDs.contains(interruptibleTurnID) {
                     continue
                 }
-                return (interruptibleTurnID, false, latestTurnID, latestTurnStatus)
+                return (interruptibleTurnID, false, latestTurnID, latestTurnStatus, latestTurnCompletedAt)
             }
 
             if encounteredTerminalBoundary {
@@ -4082,7 +4092,7 @@ extension CodexService {
             break
         }
 
-        return (nil, hasInterruptibleTurnWithoutID, latestTurnID, latestTurnStatus)
+        return (nil, hasInterruptibleTurnWithoutID, latestTurnID, latestTurnStatus, latestTurnCompletedAt)
     }
 
     private func knownParallelTurnIDs(for threadId: String) -> Set<String> {
