@@ -21,6 +21,7 @@ enum CodexSecureKeys {
     nonisolated static let lastTrustedMacDeviceId = "codex.secure.lastTrustedMacDeviceId"
     nonisolated static let phoneIdentityState = "codex.secure.phoneIdentityState"
     nonisolated static let messageHistoryKey = "codex.local.messageHistoryKey"
+    nonisolated static let liveVoiceAPIKey = "codex.liveVoice.openaiAPIKey"
     nonisolated static let terminalSSHProfile = "codex.terminal.sshProfile"
     nonisolated static let terminalSSHPrivateKey = "codex.terminal.sshPrivateKey"
     nonisolated static let terminalSSHPrivateKeyPassphrase = "codex.terminal.sshPrivateKeyPassphrase"
@@ -92,6 +93,19 @@ enum SecureStore {
         }
 
         writeData(Data(value.utf8), for: key, accessibility: accessibility)
+    }
+
+    // Writes a sensitive UTF-8 string and reports whether Keychain accepted it.
+    @discardableResult
+    nonisolated static func writeStringChecked(
+        _ value: String,
+        for key: String,
+        accessibility: CFString?
+    ) -> Bool {
+        if value.isEmpty {
+            return deleteValueChecked(for: key)
+        }
+        return writeData(Data(value.utf8), for: key, accessibility: accessibility)
     }
 
     // Stores raw data in Keychain; used by local message-history encryption keys.
@@ -238,6 +252,18 @@ enum SecureStore {
             let query = baseQuery(for: key, service: service)
             SecItemDelete(query as CFDictionary)
         }
+    }
+
+    @discardableResult
+    nonisolated static func deleteValueChecked(for key: String) -> Bool {
+        var succeeded = true
+        for service in storageServiceNames {
+            let status = SecureStoreKeychainOperations.system.delete(baseQuery(for: key, service: service))
+            if status != errSecSuccess && status != errSecItemNotFound {
+                succeeded = false
+            }
+        }
+        return succeeded
     }
 
     private enum DataReadResult {

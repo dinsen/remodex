@@ -115,7 +115,7 @@ final class VoiceComposerPhaseTwoController {
                     connection.close()
                     activePermissionRequestID = nil
                     isVoiceSessionActive = false
-                    voiceErrorExplanation = "Live Voice could not be started. Check the bridge connection and try again."
+                    voiceErrorExplanation = "Live Voice could not be started. Check the API key and network connection and try again."
                     return
                 }
                 connection.addTerminalHandler { [weak self, weak connection] in
@@ -128,7 +128,8 @@ final class VoiceComposerPhaseTwoController {
                 guard activePermissionRequestID == requestID else { return }
                 isVoiceSessionActive = false
                 activePermissionRequestID = nil
-                voiceErrorExplanation = "Live Voice could not be started. Check the bridge connection and try again."
+                voiceErrorExplanation = (error as? CodexRealtimeVoiceStartupError)?.userMessage
+                    ?? "Live Voice could not be started. Check the API key and network connection and try again."
             }
         case .denied, .restricted:
             guard activePermissionRequestID == requestID else { return }

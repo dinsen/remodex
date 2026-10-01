@@ -24,7 +24,7 @@ Remodex is a local-first remote companion for Codex on your Mac. In practice, th
 - **Chat messages and prompts** — Your messages are sent from the iPhone to your paired Mac for processing. After the secure transport handshake is complete, the relay forwards encrypted payloads and cannot read message contents.
 - **Photo attachments** — Images you attach from the camera or photo library are sent to your paired Mac over the secure channel.
 - **Voice notes** — When you use voice notes, the App records a temporary WAV file on your iPhone and uploads that audio directly from the iPhone to OpenAI/ChatGPT for transcription. The request is authenticated with a ChatGPT token resolved from your paired Mac over the encrypted Remodex channel.
-- **Live Voice audio and replies** — When you use Live Voice in a Codex conversation, microphone audio is streamed through your paired Mac to OpenAI's realtime voice service. For a spoken reply, Remodex sends OpenAI only the completed final answer from the matching Codex turn. It excludes Codex reasoning, commentary, and tool output from that reply path.
+- **Live Voice audio and replies** — When you use Live Voice in a Codex conversation, your iPhone sends microphone audio directly to OpenAI's realtime voice service using the API key saved in the iPhone Keychain. The iPhone sends transcript and delegation metadata to your paired Mac so it can start Codex work, then sends the completed answer returned by Codex to OpenAI for speech. The API key and microphone audio do not pass through the paired Mac or relay; Codex reasoning and tool output are excluded from the spoken response.
 - **Git operations** — Commands you initiate from the App, such as commit, pull, push, branch, or status actions, are executed on your paired Mac.
 
 ### 2.2 Information Collected Automatically
@@ -70,7 +70,7 @@ The bridge and Codex runtime run on your paired Mac. Your setup may connect dire
 
 ### 4.2 OpenAI / ChatGPT
 
-When you use voice notes, their audio is sent to OpenAI/ChatGPT for speech-to-text transcription. When you use Live Voice, microphone audio is streamed through your paired Mac to OpenAI's realtime voice service. To speak a Codex reply, Remodex sends only the completed final answer from the matching Codex turn to OpenAI; Codex reasoning, commentary, and tool output are excluded from that reply path. OpenAI processes these voice inputs and replies under its own policies; consult OpenAI's privacy policy for details about its handling and retention.
+When you use voice notes, their audio is sent to OpenAI/ChatGPT for speech-to-text transcription. When you use Live Voice, your iPhone sends microphone audio directly to OpenAI's realtime voice service. The iPhone sends transcript and delegation metadata to your paired Mac for local Codex processing, then sends the completed answer returned by Codex directly to OpenAI for speech. The API key and microphone audio are not sent to the paired Mac or relay. OpenAI processes these voice inputs and replies under its own policies; consult OpenAI's privacy policy for details about its handling and retention.
 
 - Privacy policy: [openai.com/privacy](https://openai.com/privacy)
 
@@ -87,14 +87,14 @@ Apple provides:
 
 ### 5.1 On Your iPhone
 
-- **Keychain** — sensitive values such as identity keys, pairing state, relay credentials, and encryption keys
+- **Keychain** — sensitive values such as identity keys, pairing state, relay credentials, and encryption keys. An OpenAI API key entered for Live Voice is stored on this iPhone and removed through Settings.
 - **Encrypted message cache** — chat history is stored locally in encrypted form using a Keychain-backed key
 - **UserDefaults** — non-sensitive preferences and interface settings
 - **Temporary files** — voice-note recordings are stored temporarily during capture/transcription. Live Voice audio is streamed in chunks during the active session rather than recorded as a voice-note WAV by Remodex.
 
 ### 5.2 On Your Mac
 
-Your paired Mac runs the local bridge and Codex runtime. Chat handling, git operations, workspace actions, and Live Voice forwarding are performed there.
+Your paired Mac runs the local bridge and Codex runtime. Chat handling, git operations, and workspace actions are performed there. For Live Voice, the bridge receives transcript and delegation metadata and returns the completed Codex answer; the iPhone connects directly to OpenAI for audio.
 
 ### 5.3 On a Configured Relay
 
@@ -104,7 +104,7 @@ If your setup uses a relay, it may keep limited operational state such as active
 
 - The iPhone and Mac establish an end-to-end encrypted session using modern cryptography.
 - A configured relay can observe connection metadata and secure-session setup traffic, but not encrypted application payloads after the secure session is established.
-- Voice-note transcription and Live Voice provider traffic are sent over HTTPS/TLS from the device or paired Mac bridge, respectively.
+- Voice-note transcription is sent over HTTPS/TLS from the iPhone. Live Voice audio and the completed Codex answer are sent over TLS directly from the iPhone to OpenAI; transcript and delegation metadata pass to the paired Mac over the encrypted Remodex connection.
 
 ## 6. Data Retention
 

@@ -2788,3 +2788,243 @@ function activeThreadRequest() {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test("device GPT-Live sessions bypass bridge credentials and provider sockets and reject key or audio payloads", async () => {
+  const responses = [];
+  const loggerCapture = makeLogger();
+  let credentialResolverCalls = 0;
+  let providerSocketCalls = 0;
+  const handler = createRealtimeSessionHandler({
+    apiKeyResolver() {
+      credentialResolverCalls += 1;
+      return { apiKey: "must-not-be-used" };
+    },
+    credentialResolver() {
+      credentialResolverCalls += 1;
+      return { apiKey: "must-not-be-used" };
+    },
+    WebSocketImpl: class {
+      constructor() {
+        providerSocketCalls += 1;
+        throw new Error("device path must not open a bridge provider socket");
+      }
+    },
+    sendCodexRequest: activeThreadRequest(),
+    resolveThreadOwner: async () => "single-runtime",
+    logger: loggerCapture.logger,
+  });
+  const request = (id, method, params) => handler.handleRealtimeSessionRequest(
+    JSON.stringify({ id, method, params }),
+    (response) => responses.push(JSON.parse(response))
+  );
+
+  assert.equal(request("device-session", "voice/realtime/device/session", {
+    threadId: "thread-123",
+    turnStartAccessConfiguration: ASK_TURN_START_ACCESS,
+  }), true);
+  await tick();
+
+  const sessionResponse = responses.find((response) => response.id === "device-session");
+  assert.equal(sessionResponse.result?.transport, "device");
+  assert.equal(sessionResponse.result?.model, "gpt-live-1");
+  assert.equal(sessionResponse.result?.clientSecret, undefined);
+  assert.equal(credentialResolverCalls, 0);
+  assert.equal(providerSocketCalls, 0);
+
+  const sessionId = sessionResponse.result.sessionId;
+  request("device-key", "voice/realtime/device/session", {
+    threadId: "thread-123",
+    apiKey: "must-not-be-used",
+  });
+  request("device-audio", "voice/realtime/device/event", {
+    sessionId,
+    event: { type: "session.input_audio.append", audio: "AQI=" },
+  });
+  request("legacy-audio", "voice/realtime/audio", { sessionId, audio: "AQI=" });
+  await tick();
+
+  assert.equal(responses.find((response) => response.id === "device-key").error?.data?.errorCode,
+    "invalid_device_realtime_request");
+  assert.equal(responses.find((response) => response.id === "device-audio").error?.data?.errorCode,
+    "unsupported_device_realtime_event");
+  assert.equal(responses.find((response) => response.id === "legacy-audio").error?.data?.errorCode,
+    "unsupported_device_realtime_event");
+  assert.equal(credentialResolverCalls, 0);
+  assert.equal(providerSocketCalls, 0);
+  assert.equal(loggerCapture.messages.join("\n").includes("must-not-be-used"), false);
+
+  request("device-close", "voice/realtime/device/close", { sessionId });
+  await tick();
+  assert.deepEqual(responses.find((response) => response.id === "device-close"), {
+    id: "device-close",
+    result: { ok: true },
+  });
+});
+
+test("device GPT-Live transcript and delegation events reuse bridge selection and return only commentary", async () => {
+  const responses = [];
+  const applicationEvents = [];
+  const delegatedContexts = [];
+  let credentialResolverCalls = 0;
+  let providerSocketCalls = 0;
+  const handler = createRealtimeSessionHandler({
+    apiKeyResolver() {
+      credentialResolverCalls += 1;
+      return "must-not-be-used";
+    },
+    WebSocketImpl: class {
+      constructor() {
+        providerSocketCalls += 1;
+        throw new Error("device path must not open a bridge provider socket");
+      }
+    },
+    sendCodexRequest: activeThreadRequest(),
+    resolveThreadOwner: async () => "single-runtime",
+    async runDelegatedTask(context) {
+      delegatedContexts.push(context);
+      return "Codex verified the requested result.";
+    },
+    sendApplicationResponse(rawMessage) {
+      applicationEvents.push(JSON.parse(rawMessage));
+    },
+  });
+  const request = (id, method, params) => handler.handleRealtimeSessionRequest(
+    JSON.stringify({ id, method, params }),
+    (response) => responses.push(JSON.parse(response))
+  );
+
+  request("device-session", "voice/realtime/device/session", {
+    threadId: "thread-123",
+    turnStartAccessConfiguration: ASK_TURN_START_ACCESS,
+  });
+  await tick();
+  const sessionId = responses[0].result.sessionId;
+
+  request("device-transcript", "voice/realtime/device/event", {
+    sessionId,
+    event: {
+      type: "session.input_transcript.delta",
+      event_id: "input_1",
+      start_ms: 0,
+      end_ms: 500,
+      delta: "Check the current branch.",
+    },
+  });
+  request("device-delegation", "voice/realtime/device/event", {
+    sessionId,
+    event: {
+      type: "session.delegation.created",
+      event_id: "delegation_1",
+      offset_ms: 500,
+      delegation: { id: "item_delegate_1", type: "delegation", target: "client" },
+    },
+  });
+  await delay(150);
+
+  assert.deepEqual(delegatedContexts, [{
+    threadId: "thread-123",
+    sessionId,
+    delegationId: "item_delegate_1",
+    transcript: "Check the current branch.",
+  }]);
+  const returnedEvents = applicationEvents.filter((message) => message.method === "voice/realtime/device/event");
+  assert.equal(returnedEvents.length, 1);
+  assert.deepEqual(returnedEvents[0].params, {
+    sessionId,
+    event: {
+      type: "session.commentary.append",
+      event_id: returnedEvents[0].params.event.event_id,
+      delegation_id: "item_delegate_1",
+      content: "Codex verified the requested result.",
+    },
+  });
+  assert.equal(JSON.stringify(applicationEvents).includes("audio"), false);
+  assert.equal(JSON.stringify(applicationEvents).includes("must-not-be-used"), false);
+  assert.equal(credentialResolverCalls, 0);
+  assert.equal(providerSocketCalls, 0);
+
+  request("device-close", "voice/realtime/device/close", { sessionId });
+  await tick();
+  assert.equal(responses.find((response) => response.id === "device-close").result?.ok, true);
+});
+
+test("device GPT-Live idle and expiry close the phone and discard pending delegations", async () => {
+  const scenarios = [
+    { name: "idle", reason: "idle", idleTimeoutMs: 5, timerDelayMs: 5 },
+    { name: "expiry", reason: "expired", idleTimeoutMs: 60_000, timerDelayMs: 900_000 },
+  ];
+
+  for (const scenario of scenarios) {
+    const responses = [];
+    const applicationEvents = [];
+    const timerHandles = [];
+    const delegatedContexts = [];
+    const now = 1_800_000_000_000;
+    const handler = createRealtimeSessionHandler({
+      now: () => now,
+      idleTimeoutMs: scenario.idleTimeoutMs,
+      sendCodexRequest: activeThreadRequest(),
+      sendApplicationResponse(rawMessage) {
+        applicationEvents.push(JSON.parse(rawMessage));
+      },
+      async runDelegatedTask(context) {
+        delegatedContexts.push(context);
+        return "This work must not run after session termination.";
+      },
+      setTimeoutImpl(callback, delayMs) {
+        const handle = { callback, delayMs, cleared: false };
+        timerHandles.push(handle);
+        return handle;
+      },
+      clearTimeoutImpl(handle) {
+        if (handle) handle.cleared = true;
+      },
+    });
+    const request = (id, method, params) => handler.handleRealtimeSessionRequest(
+      JSON.stringify({ id, method, params }),
+      (response) => responses.push(JSON.parse(response))
+    );
+
+    request(`${scenario.name}-session`, "voice/realtime/device/session", {
+      threadId: "thread-123",
+    });
+    await tick();
+    const sessionID = responses.find((response) => response.id === `${scenario.name}-session`).result.sessionId;
+    request(`${scenario.name}-delegation`, "voice/realtime/device/event", {
+      sessionId: sessionID,
+      event: {
+        type: "session.delegation.created",
+        event_id: `${scenario.name}-delegation-event`,
+        offset_ms: 500,
+        delegation: { id: `${scenario.name}-pending`, type: "delegation", target: "client" },
+      },
+    });
+    await tick();
+
+    const expirationTimer = [...timerHandles].reverse().find((handle) => (
+      !handle.cleared && handle.delayMs === scenario.timerDelayMs
+    ));
+    assert.ok(expirationTimer, `${scenario.name} timer should be scheduled`);
+    expirationTimer.callback();
+    await tick();
+
+    const terminalEvent = applicationEvents.find((message) => (
+      message.method === "voice/realtime/device/event"
+        && message.params?.sessionId === sessionID
+        && message.params?.event?.type === "session.closed"
+    ));
+    assert.ok(terminalEvent, `${scenario.name} should notify the iPhone that the session closed`);
+    assert.equal(terminalEvent.params.event.reason, scenario.reason);
+    assert.equal(delegatedContexts.length, 0, "pending Codex delegation must be discarded");
+    assert.equal(
+      timerHandles.find((handle) => handle.delayMs === 3_000)?.cleared,
+      true,
+      "pending delegation timeout should be canceled",
+    );
+    assert.equal(
+      applicationEvents.some((message) => message.params?.event?.type === "session.commentary.append"),
+      false,
+      "terminated sessions must not send new commentary",
+    );
+  }
+});

@@ -128,25 +128,18 @@ Do not put live OpenAI API keys into the Remodex launchd plist or relay configur
 
 ## GPT-Live Voice
 
-Remodex's live voice route uses OpenAI's `gpt-live-1` session on the Mac bridge.
-The iOS client receives only an opaque bridge session handle; the long-lived API
-key remains in the Mac Keychain and is never sent to the phone. The bridge still
-uses the existing push-to-talk transcription route unchanged.
+To use Live Voice, add an OpenAI API key in the iOS app under **Settings → Voice
+→ GPT-Live API key**. Remodex stores the key in the iPhone Keychain with
+device-only, unlocked access. The iPhone connects directly to OpenAI's
+`gpt-live-1` service over TLS; the key and microphone audio do not pass through
+the paired Mac or relay.
 
-Set up the bridge credential once on macOS. The final `-w` intentionally prompts
-for the value instead of placing it in shell history:
-
-```sh
-security add-generic-password -U -s com.remodex.bridge.openai -a api-key -w
-remodex restart
-```
-
-The bridge reads Keychain service `com.remodex.bridge.openai`, account `api-key`
-first. For a foreground developer run only, it falls back to
-`REMODEX_OPENAI_REALTIME_API_KEY`, then `OPENAI_API_KEY`. A macOS LaunchAgent
-does not source `.zshrc`, so do not rely on shell startup files for the
-background service; use the Keychain item and restart the bridge after changing
-it. Never place a live key in the LaunchAgent plist or relay messages.
+The local bridge still handles Codex delegation. The iPhone sends transcript and
+delegation metadata through the encrypted app connection; the bridge routes the
+request to the active local Codex thread and returns its completed answer for
+Live Voice to speak. Codex reasoning and tool output are not sent to OpenAI as
+the spoken response. Push-to-talk voice-note transcription remains a separate
+feature and keeps its existing setup.
 
 ## Install the Bridge
 
@@ -526,7 +519,9 @@ I'm not actively accepting contributions yet. See [CONTRIBUTING.md](CONTRIBUTING
 ## FAQ
 
 **Do I need an OpenAI API key?**
-Not for Remodex itself. You need Codex CLI set up and working independently.
+Not for Remodex's core bridge features; you need Codex CLI set up and working
+independently. Live Voice is optional and requires an OpenAI API key saved in
+the iOS app's Settings.
 
 **Does this work on Linux/Windows?**
 The core bridge client (Codex forwarding + git) works on any OS. Desktop refresh (AppleScript) is macOS-only, and the built-in daemon / trusted auto-reconnect service path is currently macOS-only too.

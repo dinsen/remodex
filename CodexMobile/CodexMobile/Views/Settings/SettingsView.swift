@@ -5,6 +5,7 @@
 
 import SwiftUI
 import UIKit
+import Security
 
 private struct SettingsComputerNamePresentation: Identifiable, Equatable {
     let deviceId: String?
@@ -455,15 +456,54 @@ private struct SettingsNotificationsCard: View {
 }
 
 private struct SettingsGPTAccountCard: View {
+    @Environment(CodexService.self) private var codex
     @AppStorage(VoicePreference.storageKey) private var isVoiceEnabled = false
+    @State private var liveVoiceAPIKeyDraft = ""
+    @State private var hasSavedLiveVoiceAPIKey = false
+    @State private var apiKeyStatusMessage: String?
+    @State private var apiKeyStatusIsError = false
+    @FocusState private var isLiveVoiceAPIKeyFocused: Bool
     let onShowInfo: () -> Void
 
     var body: some View {
         SettingsCard(
             title: "Voice",
-            footer: "Live Voice streams microphone audio through your paired Mac to OpenAI. To speak a reply, Remodex sends the completed final answer from that Codex turn to OpenAI; reasoning and tool output are excluded."
+            footer: "Live Voice connects this iPhone directly to OpenAI using the key saved in this device's Keychain. The paired Mac bridge receives transcript text to route Codex work and returns the completed final answer; reasoning and tool output are excluded."
         ) {
             Toggle("Enable Voice", isOn: $isVoiceEnabled)
+
+            SettingsValueRow(
+                title: "GPT-Live API key",
+                value: hasSavedLiveVoiceAPIKey ? "Saved on this iPhone" : "Not added",
+                valueColor: hasSavedLiveVoiceAPIKey ? .secondary : Color(uiColor: .tertiaryLabel)
+            )
+
+            SecureField("OpenAI API key", text: $liveVoiceAPIKeyDraft)
+                .textContentType(.password)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .privacySensitive()
+                .focused($isLiveVoiceAPIKeyFocused)
+                .submitLabel(.done)
+                .onSubmit(saveLiveVoiceAPIKey)
+                .textFieldStyle(.roundedBorder)
+
+            SettingsButton(
+                hasSavedLiveVoiceAPIKey ? "Replace API key" : "Save API key",
+                action: saveLiveVoiceAPIKey
+            )
+            .disabled(liveVoiceAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            if hasSavedLiveVoiceAPIKey {
+                SettingsButton("Remove API key", role: .destructive, action: removeLiveVoiceAPIKey)
+            }
+
+            if let apiKeyStatusMessage {
+                SettingsInlineMessage(
+                    text: apiKeyStatusMessage,
+                    tint: apiKeyStatusIsError ? .red : .secondary
+                )
+            }
 
             Button {
                 HapticFeedback.shared.triggerImpactFeedback(style: .light)
@@ -471,12 +511,58 @@ private struct SettingsGPTAccountCard: View {
             } label: {
                 SettingsLinkRow(
                     title: "ChatGPT Setup",
-                    subtitle: "ChatGPT sign-in and voice access on your paired Mac"
+                    subtitle: "ChatGPT sign-in for voice-note transcription"
                 ) {
                     RemodexIcon.image(systemName: "waveform")
                 }
             }
         }
+        .onAppear(perform: refreshLiveVoiceAPIKeyStatus)
+        .onDisappear {
+            liveVoiceAPIKeyDraft = ""
+            isLiveVoiceAPIKeyFocused = false
+        }
+    }
+
+    private func saveLiveVoiceAPIKey() {
+        let apiKey = liveVoiceAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else { return }
+
+        guard SecureStore.writeStringChecked(
+            apiKey,
+            for: CodexSecureKeys.liveVoiceAPIKey,
+            accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ) else {
+            apiKeyStatusMessage = "The API key could not be saved. Try again."
+            apiKeyStatusIsError = true
+            return
+        }
+
+        hasSavedLiveVoiceAPIKey = true
+        liveVoiceAPIKeyDraft = ""
+        isLiveVoiceAPIKeyFocused = false
+        apiKeyStatusMessage = "API key saved in this iPhone's Keychain."
+        apiKeyStatusIsError = false
+        codex.invalidateRealtimeVoiceSessionsForAPIKeyChange()
+    }
+
+    private func removeLiveVoiceAPIKey() {
+        guard SecureStore.deleteValueChecked(for: CodexSecureKeys.liveVoiceAPIKey) else {
+            apiKeyStatusMessage = "The API key could not be removed. Try again."
+            apiKeyStatusIsError = true
+            return
+        }
+
+        hasSavedLiveVoiceAPIKey = false
+        liveVoiceAPIKeyDraft = ""
+        isLiveVoiceAPIKeyFocused = false
+        apiKeyStatusMessage = "API key removed from this iPhone."
+        apiKeyStatusIsError = false
+        codex.invalidateRealtimeVoiceSessionsForAPIKeyChange()
+    }
+
+    private func refreshLiveVoiceAPIKeyStatus() {
+        hasSavedLiveVoiceAPIKey = SecureStore.readString(for: CodexSecureKeys.liveVoiceAPIKey) != nil
     }
 }
 

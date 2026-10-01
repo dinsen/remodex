@@ -1,14 +1,14 @@
 // FILE: CodexService+RealtimeVoice.swift
-// Purpose: Starts a bridge-owned GPT-Live session and exposes a small iOS RPC
-// boundary for audio/control events. The provider socket and API key stay on
-// the paired Mac bridge.
+// Purpose: Connects iOS directly to GPT-Live and delegates Codex work through
+// the paired bridge using transcript and response events.
 // Layer: Service
 // Exports: CodexRealtimeVoiceSession, CodexRealtimeVoiceConnection, CodexService realtime voice helpers
-// Depends on: Foundation, CodexService, JSONValue
+// Depends on: Foundation, CryptoKit, CodexService, JSONValue
 
 import Foundation
 import AVFAudio
 import CoreAudio
+import CryptoKit
 
 struct CodexRealtimeVoiceSession: Equatable, Sendable {
     static let liveModel = "gpt-live-1"
@@ -22,38 +22,174 @@ struct CodexRealtimeVoiceSession: Equatable, Sendable {
     }
 }
 
-/// Main-actor connection boundary for the bridge-owned GPT-Live session.
-///
-/// This type intentionally does not contain a provider URL, bearer token, or
-/// provider WebSocket. `CodexService.sendRequest` carries the encrypted RPC
-/// over the already-paired transport; the bridge owns OpenAI authentication and
-/// the live provider connection. Native microphone capture/playback can feed
-/// `sendAudio` as a later contained capability without changing that boundary.
+@MainActor
+protocol CodexLiveVoiceWebSocket: AnyObject {
+    func resume()
+    func send(text: String) async throws
+    func receiveText() async throws -> String
+    func close()
+}
+
+enum CodexRealtimeVoiceStartupError: Error, Equatable {
+    case missingAPIKey
+    case bridgeUpdateRequired
+
+    var userMessage: String {
+        switch self {
+        case .missingAPIKey:
+            "Add an OpenAI API key in Settings to use Live Voice."
+        case .bridgeUpdateRequired:
+            "Update the Remodex bridge on your Mac to use direct GPT-Live Voice."
+        }
+    }
+}
+
+private func isLegacyRealtimeVoiceBridgeMethodError(_ error: RPCError) -> Bool {
+    error.code == -32601
+        || error.message.localizedCaseInsensitiveContains("unknown method")
+        || error.message.localizedCaseInsensitiveContains("method not found")
+}
+
+enum CodexLiveVoiceRedirectPolicy {
+    static func permits(_ url: URL?) -> Bool {
+        guard let url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "wss",
+              components.host?.lowercased() == "api.openai.com",
+              components.port == nil || components.port == 443,
+              components.path == "/v1/live/sessions",
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil else {
+            return false
+        }
+        return true
+    }
+}
+
+private final class CodexLiveVoiceRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(CodexLiveVoiceRedirectPolicy.permits(request.url) ? request : nil)
+    }
+}
+
+@MainActor
+final class URLSessionLiveVoiceWebSocket: CodexLiveVoiceWebSocket {
+    private let session: URLSession
+    private let task: URLSessionWebSocketTask
+
+    init(request: URLRequest) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        let session = URLSession(
+            configuration: configuration,
+            delegate: CodexLiveVoiceRedirectDelegate(),
+            delegateQueue: nil
+        )
+        self.session = session
+        task = session.webSocketTask(with: request)
+    }
+
+    func resume() {
+        task.resume()
+    }
+
+    func send(text: String) async throws {
+        try await task.send(.string(text))
+    }
+
+    func receiveText() async throws -> String {
+        switch try await task.receive() {
+        case .string(let text):
+            return text
+        case .data(let data):
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw CodexServiceError.invalidResponse("Live Voice returned an unreadable event.")
+            }
+            return text
+        @unknown default:
+            throw CodexServiceError.invalidResponse("Live Voice returned an unsupported event.")
+        }
+    }
+
+    func close() {
+        task.cancel(with: .goingAway, reason: nil)
+        session.invalidateAndCancel()
+    }
+}
+
+/// Owns the phone-to-provider WebSocket and keeps Codex delegation on the
+/// encrypted bridge. Provider audio never enters a bridge RPC.
 @MainActor
 final class CodexRealtimeVoiceConnection {
     typealias EventSender = @MainActor (_ method: String, _ params: JSONValue?) async throws -> RPCMessage
+    typealias WebSocketFactory = @MainActor (URLRequest) -> CodexLiveVoiceWebSocket
+
+    private static let providerURL = URL(string: "wss://api.openai.com/v1/live/sessions")!
+    private static let providerStartTimeoutNanoseconds: UInt64 = 15_000_000_000
+    private static let maxProviderEventBytes = 1_048_576
+    private static let maxPendingProviderSends = 8
 
     enum State: Equatable {
         case idle
         case connecting
         case connected
+        case closing
         case failed
         case closed
     }
 
     let session: CodexRealtimeVoiceSession
 
+    private let safetyIdentifier: String
+    private let apiKeyProvider: @MainActor () -> String?
+    private let webSocketFactory: WebSocketFactory
     private let sendEvent: EventSender
+    private let providerCloseTimeoutNanoseconds: UInt64
     private var liveVoiceCoordinator: CodexLiveVoiceCoordinator?
-    private var bridgeEventHandler: ((JSONValue) -> Void)?
+    private var providerEventHandler: ((JSONValue) -> Void)?
     private var terminalHandlers: [() -> Void] = []
+    private var providerSocket: CodexLiveVoiceWebSocket?
+    private var providerReceiveTask: Task<Void, Never>?
+    private var providerStartTimeoutTask: Task<Void, Never>?
+    private var providerExpiryTask: Task<Void, Never>?
+    private var providerCloseTimeoutTask: Task<Void, Never>?
+    private var providerStartContinuation: CheckedContinuation<Void, Error>?
+    private var providerStartResult: Result<Void, Error>?
+    private var providerCloseContinuation: CheckedContinuation<Void, Never>?
+    private var providerSendTail: Task<Void, Error>?
+    private var bridgeCloseTask: Task<Void, Never>?
+    private var queuedProviderSendCount = 0
+    private var didReceiveProviderStart = false
+    private var didReceiveProviderClose = false
+    private var didSendBridgeClose = false
     private(set) var state: State = .idle
+    private(set) var providerCloseFinalizationConfirmed: Bool?
 
     init(
         session: CodexRealtimeVoiceSession,
+        safetyIdentifier: String? = nil,
+        apiKeyProvider: @escaping @MainActor () -> String? = {
+            SecureStore.readString(for: CodexSecureKeys.liveVoiceAPIKey)
+        },
+        webSocketFactory: @escaping WebSocketFactory = { URLSessionLiveVoiceWebSocket(request: $0) },
+        providerCloseTimeoutNanoseconds: UInt64 = 3_000_000_000,
         sendEvent: @escaping EventSender
     ) {
         self.session = session
+        self.safetyIdentifier = safetyIdentifier ?? Self.safetyIdentifier(for: session.sessionID)
+        self.apiKeyProvider = apiKeyProvider
+        self.webSocketFactory = webSocketFactory
+        self.providerCloseTimeoutNanoseconds = providerCloseTimeoutNanoseconds
         self.sendEvent = sendEvent
     }
 
@@ -65,8 +201,8 @@ final class CodexRealtimeVoiceConnection {
         }
     }
 
-    /// The provider session is opened by the bridge before this object is
-    /// created, so connecting here only transitions the local lifecycle state.
+    /// Opens the provider WebSocket directly from the device and waits for the
+    /// server's session.started event before capture begins.
     func connect() async throws {
         guard state == .idle else {
             throw CodexServiceError.invalidInput("Voice connection has already been started.")
@@ -75,16 +211,57 @@ final class CodexRealtimeVoiceConnection {
             throw CodexServiceError.invalidInput("The live Voice session has expired. Try again.")
         }
 
-        state = .connecting
         guard session.model == CodexRealtimeVoiceSession.liveModel else {
             state = .failed
             throw CodexServiceError.invalidInput("Live Voice is unavailable.")
         }
-        state = .connected
+
+        guard let apiKey = apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else {
+            state = .failed
+            throw CodexRealtimeVoiceStartupError.missingAPIKey
+        }
+
+        var request = URLRequest(
+            url: Self.providerURL,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: TimeInterval(Self.providerStartTimeoutNanoseconds) / 1_000_000_000
+        )
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(safetyIdentifier, forHTTPHeaderField: "OpenAI-Safety-Identifier")
+
+        let socket = webSocketFactory(request)
+        providerSocket = socket
+        state = .connecting
+        scheduleProviderExpiry()
+        socket.resume()
+        providerStartTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.providerStartTimeoutNanoseconds)
+            guard !Task.isCancelled, let self, self.state == .connecting else { return }
+            self.completeProviderStart(
+                .failure(CodexServiceError.invalidInput("Live Voice took too long to start. Check the API key and try again."))
+            )
+            self.finishProviderSession(
+                error: CodexServiceError.invalidInput("Live Voice took too long to start. Check the API key and try again.")
+            )
+        }
+        providerReceiveTask = Task { @MainActor [weak self] in
+            await self?.receiveProviderEvents(from: socket)
+        }
+
+        do {
+            try await sendProviderEvent(Self.sessionStartEvent())
+            try await waitForProviderStart()
+        } catch {
+            if state != .closing {
+                finishProviderSession(error: error)
+            }
+            throw error
+        }
     }
 
-    func setBridgeEventHandler(_ handler: @escaping (JSONValue) -> Void) {
-        bridgeEventHandler = handler
+    func setProviderEventHandler(_ handler: @escaping (JSONValue) -> Void) {
+        providerEventHandler = handler
     }
 
     func setTerminalHandler(_ handler: @escaping () -> Void) {
@@ -99,20 +276,38 @@ final class CodexRealtimeVoiceConnection {
         liveVoiceCoordinator = coordinator
     }
 
-    /// Called by CodexService when the bridge forwards a provider event. The
-    /// event remains on-device after decryption; no provider credential is
-    /// exposed to the handler or UI.
+    /// The bridge sends only completed Codex commentary back for the local
+    /// provider socket to speak.
     func handleBridgeEvent(_ event: JSONValue) {
-        let type = event.objectValue?["type"]?.stringValue
-        if type == "session.closed" || type == "error" {
-            state = .closed
-            notifyTerminalHandlers()
+        guard let object = event.objectValue,
+              let type = object["type"]?.stringValue else {
+            return
         }
-        bridgeEventHandler?(event)
+        if type == "session.closed",
+           ["idle", "expired"].contains(object["reason"]?.stringValue),
+           object["event_id"]?.stringValue != nil {
+            beginProviderClose(notifyBridgeClose: false)
+            return
+        }
+        guard state == .connected,
+              type == "session.commentary.append",
+              object["event_id"]?.stringValue != nil,
+              object["delegation_id"]?.stringValue != nil,
+              let content = object["content"]?.stringValue,
+              content.utf8.count <= 1_024 else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            do {
+                try await self?.sendProviderEvent(event)
+            } catch {
+                guard let self, self.state != .closing else { return }
+                self.finishProviderSession(error: error)
+            }
+        }
     }
 
-    /// Sends one base64-encoded PCM16 chunk to the bridge. The bridge validates
-    /// and forwards it as `session.input_audio.append` to GPT-Live.
+    /// Sends one base64-encoded PCM16 chunk directly to GPT-Live.
     func sendAudio(base64PCM: String) async throws {
         guard state == .connected else {
             throw CodexServiceError.invalidInput("Voice connection is not active.")
@@ -121,31 +316,382 @@ final class CodexRealtimeVoiceConnection {
         guard !normalized.isEmpty else {
             throw CodexServiceError.invalidInput("Live Voice audio was empty.")
         }
-        _ = try await sendEvent(
-            "voice/realtime/audio",
-            .object([
-                "sessionId": .string(session.sessionID),
-                "audio": .string(normalized),
-            ])
-        )
+        try await sendProviderEvent(.object([
+            "type": .string("session.input_audio.append"),
+            "audio": .string(normalized),
+        ]))
     }
 
     func close() {
-        guard state != .closed else { return }
-        state = .closed
-        // Stop capture/playback before sending the close RPC so no queued
-        // microphone chunk can race a provider session that is shutting down.
-        liveVoiceCoordinator?.stopMedia()
+        beginProviderClose(notifyBridgeClose: true)
+    }
 
+    private func receiveProviderEvents(from socket: CodexLiveVoiceWebSocket) async {
+        while !Task.isCancelled,
+              providerSocket === socket,
+              state == .connecting || state == .connected || state == .closing {
+            do {
+                let payload = try await socket.receiveText()
+                guard payload.utf8.count <= Self.maxProviderEventBytes,
+                      let event = try? JSONDecoder().decode(JSONValue.self, from: Data(payload.utf8)),
+                      let type = event.objectValue?["type"]?.stringValue else {
+                    finishProviderSession(
+                        error: CodexServiceError.invalidResponse("Live Voice returned an invalid event.")
+                    )
+                    return
+                }
+
+                if type == "session.started" {
+                    didReceiveProviderStart = true
+                    if state == .connecting {
+                        state = .connected
+                    }
+                    providerStartTimeoutTask?.cancel()
+                    providerStartTimeoutTask = nil
+                    completeProviderStart(.success(()))
+                } else if state != .closing,
+                          type == "session.input_transcript.delta" || type == "session.delegation.created" {
+                    try await forwardDelegationMetadata(event)
+                }
+
+                if state != .closing || type == "session.closed" {
+                    providerEventHandler?(event)
+                }
+                if type == "session.closed" {
+                    didReceiveProviderClose = true
+                    if state == .closing {
+                        completeProviderCloseWait()
+                        return
+                    }
+                    finishProviderSession()
+                    return
+                }
+                if type == "error" {
+                    finishProviderSession(
+                        error: CodexServiceError.invalidInput("GPT-Live returned an error. Check the API key and network connection.")
+                    )
+                    return
+                }
+            } catch {
+                guard state == .connecting || state == .connected || state == .closing else { return }
+                finishProviderSession(error: error)
+                return
+            }
+        }
+    }
+
+    private func forwardDelegationMetadata(_ event: JSONValue) async throws {
+        guard let bridgeEvent = Self.deviceBridgeMetadata(from: event) else { return }
+        let response = try await sendEvent(
+            "voice/realtime/device/event",
+            .object([
+                "sessionId": .string(session.sessionID),
+                "event": bridgeEvent,
+            ])
+        )
+        if let error = response.error {
+            throw CodexServiceError.rpcError(error)
+        }
+    }
+
+    private func waitForProviderStart() async throws {
+        if let providerStartResult {
+            try providerStartResult.get()
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            if let providerStartResult {
+                continuation.resume(with: providerStartResult)
+            } else {
+                providerStartContinuation = continuation
+            }
+        }
+    }
+
+    private func completeProviderStart(_ result: Result<Void, Error>) {
+        guard providerStartResult == nil else { return }
+        providerStartResult = result
+        guard let continuation = providerStartContinuation else { return }
+        providerStartContinuation = nil
+        continuation.resume(with: result)
+    }
+
+    private func scheduleProviderExpiry() {
+        let remaining = max(0, session.expiresAt.timeIntervalSinceNow)
+        let delayNanoseconds = UInt64(remaining * 1_000_000_000)
+        providerExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled,
+                  let self,
+                  self.state == .connecting || self.state == .connected else {
+                return
+            }
+            self.beginProviderClose(notifyBridgeClose: true)
+        }
+    }
+
+    private func beginProviderClose(notifyBridgeClose: Bool) {
+        guard state != .closed, state != .failed, state != .closing else { return }
+        let bridgeCloseBarrier = notifyBridgeClose ? sendBridgeClose() : nil
+        let shouldSendProviderClose = providerSocket != nil && (state == .connecting || state == .connected)
+
+        liveVoiceCoordinator?.stopMedia()
+        liveVoiceCoordinator = nil
+        providerEventHandler = nil
+        providerStartTimeoutTask?.cancel()
+        providerStartTimeoutTask = nil
+        providerExpiryTask?.cancel()
+        providerExpiryTask = nil
+        completeProviderStart(.failure(CodexServiceError.disconnected))
+
+        guard shouldSendProviderClose else {
+            state = .closed
+            providerCloseFinalizationConfirmed = nil
+            stopProviderResources()
+            notifyTerminalHandlers()
+            return
+        }
+
+        state = .closing
+        didReceiveProviderClose = false
+        providerCloseFinalizationConfirmed = nil
+        providerCloseTimeoutTask = Task { @MainActor [self] in
+            try? await Task.sleep(nanoseconds: self.providerCloseTimeoutNanoseconds)
+            guard !Task.isCancelled, self.state == .closing else { return }
+            self.finalizeProviderClose(confirmed: false)
+        }
+        Task { @MainActor [self] in
+            if let bridgeCloseBarrier {
+                await bridgeCloseBarrier.value
+            }
+            guard self.state == .closing else { return }
+            if self.didReceiveProviderClose {
+                self.finalizeProviderClose(confirmed: true)
+                return
+            }
+            do {
+                try await self.sendProviderEvent(Self.sessionCloseEvent(), allowDuringClose: true)
+                guard self.state == .closing else { return }
+                if !self.didReceiveProviderClose {
+                    await self.waitForProviderClose()
+                }
+            } catch {
+                guard self.state == .closing else { return }
+            }
+            guard self.state == .closing else { return }
+            self.finalizeProviderClose(confirmed: self.didReceiveProviderClose)
+        }
+        notifyTerminalHandlers()
+    }
+
+    private func waitForProviderClose() async {
+        guard state == .closing, !didReceiveProviderClose else { return }
+        await withCheckedContinuation { continuation in
+            if state != .closing || didReceiveProviderClose {
+                continuation.resume()
+            } else {
+                providerCloseContinuation = continuation
+            }
+        }
+    }
+
+    private func completeProviderCloseWait() {
+        guard let continuation = providerCloseContinuation else { return }
+        providerCloseContinuation = nil
+        continuation.resume()
+    }
+
+    private func finalizeProviderClose(confirmed: Bool) {
+        guard state == .closing else { return }
+        providerCloseFinalizationConfirmed = confirmed
+        state = .closed
+        completeProviderCloseWait()
+        completeProviderStart(.failure(CodexServiceError.disconnected))
+        liveVoiceCoordinator?.stopMedia()
+        if !confirmed {
+            bridgeCloseTask?.cancel()
+        }
+        stopProviderResources()
+        notifyTerminalHandlers()
+    }
+
+    private func sendProviderEvent(_ event: JSONValue, allowDuringClose: Bool = false) async throws {
+        let isActive = state == .connecting || state == .connected
+        guard isActive || (allowDuringClose && state == .closing),
+              let socket = providerSocket else {
+            throw CodexServiceError.invalidInput("Voice connection is not active.")
+        }
+        guard allowDuringClose || queuedProviderSendCount < Self.maxPendingProviderSends else {
+            throw CodexServiceError.invalidInput("Live Voice is temporarily overloaded. Try again.")
+        }
+        let data = try JSONEncoder().encode(event)
+        guard data.count <= Self.maxProviderEventBytes,
+              let text = String(data: data, encoding: .utf8) else {
+            throw CodexServiceError.invalidInput("Live Voice event was too large.")
+        }
+
+        let previousSend = providerSendTail
+        queuedProviderSendCount += 1
+        let sendTask = Task { @MainActor [weak self] in
+            defer {
+                if let self {
+                    self.queuedProviderSendCount = max(0, self.queuedProviderSendCount - 1)
+                    if self.queuedProviderSendCount == 0 {
+                        self.providerSendTail = nil
+                    }
+                }
+            }
+            if let previousSend {
+                if allowDuringClose {
+                    try? await previousSend.value
+                } else {
+                    try await previousSend.value
+                }
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.providerSocket === socket,
+                  self.state == .connecting
+                    || self.state == .connected
+                    || (allowDuringClose && self.state == .closing) else {
+                throw CodexServiceError.disconnected
+            }
+            try await socket.send(text: text)
+        }
+        providerSendTail = sendTask
+        try await sendTask.value
+    }
+
+    private func finishProviderSession(error: Error? = nil) {
+        if state == .closing {
+            finalizeProviderClose(confirmed: didReceiveProviderClose)
+            return
+        }
+        guard state != .closed && state != .failed else { return }
+        state = error == nil ? .closed : .failed
+        providerCloseFinalizationConfirmed = nil
+        _ = sendBridgeClose()
+        completeProviderStart(.failure(error ?? CodexServiceError.disconnected))
+        providerStartTimeoutTask?.cancel()
+        providerStartTimeoutTask = nil
+        liveVoiceCoordinator?.stopMedia()
+        stopProviderResources()
+        notifyTerminalHandlers()
+    }
+
+    private func stopProviderResources() {
+        providerReceiveTask?.cancel()
+        providerReceiveTask = nil
+        providerStartTimeoutTask?.cancel()
+        providerStartTimeoutTask = nil
+        providerExpiryTask?.cancel()
+        providerExpiryTask = nil
+        providerCloseTimeoutTask?.cancel()
+        providerCloseTimeoutTask = nil
+        providerSendTail?.cancel()
+        providerSendTail = nil
+        queuedProviderSendCount = 0
+        providerSocket?.close()
+        providerSocket = nil
+    }
+
+    @discardableResult
+    private func sendBridgeClose() -> Task<Void, Never>? {
+        guard !didSendBridgeClose else { return bridgeCloseTask }
+        didSendBridgeClose = true
         let sessionID = session.sessionID
         let sendEvent = self.sendEvent
-        notifyTerminalHandlers()
-        Task { @MainActor in
+        let task = Task { @MainActor in
             _ = try? await sendEvent(
-                "voice/realtime/close",
+                "voice/realtime/device/close",
                 .object(["sessionId": .string(sessionID)])
             )
         }
+        bridgeCloseTask = task
+        return task
+    }
+
+    private static func sessionStartEvent() -> JSONValue {
+        .object([
+            "type": .string("session.start"),
+            "event_id": .string(UUID().uuidString),
+            "session": .object([
+                "model": .string(CodexRealtimeVoiceSession.liveModel),
+                "instructions": .string("You are the live voice interface for the user's local Codex task. Keep spoken replies concise and delegate task execution to the paired Mac bridge."),
+                "audio": .object([
+                    "format": .object([
+                        "type": .string("audio/pcm"),
+                        "rate": .integer(24_000),
+                    ]),
+                    "output": .object(["voice": .string("marin")]),
+                ]),
+                "delegation": .object(["type": .string("client")]),
+            ]),
+        ])
+    }
+
+    private static func sessionCloseEvent() -> JSONValue {
+        .object([
+            "type": .string("session.close"),
+            "event_id": .string(UUID().uuidString),
+        ])
+    }
+
+    private static func deviceBridgeMetadata(from event: JSONValue) -> JSONValue? {
+        guard let object = event.objectValue,
+              let type = object["type"]?.stringValue else {
+            return nil
+        }
+        switch type {
+        case "session.input_transcript.delta":
+            guard let start = object["start_ms"],
+                  let end = object["end_ms"],
+                  let delta = object["delta"]?.stringValue,
+                  !delta.isEmpty else {
+                return nil
+            }
+            var metadata: [String: JSONValue] = [
+                "type": .string(type),
+                "start_ms": start,
+                "end_ms": end,
+                "delta": .string(delta),
+            ]
+            if let eventID = object["event_id"] {
+                metadata["event_id"] = eventID
+            }
+            return .object(metadata)
+        case "session.delegation.created":
+            guard let offset = object["offset_ms"],
+                  let delegation = object["delegation"]?.objectValue,
+                  let id = delegation["id"]?.stringValue,
+                  let target = delegation["target"]?.stringValue else {
+                return nil
+            }
+            var metadata: [String: JSONValue] = [
+                "type": .string(type),
+                "offset_ms": offset,
+                "delegation": .object([
+                    "id": .string(id),
+                    "target": .string(target),
+                ]),
+            ]
+            if let eventID = object["event_id"] {
+                metadata["event_id"] = eventID
+            }
+            if let delegationType = delegation["type"] {
+                var normalizedDelegation = metadata["delegation"]?.objectValue ?? [:]
+                normalizedDelegation["type"] = delegationType
+                metadata["delegation"] = .object(normalizedDelegation)
+            }
+            return .object(metadata)
+        default:
+            return nil
+        }
+    }
+
+    static func safetyIdentifier(for threadID: String) -> String {
+        let digest = SHA256.hash(data: Data(threadID.utf8))
+        return "remodex-" + digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private func notifyTerminalHandlers() {
@@ -403,12 +949,14 @@ final class AVAudioLiveVoicePlayback: CodexLiveVoicePlayback {
     }
 }
 
-/// Owns the iOS media lifecycle around a bridge-backed connection. Capture and
-/// playback dependencies are injectable so tests never touch hardware.
+/// Owns the iOS media lifecycle around a direct provider connection. Capture
+/// and playback dependencies are injectable so tests never touch hardware.
 @MainActor
 final class CodexLiveVoiceCoordinator {
     private static let maxPendingAudioChunks = 8
     private static let maxPendingAudioBytes = 64 * 1_024
+    private static let maxPendingOutputAudioChunks = 64
+    private static let maxPendingOutputAudioBytes = 512 * 1_024
 
     private weak var connection: CodexRealtimeVoiceConnection?
 
@@ -418,8 +966,8 @@ final class CodexLiveVoiceCoordinator {
     private var pendingSendTask: Task<Void, Never>?
     private var pendingAudioChunks: [Data] = []
     private var pendingAudioBytes = 0
-    private var pendingOutputAudioBase64: [String] = []
-    private var pendingOutputAudioReadIndex = 0
+    private var pendingOutputAudio: [Data] = []
+    private var pendingOutputAudioBytes = 0
     private var outputAudioDrainTask: Task<Void, Never>?
     private var outputAudioDrainID: UUID?
     private(set) var pendingAudioChunkCount = 0
@@ -481,8 +1029,11 @@ final class CodexLiveVoiceCoordinator {
         let type = object["type"]?.stringValue ?? ""
         if type == "session.output_audio.delta",
            let encodedAudio = object["delta"]?.stringValue {
-            pendingOutputAudioBase64.append(encodedAudio)
-            startOutputAudioDrainIfNeeded()
+            if let data = Data(base64Encoded: encodedAudio),
+               !data.isEmpty,
+               data.count % MemoryLayout<Int16>.size == 0 {
+                enqueueOutputAudio(data)
+            }
         }
         if type == "session.closed" || type == "error" {
             stop(closeConnection: false)
@@ -553,26 +1104,30 @@ final class CodexLiveVoiceCoordinator {
             if outputAudioDrainID == drainID {
                 outputAudioDrainTask = nil
                 outputAudioDrainID = nil
-                if pendingOutputAudioReadIndex < pendingOutputAudioBase64.count {
+                if !pendingOutputAudio.isEmpty {
                     startOutputAudioDrainIfNeeded()
-                } else {
-                    pendingOutputAudioBase64.removeAll(keepingCapacity: false)
-                    pendingOutputAudioReadIndex = 0
                 }
             }
         }
 
-        while !Task.isCancelled, pendingOutputAudioReadIndex < pendingOutputAudioBase64.count {
-            let encodedAudio = pendingOutputAudioBase64[pendingOutputAudioReadIndex]
-            pendingOutputAudioReadIndex += 1
-            guard let data = await CodexTransferWork.decodeBase64(encodedAudio),
-                  !data.isEmpty,
-                  data.count % MemoryLayout<Int16>.size == 0,
-                  !Task.isCancelled else {
-                continue
-            }
+        while !Task.isCancelled, !pendingOutputAudio.isEmpty {
+            let data = pendingOutputAudio.removeFirst()
+            pendingOutputAudioBytes -= data.count
             playback.enqueuePCM16(data)
+            await Task.yield()
         }
+    }
+
+    private func enqueueOutputAudio(_ data: Data) {
+        guard data.count <= Self.maxPendingOutputAudioBytes else { return }
+        while pendingOutputAudio.count >= Self.maxPendingOutputAudioChunks
+            || pendingOutputAudioBytes + data.count > Self.maxPendingOutputAudioBytes {
+            guard !pendingOutputAudio.isEmpty else { return }
+            pendingOutputAudioBytes -= pendingOutputAudio.removeFirst().count
+        }
+        pendingOutputAudio.append(data)
+        pendingOutputAudioBytes += data.count
+        startOutputAudioDrainIfNeeded()
     }
 
     private func stopForInterruption() {
@@ -600,8 +1155,8 @@ final class CodexLiveVoiceCoordinator {
         outputAudioDrainID = nil
         outputAudioDrainTask?.cancel()
         outputAudioDrainTask = nil
-        pendingOutputAudioBase64.removeAll(keepingCapacity: false)
-        pendingOutputAudioReadIndex = 0
+        pendingOutputAudio.removeAll(keepingCapacity: false)
+        pendingOutputAudioBytes = 0
         if closeConnection {
             connection?.close()
         }
@@ -610,6 +1165,7 @@ final class CodexLiveVoiceCoordinator {
 
 extension CodexService {
     private static let realtimeVoiceSessionTimeoutNanoseconds: UInt64 = 15_000_000_000
+    private static let realtimeVoiceBridgeCloseTimeoutNanoseconds: UInt64 = 1_000_000_000
 
     func registerRealtimeVoiceEventHandler(
         sessionID: String,
@@ -630,6 +1186,16 @@ extension CodexService {
         Array(realtimeVoiceConnectionsBySessionID.values).forEach { $0.close() }
     }
 
+    func invalidateRealtimeVoiceSessionsForAPIKeyChange() {
+        realtimeVoiceAccessRevision &+= 1
+        Array(realtimeVoiceConnectionsBySessionID.values).forEach { $0.close() }
+    }
+
+    func invalidateRealtimeVoiceSessionsForTransportDisconnect() {
+        realtimeVoiceAccessRevision &+= 1
+        Array(realtimeVoiceConnectionsBySessionID.values).forEach { $0.close() }
+    }
+
     func handleRealtimeVoiceEvent(_ paramsObject: IncomingParamsObject?) {
         guard let paramsObject,
               let sessionID = paramsObject["sessionId"]?.stringValue,
@@ -643,8 +1209,8 @@ extension CodexService {
         }
     }
 
-    // Requests a bridge-owned GPT-Live handle through the encrypted, paired
-    // bridge. No provider credential is returned to the iOS process.
+    // Requests a device-scoped GPT-Live delegation handle through the paired
+    // bridge. Provider authentication and media remain on the iPhone.
     func requestRealtimeVoiceSession(threadID: String) async throws -> CodexRealtimeVoiceSession {
         let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedThreadID.isEmpty else {
@@ -665,17 +1231,30 @@ extension CodexService {
             "sandboxPolicy": accessConfiguration.sandboxPolicy,
         ])
 
-        let response = try await sendRequest(
-            method: "voice/realtime/session",
-            params: .object([
-                "threadId": .string(normalizedThreadID),
-                "turnStartAccessConfiguration": turnStartAccessConfiguration,
-            ]),
-            timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
-            timeoutMessage: "Live Voice session setup timed out. Check the bridge connection and try again."
-        )
+        let response: RPCMessage
+        do {
+            response = try await sendRequest(
+                method: "voice/realtime/device/session",
+                params: .object([
+                    "threadId": .string(normalizedThreadID),
+                    "turnStartAccessConfiguration": turnStartAccessConfiguration,
+                ]),
+                timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
+                timeoutMessage: "Live Voice session setup timed out. Check the bridge connection and try again."
+            )
+        } catch let CodexServiceError.rpcError(error) {
+            // Real RPC responses are converted to errors by the incoming transport
+            // before sendRequest returns; preserve safe upgrade guidance there too.
+            guard isLegacyRealtimeVoiceBridgeMethodError(error) else {
+                throw CodexServiceError.rpcError(error)
+            }
+            throw CodexRealtimeVoiceStartupError.bridgeUpdateRequired
+        }
 
         if let error = response.error {
+            if isLegacyRealtimeVoiceBridgeMethodError(error) {
+                throw CodexRealtimeVoiceStartupError.bridgeUpdateRequired
+            }
             throw CodexServiceError.rpcError(error)
         }
 
@@ -685,6 +1264,11 @@ extension CodexService {
               let expiresAtSeconds = result["expiresAt"]?.doubleValue,
               expiresAtSeconds.isFinite else {
             throw CodexServiceError.invalidResponse("The bridge returned an invalid live Voice session.")
+        }
+
+        guard result["transport"]?.stringValue == "device" else {
+            await closeRealtimeVoiceBridgeSession(sessionID: sessionID)
+            throw CodexRealtimeVoiceStartupError.bridgeUpdateRequired
         }
 
         let model = result["model"]?.stringValue ?? CodexRealtimeVoiceSession.liveModel
@@ -707,31 +1291,44 @@ extension CodexService {
 
     private func closeRealtimeVoiceBridgeSession(sessionID: String) async {
         _ = try? await sendRequest(
-            method: "voice/realtime/close",
+            method: "voice/realtime/device/close",
             params: .object(["sessionId": .string(sessionID)]),
             timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
             timeoutMessage: "Live Voice bridge request timed out. Try again."
         )
     }
 
-    // The bridge opens and owns the provider WebSocket. This object only sends
-    // encrypted media/control RPCs back through the same paired transport.
+    // The iPhone owns the provider WebSocket. This object sends only transcript,
+    // delegation, and close RPCs through the paired bridge.
     func openRealtimeVoiceConnection(threadID: String) async throws -> CodexRealtimeVoiceConnection {
+        guard let apiKey = SecureStore.readString(for: CodexSecureKeys.liveVoiceAPIKey),
+              !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CodexRealtimeVoiceStartupError.missingAPIKey
+        }
         let accessRevision = realtimeVoiceAccessRevision
         let session = try await requestRealtimeVoiceSession(threadID: threadID)
         guard accessRevision == realtimeVoiceAccessRevision else {
             await closeRealtimeVoiceBridgeSession(sessionID: session.sessionID)
             throw CodexServiceError.invalidInput("The access mode changed while Voice was starting. Try again.")
         }
-        let connection = CodexRealtimeVoiceConnection(session: session) { [weak self] method, params in
+        let connection = CodexRealtimeVoiceConnection(
+            session: session,
+            safetyIdentifier: CodexRealtimeVoiceConnection.safetyIdentifier(for: threadID.trimmingCharacters(in: .whitespacesAndNewlines)),
+            apiKeyProvider: { SecureStore.readString(for: CodexSecureKeys.liveVoiceAPIKey) }
+        ) { [weak self] method, params in
             guard let self else {
                 throw CodexServiceError.disconnected
             }
+            let isDeviceClose = method == "voice/realtime/device/close"
             let response = try await self.sendRequest(
                 method: method,
                 params: params,
-                timeoutNanoseconds: Self.realtimeVoiceSessionTimeoutNanoseconds,
-                timeoutMessage: "Live Voice bridge request timed out. Try again."
+                timeoutNanoseconds: isDeviceClose
+                    ? Self.realtimeVoiceBridgeCloseTimeoutNanoseconds
+                    : Self.realtimeVoiceSessionTimeoutNanoseconds,
+                timeoutMessage: isDeviceClose
+                    ? "Live Voice close timed out."
+                    : "Live Voice bridge request timed out. Try again."
             )
             if let error = response.error {
                 throw CodexServiceError.rpcError(error)
@@ -740,7 +1337,7 @@ extension CodexService {
         }
         let coordinator = CodexLiveVoiceCoordinator(connection: connection)
         connection.attachLiveVoiceCoordinator(coordinator)
-        connection.setBridgeEventHandler { [weak coordinator] event in
+        connection.setProviderEventHandler { [weak coordinator] event in
             coordinator?.handleProviderEvent(event)
         }
         connection.setTerminalHandler { [weak self] in

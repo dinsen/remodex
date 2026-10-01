@@ -355,6 +355,8 @@ extension CodexService {
         switch method {
         case "voice/realtime/event":
             handleRealtimeVoiceEvent(paramsObject)
+        case "voice/realtime/device/event":
+            handleRealtimeVoiceEvent(paramsObject)
 
         case "thread/started":
             if case .threadStarted(let thread) = decodedModelPayload {

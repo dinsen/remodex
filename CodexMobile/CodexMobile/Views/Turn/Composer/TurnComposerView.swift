@@ -24,6 +24,7 @@ struct TurnComposerInputChangeHandler {
 }
 
 struct TurnComposerView: View, Equatable {
+    @Environment(\.scenePhase) private var scenePhase
     let threadID: String
     @Binding var input: String
     let isInputFocused: Binding<Bool>
@@ -81,7 +82,7 @@ struct TurnComposerView: View, Equatable {
     let onTapAddImage: () -> Void
     let onTapTakePhoto: () -> Void
     let onTapVoice: () -> Void
-    // Starts the bridge-owned GPT-Live session after microphone permission is granted.
+    // Starts the phone-owned GPT-Live session after microphone permission is granted.
     // The composer keeps this injectable so previews/tests never open a network socket.
     var onStartVoiceSession: () async throws -> CodexRealtimeVoiceConnection = {
         throw CodexServiceError.invalidInput("Live Voice is unavailable.")
@@ -456,6 +457,11 @@ struct TurnComposerView: View, Equatable {
         .onChange(of: allowsLiveVoice) { _, isAllowed in
             if !isAllowed {
                 voicePhaseTwoController.disableVoice()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background {
+                voicePhaseTwoController.endVoiceSession()
             }
         }
         .onDisappear {

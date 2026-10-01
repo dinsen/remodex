@@ -151,6 +151,7 @@ extension CodexService {
 
     // Closes the socket and fails any in-flight requests.
     func disconnect(preserveReconnectIntent: Bool = false) async {
+        invalidateRealtimeVoiceSessionsForTransportDisconnect()
         cancelCurrentSocketConnection()
 
         isConnected = false
@@ -500,6 +501,7 @@ extension CodexService {
             return
         }
 
+        invalidateRealtimeVoiceSessionsForTransportDisconnect()
         cancelCurrentSocketConnection()
 
         cancelRuntimeSettingsUpdates()
