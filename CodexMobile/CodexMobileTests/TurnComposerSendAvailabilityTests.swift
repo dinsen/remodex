@@ -64,6 +64,37 @@ final class TurnComposerSendAvailabilityTests: XCTestCase {
         )
     }
 
+    func testTurnStopVisibilityUsesVoiceStopWhenVoiceIsActive() {
+        XCTAssertFalse(
+            VoiceComposerPhaseOne.showsTurnStop(
+                isThreadRunning: true,
+                voiceControl: .voiceWave,
+                isVoiceSessionActive: true
+            )
+        )
+        XCTAssertTrue(
+            VoiceComposerPhaseOne.showsTurnStop(
+                isThreadRunning: true,
+                voiceControl: .voiceWave,
+                isVoiceSessionActive: false
+            )
+        )
+        XCTAssertTrue(
+            VoiceComposerPhaseOne.showsTurnStop(
+                isThreadRunning: true,
+                voiceControl: .normal,
+                isVoiceSessionActive: true
+            )
+        )
+        XCTAssertFalse(
+            VoiceComposerPhaseOne.showsTurnStop(
+                isThreadRunning: false,
+                voiceControl: .voiceWave,
+                isVoiceSessionActive: true
+            )
+        )
+    }
+
     func testVoicePhaseOnePreservesSendForAllStructuredSendableContent() {
         let accessoryStates = [
             makeAccessoryState(hasAttachment: true),

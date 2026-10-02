@@ -79,7 +79,11 @@ struct ComposerBottomBar: View {
     }
 
     private var showsStopButton: Bool {
-        isThreadRunning && !showsSendButton
+        VoiceComposerPhaseOne.showsTurnStop(
+            isThreadRunning: isThreadRunning,
+            voiceControl: voicePhaseOneControl,
+            isVoiceSessionActive: isVoiceSessionActive
+        ) && !showsSendButton
     }
 
     // MARK: - Body
@@ -158,6 +162,7 @@ struct ComposerBottomBar: View {
             if voicePhaseOneControl == .voiceWave {
                 ComposerVoiceWaveButton(
                     isVoiceSessionActive: isVoiceSessionActive,
+                    isThreadRunning: isThreadRunning,
                     onTap: onTapVoiceWave
                 )
                     .padding(.leading, 4)

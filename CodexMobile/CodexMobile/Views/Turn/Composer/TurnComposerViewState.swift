@@ -35,6 +35,14 @@ enum VoiceComposerPhaseOne {
         if isVoiceSessionActive { return .voiceWave }
         return hasSendableContent ? .send : .voiceWave
     }
+
+    static func showsTurnStop(
+        isThreadRunning: Bool,
+        voiceControl: TrailingControl,
+        isVoiceSessionActive: Bool
+    ) -> Bool {
+        isThreadRunning && !(voiceControl == .voiceWave && isVoiceSessionActive)
+    }
 }
 
 enum VoiceMicrophonePermission {

@@ -177,24 +177,40 @@ struct ComposerVoiceButton: View {
 }
 
 struct ComposerVoiceWaveButton: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(UserBubbleColor.storageKey) private var userBubbleColorRawValue = UserBubbleColor.defaultStoredRawValue
+
     let isVoiceSessionActive: Bool
+    let isThreadRunning: Bool
     let onTap: () -> Void
     var circleDiameter: CGFloat = 32
     var tapTargetSide: CGFloat? = nil
+
+    private var palette: UserBubbleColor {
+        (UserBubbleColor(rawValue: userBubbleColorRawValue) ?? .default).ctaPalette
+    }
 
     var body: some View {
         Button(action: onTap) {
             RemodexCircleBadge(
                 systemName: isVoiceSessionActive ? "stop.fill" : "waveform",
-                foreground: isVoiceSessionActive ? Color(.systemBackground) : .primary,
-                background: isVoiceSessionActive ? Color(.systemRed) : Color(.systemGray5),
+                foreground: isVoiceSessionActive ? palette.bubbleForeground(for: colorScheme) : .primary,
+                background: isVoiceSessionActive ? palette.bubbleBackground(for: colorScheme) : Color(.systemGray5),
                 diameter: circleDiameter
             )
             .frame(width: tapTargetSide, height: tapTargetSide)
             .contentShape(Circle())
         }
-        .accessibilityLabel(isVoiceSessionActive ? "End Voice" : "Voice")
-        .accessibilityHint(isVoiceSessionActive ? "Ends the local Voice session" : "Requests microphone access")
+        .accessibilityLabel(
+            isVoiceSessionActive
+                ? (isThreadRunning ? "Stop Voice and current run" : "End Voice")
+                : "Voice"
+        )
+        .accessibilityHint(
+            isVoiceSessionActive
+                ? (isThreadRunning ? "Ends the local Voice session and stops the current run" : "Ends the local Voice session")
+                : "Requests microphone access"
+        )
     }
 }
 

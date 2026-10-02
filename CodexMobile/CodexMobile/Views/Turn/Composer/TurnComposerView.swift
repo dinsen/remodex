@@ -364,6 +364,7 @@ struct TurnComposerView: View, Equatable {
                         } else if voicePhaseOneControl == .voiceWave {
                             ComposerVoiceWaveButton(
                                 isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive,
+                                isThreadRunning: isThreadRunning,
                                 onTap: handleVoiceWaveTap,
                                 tapTargetSide: collapsedControlTapTarget
                             )
@@ -372,7 +373,11 @@ struct TurnComposerView: View, Equatable {
                         }
 
                         // Keep Stop reachable while a turn runs even in the resting capsule.
-                        if isThreadRunning {
+                        if VoiceComposerPhaseOne.showsTurnStop(
+                            isThreadRunning: isThreadRunning,
+                            voiceControl: voicePhaseOneControl,
+                            isVoiceSessionActive: voicePhaseTwoController.isVoiceSessionActive
+                        ) {
                             ComposerStopControl(
                                 activeTurnID: activeTurnID,
                                 isSending: isSending,
@@ -545,6 +550,14 @@ struct TurnComposerView: View, Equatable {
     private func handleVoiceWaveTap() {
         guard allowsLiveVoice else { return }
         Task { @MainActor in
+            if voicePhaseTwoController.isVoiceSessionActive {
+                voicePhaseTwoController.endVoiceSession()
+                if isThreadRunning {
+                    onStopTurn(activeTurnID)
+                }
+                return
+            }
+
             await voicePhaseTwoController.handleWaveTap(
                 isVoiceEnabled: isVoiceEnabled && allowsLiveVoice,
                 startSession: onStartVoiceSession
