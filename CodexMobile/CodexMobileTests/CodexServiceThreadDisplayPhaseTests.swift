@@ -119,6 +119,109 @@ final class CodexServiceThreadDisplayPhaseTests: XCTestCase {
         XCTAssertEqual(service.thread(for: "thread-selected")?.syncState, .live)
     }
 
+    func testIdleReleaseWaitsForResumeAndReopenResubscribesAfterCoalescedDisplay() async {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        service.isConnected = true
+        service.isInitialized = true
+        service.supportsTurnPagination = true
+        service.threads = [
+            CodexThread(
+                id: threadID,
+                title: "Existing chat",
+                preview: "Existing history",
+                syncState: .live
+            )
+        ]
+
+        let firstResumeStarted = expectation(description: "first resume started")
+        let secondResumeStarted = expectation(description: "reopened thread resumed")
+        var resumeCount = 0
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            if method == "thread/resume" {
+                resumeCount += 1
+                if resumeCount == 1 {
+                    firstResumeStarted.fulfill()
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                } else if resumeCount == 2 {
+                    secondResumeStarted.fulfill()
+                }
+            }
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([:]),
+                includeJSONRPC: false
+            )
+        }
+
+        let initialDisplay = Task { await service.prepareThreadForDisplay(threadId: threadID) }
+        await fulfillment(of: [firstResumeStarted], timeout: 1)
+        let coalescedDisplay = Task { await service.prepareThreadForDisplay(threadId: threadID) }
+        await Task.yield()
+
+        XCTAssertFalse(service.scheduleThreadSubscriptionReleaseIfIdle(threadId: threadID))
+        let reopenedDisplay = Task { await service.prepareThreadForDisplay(threadId: threadID) }
+
+        await fulfillment(of: [secondResumeStarted], timeout: 3)
+        let initialDisplaySucceeded = await initialDisplay.value
+        let coalescedDisplaySucceeded = await coalescedDisplay.value
+        let reopenedDisplaySucceeded = await reopenedDisplay.value
+        XCTAssertTrue(initialDisplaySucceeded)
+        XCTAssertFalse(coalescedDisplaySucceeded)
+        XCTAssertTrue(reopenedDisplaySucceeded)
+        XCTAssertTrue(service.resumedThreadIDs.contains(threadID))
+
+        let unsubscribeIndex = try! XCTUnwrap(recordedMethods.firstIndex(of: "thread/unsubscribe"))
+        let resumeIndices = recordedMethods.indices.filter { recordedMethods[$0] == "thread/resume" }
+        XCTAssertGreaterThanOrEqual(resumeIndices.count, 2)
+        XCTAssertLessThan(resumeIndices[0], unsubscribeIndex)
+        XCTAssertLessThan(unsubscribeIndex, resumeIndices[1])
+    }
+
+    func testReleaseLeavesRunningThreadOwned() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        service.isConnected = true
+        service.resumedThreadIDs.insert(threadID)
+        service.runningThreadIDs.insert(threadID)
+        service.requestTransportOverride = { method, _ in
+            XCTFail("Running thread must not unsubscribe: \(method)")
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+
+        XCTAssertFalse(service.scheduleThreadSubscriptionReleaseIfIdle(threadId: threadID))
+        XCTAssertNil(service.threadUnsubscribeTaskByThreadID[threadID])
+        XCTAssertTrue(service.resumedThreadIDs.contains(threadID))
+        XCTAssertTrue(service.threadHasActiveOrRunningTurn(threadID))
+    }
+
+    func testUnsubscribeErrorDoesNotPreventDesktopHandoff() async throws {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        service.isConnected = true
+        service.resumedThreadIDs.insert(threadID)
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            if method == "thread/unsubscribe" {
+                throw CodexServiceError.rpcError(RPCError(code: -32601, message: "Method not found"))
+            }
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["success": .bool(true)]),
+                includeJSONRPC: false
+            )
+        }
+
+        await service.releaseThreadSubscriptionIfIdle(threadId: threadID)
+        try await DesktopHandoffService(codex: service).continueOnDesktopApp(threadId: threadID)
+
+        XCTAssertEqual(recordedMethods, ["thread/unsubscribe", "desktop/continueOnDesktop"])
+        XCTAssertFalse(service.resumedThreadIDs.contains(threadID))
+    }
+
     func testTimedOutExistingThreadWithoutCacheRemainsLoading() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"

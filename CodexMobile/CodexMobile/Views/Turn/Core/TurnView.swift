@@ -491,6 +491,7 @@ struct TurnView: View {
             handleVoiceViewDisappear()
             viewModel.cancelTransientTasks()
             viewModel.clearComposerAutocomplete()
+            codex.scheduleThreadSubscriptionReleaseIfIdle(threadId: thread.id)
         }
         .onChange(of: isInputFocused) { _, isFocused in
             // Defer the observable-model mutation out of the .onChange action
@@ -930,6 +931,7 @@ struct TurnView: View {
 
             do {
                 let handoffService = DesktopHandoffService(codex: codex)
+                await codex.releaseThreadSubscriptionIfIdle(threadId: thread.id)
                 try await handoffService.continueOnDesktopApp(threadId: thread.id)
             } catch {
                 macHandoffErrorMessage = error.localizedDescription

@@ -1824,6 +1824,10 @@ extension CodexService {
             return nil
         }
 
+        if let unsubscribeTask = threadUnsubscribeTaskByThreadID[threadId] {
+            await unsubscribeTask.value
+        }
+
         if force {
             forcedResumeEscalationThreadIDs.insert(threadId)
         }
@@ -2039,6 +2043,61 @@ extension CodexService {
         threadResumeTaskByThreadID[threadId] = task
         threadResumeRequestSignatureByThreadID[threadId] = requestedSignature
         return try await task.value
+    }
+
+    // Registers a departure before view callbacks can race a new display request.
+    @discardableResult
+    func scheduleThreadSubscriptionReleaseIfIdle(threadId: String) -> Bool {
+        guard !threadId.isEmpty else { return false }
+        threadSubscriptionReleaseGenerationByThreadID[threadId, default: 0] &+= 1
+
+        if threadUnsubscribeTaskByThreadID[threadId] != nil {
+            return isConnected
+                && !threadHasActiveOrRunningTurn(threadId)
+                && threadResumeTaskByThreadID[threadId] == nil
+        }
+        guard isConnected, !threadHasActiveOrRunningTurn(threadId) else {
+            return false
+        }
+
+        let resumeTask = threadResumeTaskByThreadID[threadId]
+        let unsubscribeTask = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.threadUnsubscribeTaskByThreadID.removeValue(forKey: threadId) }
+
+            guard self.isConnected, !self.threadHasActiveOrRunningTurn(threadId) else {
+                return
+            }
+
+            if let resumeTask {
+                _ = try? await resumeTask.value
+            }
+
+            guard self.isConnected, !self.threadHasActiveOrRunningTurn(threadId) else {
+                return
+            }
+
+            do {
+                _ = try await self.sendRequest(
+                    method: "thread/unsubscribe",
+                    params: .object(["threadId": .string(threadId)]),
+                    timeoutNanoseconds: 2_000_000_000,
+                    timeoutMessage: "Releasing the chat subscription timed out."
+                )
+            } catch {
+                // Resume cache must be invalidated even if an older server rejects unsubscribe.
+            }
+            self.resumedThreadIDs.remove(threadId)
+        }
+        threadUnsubscribeTaskByThreadID[threadId] = unsubscribeTask
+        return resumeTask == nil
+    }
+
+    // The RPC itself is bounded; pending resumes are released in the background so handoff stays responsive.
+    func releaseThreadSubscriptionIfIdle(threadId: String) async {
+        let shouldWait = scheduleThreadSubscriptionReleaseIfIdle(threadId: threadId)
+        guard shouldWait, let unsubscribeTask = threadUnsubscribeTaskByThreadID[threadId] else { return }
+        await unsubscribeTask.value
     }
 
     func isThreadMissingOnServer(_ threadId: String) async -> Bool {

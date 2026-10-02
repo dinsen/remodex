@@ -1020,8 +1020,31 @@ extension CodexService {
     // into a single pipeline run instead of racing duplicate resume/history passes.
     @discardableResult
     func prepareThreadForDisplay(threadId: String) async -> Bool {
+        let releaseGeneration = threadSubscriptionReleaseGenerationByThreadID[threadId, default: 0]
+        let pendingUnsubscribeTask = threadUnsubscribeTaskByThreadID[threadId]
+        if let pendingUnsubscribeTask {
+            await pendingUnsubscribeTask.value
+            guard threadSubscriptionReleaseGenerationByThreadID[threadId, default: 0] == releaseGeneration else {
+                return false
+            }
+        }
+
         if let existingTask = prepareThreadDisplayTaskByThreadID[threadId] {
-            return await existingTask.value
+            let result = await existingTask.value
+            guard threadSubscriptionReleaseGenerationByThreadID[threadId, default: 0] == releaseGeneration else {
+                return false
+            }
+            if pendingUnsubscribeTask != nil, isConnected, activeThreadId == threadId {
+                do {
+                    try await ensureThreadResumed(threadId: threadId)
+                } catch {
+                    return false
+                }
+                guard threadSubscriptionReleaseGenerationByThreadID[threadId, default: 0] == releaseGeneration else {
+                    return false
+                }
+            }
+            return result
         }
 
         let task = Task<Bool, Never> { @MainActor [weak self] in

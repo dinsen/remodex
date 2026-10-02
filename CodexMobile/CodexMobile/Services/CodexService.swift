@@ -743,6 +743,9 @@ final class CodexService {
     @ObservationIgnored var prepareThreadDisplayTaskByThreadID: [String: Task<Bool, Never>] = [:]
     // Coalesces per-thread resume work so rapid thread switches reuse the same in-flight refresh.
     @ObservationIgnored var threadResumeTaskByThreadID: [String: Task<CodexThread?, Error>] = [:]
+    // Serializes best-effort unsubscribe with a later reopen of the same thread.
+    @ObservationIgnored var threadUnsubscribeTaskByThreadID: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored var threadSubscriptionReleaseGenerationByThreadID: [String: UInt64] = [:]
     // Remembers which cwd/model pair an in-flight resume is actually targeting.
     @ObservationIgnored var threadResumeRequestSignatureByThreadID: [String: CodexThreadResumeRequestSignature] = [:]
     // Lets a late force caller upgrade an in-flight resume without spawning another RPC.
